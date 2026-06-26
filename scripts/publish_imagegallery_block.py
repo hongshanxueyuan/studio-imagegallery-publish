@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -23,6 +23,11 @@ class SafeDict(dict):
 def parse_vertical_block_id(url_input: str) -> str | None:
     m = re.search(r"block-v1:[^/?#]+", url_input)
     return m.group(0) if m else None
+
+
+def normalize_block_url(url_input: str) -> str:
+    parsed = urlparse(url_input.strip())
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
 def course_key_from_vertical_block_id(vertical_block_id: str) -> str:
@@ -402,10 +407,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for i in manifest["items"]
     ]
 
+    canonical_block_url = normalize_block_url(args.block_url or studio_url)
+
     ctx: dict[str, Any] = {
         "studio_url": studio_url,
         "studio_base": studio_base,
-        "block_url": args.block_url or studio_url,
+        "block_url": canonical_block_url,
         "vertical_block_id": vertical_block_id,
         "manifest": str(manifest_path),
         "manifest_json": json.dumps(manifest, ensure_ascii=False),

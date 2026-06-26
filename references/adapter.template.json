@@ -23,8 +23,11 @@
     "method": "POST",
     "url": "{studio_base}/xblock/{block_locator}/handler/file_upload",
     "headers": {
+      "Accept": "application/json, text/plain, */*",
       "X-CSRFToken": "{csrftoken}",
-      "X-Requested-With": "XMLHttpRequest"
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}"
     },
     "files": {
       "files": "{image_file}"
@@ -38,7 +41,7 @@
       "Content-Type": "application/json",
       "X-CSRFToken": "{csrftoken}",
       "Origin": "{studio_base}",
-      "Referer": "{block_url}?action=new"
+      "Referer": "{block_url}"
     },
     "json": {
       "ids": "{uploaded_asset_ids}"
@@ -52,7 +55,7 @@
       "Content-Type": "application/json",
       "X-CSRFToken": "{csrftoken}",
       "Origin": "{studio_base}",
-      "Referer": "{block_url}?action=new"
+      "Referer": "{block_url}"
     },
     "json": {
       "file_name": "{audio_file_name}",
@@ -70,7 +73,7 @@
       "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
       "X-CSRFToken": "{csrftoken}",
       "Origin": "{studio_base}",
-      "Referer": "{block_url}?action=new"
+      "Referer": "{block_url}"
     },
     "data": {
       "edx_document_id": "{edx_document_id}",
@@ -88,7 +91,9 @@
     "headers": {
       "Content-Type": "application/json",
       "X-CSRFToken": "{csrftoken}",
-      "X-Requested-With": "XMLHttpRequest"
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}"
     },
     "json": {
       "document_id": "{audio_document_id}",
@@ -103,7 +108,7 @@
       "Content-Type": "application/json",
       "X-CSRFToken": "{csrftoken}",
       "Origin": "{studio_base}",
-      "Referer": "{block_url}?action=new"
+      "Referer": "{block_url}"
     },
     "json": {
       "values": {
@@ -118,7 +123,9 @@
     "headers": {
       "Content-Type": "application/json",
       "X-CSRFToken": "{csrftoken}",
-      "X-Requested-With": "XMLHttpRequest"
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}"
     },
     "json": {
       "play_config": {
