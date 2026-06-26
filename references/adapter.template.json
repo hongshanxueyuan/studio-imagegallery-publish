@@ -1,0 +1,130 @@
+{
+  "name": "imagesgallery-adapter-template",
+  "imagegallery_category": "imagesgallery",
+  "create_block": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/",
+    "headers": {
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": "{studio_base}",
+      "Referer": "{studio_base}/container/{vertical_block_id}"
+    },
+    "json": {
+      "parent_locator": "{vertical_block_id}",
+      "category": "{imagegallery_category}"
+    },
+    "extract": {
+      "block_locator": "locator"
+    }
+  },
+  "upload_image": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{block_locator}/handler/file_upload",
+    "headers": {
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest"
+    },
+    "files": {
+      "files": "{image_file}"
+    }
+  },
+  "change_files_order": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{block_locator}/handler/change_files_order",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}?action=new"
+    },
+    "json": {
+      "ids": "{uploaded_asset_ids}"
+    }
+  },
+  "upload_audio_prepare": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{block_locator}/handler/get_upload_info",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}?action=new"
+    },
+    "json": {
+      "file_name": "{audio_file_name}",
+      "post_fix": "{audio_post_fix}"
+    },
+    "extract": {
+      "file_key": "file_key"
+    }
+  },
+  "upload_audio_register": {
+    "method": "POST",
+    "url": "{studio_base}/api/edxdal/v1/documents/",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "X-CSRFToken": "{csrftoken}",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}?action=new"
+    },
+    "data": {
+      "edx_document_id": "{edx_document_id}",
+      "client_document_id": "{audio_file_name}",
+      "document_type": "audio",
+      "courses": "{courses_json}",
+      "pages": "0",
+      "status": "upload",
+      "csrfmiddlewaretoken": "{csrftoken}"
+    }
+  },
+  "save_audio_binding": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{block_locator}/handler/save_audio",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest"
+    },
+    "json": {
+      "document_id": "{audio_document_id}",
+      "file_name": "{audio_file_name}"
+    }
+  },
+  "submit_studio_edits": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{block_locator}/handler/submit_studio_edits",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}?action=new"
+    },
+    "json": {
+      "values": {
+        "display_name": "有声幻灯片"
+      },
+      "defaults": []
+    }
+  },
+  "save_block": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{block_locator}/handler/update_play_config",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest"
+    },
+    "json": {
+      "play_config": {
+        "show_subtitles": "{show_subtitles}",
+        "time_config": "{time_config_obj}"
+      }
+    }
+  }
+}
