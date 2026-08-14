@@ -61,7 +61,37 @@ This skill is self-contained and does not import `fira-llms` or `fira-gpt-fcs` r
    - upload images
    - upload/register/bind audio
    - save play config and display name
-5. Return created `block_locator` and publish summary.
+5. Return created `block_locator`, the final clickable Studio block URL, and publish summary.
+
+## Batch Publish Safety
+
+If this skill is used from a larger batch workflow:
+
+- Local preparation may be parallelized upstream, but the actual Studio publish phase must run **sequentially**.
+- Do **not** publish multiple decks to Studio concurrently with the same operator session.
+- Reason: concurrent Studio login/session refresh can fight with each other and cause intermittent auth failures such as `401`, `Not Login yet`, csrf/session invalidation, or partial audio-registration failures.
+- Safe pattern:
+  - prepare local `imagesgallery` outputs in parallel if needed
+  - publish deck A to Studio
+  - after deck A fully succeeds, publish deck B
+  - then publish deck C, and so on
+
+## Auth Error Retry Rule
+
+During execute mode, if a publish step fails with an authentication/session-related error, the script should:
+
+- treat errors like `401`, `Not Login yet`, csrf/session invalidation, and similar login/auth messages as retryable auth failures
+- refresh Studio login/session
+- wait a few seconds between retries
+- retry at most **4** times
+- only apply this retry policy to auth-related failures, not generic business/data errors
+
+Typical retryable cases include:
+
+- `upload_audio_register` returns `401 Not Login yet`
+- a later save step fails because csrf/session expired mid-run
+
+If the auth-related retries are exhausted, stop and report the failing step clearly.
 
 ## Command Interface
 
@@ -91,6 +121,8 @@ Arguments:
 - `--cookie`: optional cookie auth mode.
 - `--csrf-token`: optional CSRF override.
 - `--skip-oss-multipart`: debug mode; skip OSS upload after receiving upload info.
+- `--auth-retry-max-retries`: max retries for auth/session related failures; default `4`.
+- `--auth-retry-delay-seconds`: delay between auth retries; default `3`.
 
 ## Adapter Concept
 
@@ -119,3 +151,5 @@ Each template supports:
 - Always run `--dry-run` first for a new site.
 - Script auto-installs `oss2` if missing.
 - Block category is `imagesgallery`.
+- After execute succeeds, always surface the final clickable Studio block URL to the user, not only the raw `block_locator`.
+- In batch completion summaries, list every created Studio block URL separately so operators can click in and do manual fine-tuning.
