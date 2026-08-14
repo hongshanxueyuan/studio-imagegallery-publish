@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -15,9 +16,40 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 
+DEFAULT_AUTH_RETRY_MAX_RETRIES = 4
+DEFAULT_AUTH_RETRY_DELAY_SECONDS = 3.0
+AUTH_ERROR_HINTS = (
+    "not login",
+    "login yet",
+    "unauthorized",
+    "authorization",
+    "authentication",
+    "authenticated",
+    "csrf",
+    "session",
+    "login required",
+    "登录",
+    "认证",
+    "会话",
+)
+
+
 class SafeDict(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+class TemplateCallError(RuntimeError):
+    def __init__(self, step_name: str, status_code: int, payload: Any):
+        self.step_name = step_name
+        self.status_code = int(status_code)
+        self.payload = payload
+        payload_text = payload_to_text(payload)
+        self.payload_text = payload_text[:500]
+        super().__init__(f"{step_name} 失败: HTTP {status_code}, body={payload}")
+
+    def is_auth_related(self) -> bool:
+        return is_auth_related_failure(self.status_code, self.payload)
 
 
 def parse_vertical_block_id(url_input: str) -> str | None:
@@ -28,6 +60,14 @@ def parse_vertical_block_id(url_input: str) -> str | None:
 def normalize_block_url(url_input: str) -> str:
     parsed = urlparse(url_input.strip())
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def build_container_block_url(studio_base: str, block_locator: str) -> str:
+    base = (studio_base or "").rstrip("/")
+    locator = (block_locator or "").strip()
+    if not base or not locator:
+        return ""
+    return f"{base}/container/{locator}"
 
 
 def course_key_from_vertical_block_id(vertical_block_id: str) -> str:
@@ -113,6 +153,54 @@ def maybe_extract_uuid(text: str) -> str:
         text,
     )
     return m.group(0) if m else ""
+
+
+def payload_to_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    try:
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return str(payload)
+
+
+def is_auth_related_failure(status_code: int, payload: Any) -> bool:
+    text = payload_to_text(payload).lower()
+    if int(status_code) == 401:
+        return True
+    if int(status_code) == 403 and any(hint in text for hint in AUTH_ERROR_HINTS):
+        return True
+    return any(hint in text for hint in AUTH_ERROR_HINTS)
+
+
+def call_with_auth_retry(
+    call_fn: Any,
+    refresh_auth_fn: Any = None,
+    *,
+    max_retries: int = DEFAULT_AUTH_RETRY_MAX_RETRIES,
+    delay_seconds: float = DEFAULT_AUTH_RETRY_DELAY_SECONDS,
+) -> tuple[Any, list[dict[str, Any]]]:
+    retry_events: list[dict[str, Any]] = []
+    while True:
+        try:
+            result = call_fn()
+            return result, retry_events
+        except TemplateCallError as exc:
+            if refresh_auth_fn is None or not exc.is_auth_related() or len(retry_events) >= max_retries:
+                raise
+            retry_index = len(retry_events) + 1
+            retry_events.append(
+                {
+                    "retry_index": retry_index,
+                    "reason": "auth_error",
+                    "step": exc.step_name,
+                    "status_code": exc.status_code,
+                    "message": exc.payload_text,
+                }
+            )
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            refresh_auth_fn()
 
 
 def ensure_oss2():
@@ -327,7 +415,7 @@ def call_template(
     record["response"] = payload
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"{name} 失败: HTTP {resp.status_code}, body={payload}")
+        raise TemplateCallError(name, resp.status_code, payload)
 
     extract = rendered.get("extract") or {}
     if isinstance(extract, dict):
@@ -437,12 +525,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     logs: list[dict[str, Any]] = []
     execute = bool(args.execute)
+    can_refresh_auth = bool(execute and account and password and courses_base)
+
+    def refresh_auth_session() -> None:
+        nonlocal session, csrftoken
+        session, login_csrf = login_and_get_studio_session(
+            account=account,
+            password=password,
+            courses_base=courses_base,
+            studio_csrf_url=args.block_url or studio_url,
+        )
+        csrftoken = login_csrf
+        ctx["csrftoken"] = csrftoken
+
+    def call_step(name: str, tmpl: dict[str, Any]) -> dict[str, Any]:
+        record, retry_events = call_with_auth_retry(
+            lambda: call_template(session, name, tmpl, ctx, execute, args.timeout),
+            refresh_auth_session if can_refresh_auth else None,
+            max_retries=max(0, int(args.auth_retry_max_retries)),
+            delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
+        )
+        if retry_events:
+            record["auth_retry_attempts"] = len(retry_events)
+            record["auth_retry_events"] = retry_events
+        return record
 
     for key in ("create_block", "upload_image", "save_block"):
         if key not in adapter:
             raise ValueError(f"adapter 缺失步骤: {key}")
 
-    logs.append(call_template(session, "create_block", adapter["create_block"], ctx, execute, args.timeout))
+    logs.append(call_step("create_block", adapter["create_block"]))
 
     for idx, item in enumerate(manifest["items"], start=1):
         ctx.update(
@@ -457,7 +569,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "end": int(item["end"]),
             }
         )
-        image_step = call_template(session, f"upload_image[{idx}]", adapter["upload_image"], ctx, execute, args.timeout)
+        image_step = call_step(f"upload_image[{idx}]", adapter["upload_image"])
         logs.append(image_step)
         resp = image_step.get("response")
         asset_id = ""
@@ -470,24 +582,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if "change_files_order" in adapter:
         logs.append(
-            call_template(
-                session,
+            call_step(
                 "change_files_order",
                 adapter["change_files_order"],
-                ctx,
-                execute,
-                args.timeout,
             )
         )
 
     if "upload_audio_prepare" in adapter:
-        prepare_step = call_template(
-            session,
+        prepare_step = call_step(
             "upload_audio_prepare",
             adapter["upload_audio_prepare"],
-            ctx,
-            execute,
-            args.timeout,
         )
         logs.append(prepare_step)
         if isinstance(prepare_step.get("response"), dict):
@@ -529,44 +633,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ctx["audio_document_id"] = f"{ctx['edx_document_id']}.{ctx['audio_post_fix']}"
 
     if "upload_audio" in adapter:
-        logs.append(call_template(session, "upload_audio", adapter["upload_audio"], ctx, execute, args.timeout))
+        logs.append(call_step("upload_audio", adapter["upload_audio"]))
 
     if "upload_audio_register" in adapter:
         logs.append(
-            call_template(
-                session,
+            call_step(
                 "upload_audio_register",
                 adapter["upload_audio_register"],
-                ctx,
-                execute,
-                args.timeout,
             )
         )
 
     if "save_audio_binding" in adapter:
         logs.append(
-            call_template(
-                session,
+            call_step(
                 "save_audio_binding",
                 adapter["save_audio_binding"],
-                ctx,
-                execute,
-                args.timeout,
             )
         )
 
     if "submit_studio_edits" in adapter:
         logs.append(
-            call_template(
-                session,
+            call_step(
                 "submit_studio_edits",
                 adapter["submit_studio_edits"],
-                ctx,
-                execute,
-                args.timeout,
             )
         )
-    logs.append(call_template(session, "save_block", adapter["save_block"], ctx, execute, args.timeout))
+    logs.append(call_step("save_block", adapter["save_block"]))
 
     return {
         "mode": "execute" if execute else "dry-run",
@@ -574,6 +666,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "courses_base": courses_base,
         "vertical_block_id": vertical_block_id,
         "block_locator": ctx.get("block_locator", ""),
+        "created_block_url": build_container_block_url(studio_base, str(ctx.get("block_locator", ""))),
+        "auth_retry_policy": {
+            "enabled": can_refresh_auth,
+            "max_retries": max(0, int(args.auth_retry_max_retries)),
+            "delay_seconds": max(0.0, float(args.auth_retry_delay_seconds)),
+        },
         "steps": logs,
     }
 
@@ -601,6 +699,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cookie", default="")
     p.add_argument("--csrf-token", default="")
     p.add_argument("--skip-oss-multipart", action="store_true", help="skip OSS multipart upload after get_upload_info")
+    p.add_argument(
+        "--auth-retry-max-retries",
+        type=int,
+        default=DEFAULT_AUTH_RETRY_MAX_RETRIES,
+        help=f"max retries for auth/login/session related publish errors (default: {DEFAULT_AUTH_RETRY_MAX_RETRIES})",
+    )
+    p.add_argument(
+        "--auth-retry-delay-seconds",
+        type=float,
+        default=DEFAULT_AUTH_RETRY_DELAY_SECONDS,
+        help=f"delay between auth-error retries in seconds (default: {DEFAULT_AUTH_RETRY_DELAY_SECONDS})",
+    )
     return p.parse_args()
 
 
