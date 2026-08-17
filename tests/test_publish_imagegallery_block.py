@@ -1,7 +1,10 @@
+import argparse
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,12 +101,88 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 delay_seconds=0,
             )
 
+    def test_run_returns_target_vertical_url_for_operator_navigation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            image_path = tmp_path / "page-001.png"
+            audio_path = tmp_path / "full_speech.mp3"
+            manifest_path = tmp_path / "imagesgallery.json"
+            adapter_path = tmp_path / "adapter.json"
+
+            image_path.write_bytes(b"fake-image")
+            audio_path.write_bytes(b"fake-audio")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "audio": {"full_audio": str(audio_path)},
+                        "items": [
+                            {
+                                "page": 1,
+                                "image": str(image_path),
+                                "subtitle": "第一页",
+                                "start": 0,
+                                "end": 1000,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            adapter_path.write_text(
+                json.dumps(
+                    {
+                        "create_block": {"method": "POST", "url": "https://studio.example.com/create"},
+                        "upload_image": {"method": "POST", "url": "https://studio.example.com/upload"},
+                        "save_block": {"method": "POST", "url": "https://studio.example.com/save"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            args = argparse.Namespace(
+                studio_url="https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@vertical123",
+                manifest=str(manifest_path),
+                adapter=str(adapter_path),
+                execute=False,
+                dry_run=True,
+                timeout=30,
+                vertical_block_id="",
+                block_url="",
+                courses_base="",
+                account="",
+                password="",
+                cookie="csrftoken=fake",
+                csrf_token="",
+                skip_oss_multipart=False,
+                auth_retry_max_retries=4,
+                auth_retry_delay_seconds=0,
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "FIRA_SAAS_OP_ACCOUNT": "",
+                    "FIRA_SAAS_OP_PASSWORD": "",
+                },
+                clear=False,
+            ):
+                result = module.run(args)
+
+        self.assertEqual(
+            "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@vertical123",
+            result["target_vertical_url"],
+        )
+        self.assertEqual("", result["created_imagegallery_block_url"])
+        self.assertEqual("", result["created_block_url"])
+
     def test_skill_doc_mentions_batch_publish_guardrails(self) -> None:
         skill_doc = SKILL_PATH.read_text(encoding="utf-8")
-        self.assertIn("must run **sequentially**", skill_doc)
-        self.assertIn("retry at most **4** times", skill_doc)
-        self.assertIn("final clickable Studio block URL", skill_doc)
-        self.assertIn("list every created Studio block URL separately", skill_doc)
+        self.assertIn("必须 **顺序执行**", skill_doc)
+        self.assertIn("最多重试 **4** 次", skill_doc)
+        self.assertIn("目标 vertical URL", skill_doc)
+        self.assertIn("新建的 `imagesgallery` block URL", skill_doc)
 
 
 if __name__ == "__main__":

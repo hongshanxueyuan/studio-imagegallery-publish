@@ -660,13 +660,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     logs.append(call_step("save_block", adapter["save_block"]))
 
+    target_vertical_url = build_container_block_url(studio_base, vertical_block_id)
+    created_imagegallery_block_url = build_container_block_url(studio_base, str(ctx.get("block_locator", "")))
+
     return {
         "mode": "execute" if execute else "dry-run",
         "studio_base": studio_base,
         "courses_base": courses_base,
         "vertical_block_id": vertical_block_id,
+        "target_vertical_url": target_vertical_url,
         "block_locator": ctx.get("block_locator", ""),
-        "created_block_url": build_container_block_url(studio_base, str(ctx.get("block_locator", ""))),
+        "created_imagegallery_block_url": created_imagegallery_block_url,
+        "created_block_url": created_imagegallery_block_url,
         "auth_retry_policy": {
             "enabled": can_refresh_auth,
             "max_retries": max(0, int(args.auth_retry_max_retries)),
