@@ -1,99 +1,99 @@
 ---
 name: studio-imagegallery-publish
-description: Publish a local imagesgallery package to Studio as an imagegallery block using configurable API adapters, without relying on fira-llms/fcs runtime code.
+description: 使用可配置的 API 适配器，将本地 imagesgallery 包发布到 Studio，创建为 imagegallery block，不依赖 fira-llms/fcs 运行时代码。
 ---
 
-# Studio ImageGallery Publish
+# Studio ImageGallery 推送
 
-Use this skill to publish local `imagesgallery` output (images + audio + timeline subtitles) into Studio.
+使用这个 skill，把本地 `imagesgallery` 产物（图片 + 音频 + 时间轴字幕）发布到 Studio。
 
-## Credential Preflight (Required Before Execute)
+## 凭据前置检查（执行前必须完成）
 
-This skill must authenticate before creating and editing blocks.
+这个 skill 在创建和编辑 block 之前，必须先完成认证。
 
-Preferred auth inputs:
+优先使用的认证输入：
 
-1. Environment variables (fixed vars, recommended):
+1. 环境变量（固定变量，推荐）：
    - `FIRA_SAAS_OP_ACCOUNT`
    - `FIRA_SAAS_OP_PASSWORD`
-2. CLI flags:
+2. CLI 参数：
    - `--account`
    - `--password`
-3. Existing Studio cookie:
+3. 现有的 Studio Cookie：
    - `--cookie`
 
-If none of the above is provided, the skill must stop and explicitly remind the user to configure:
+如果以上方式都没有提供，这个 skill 必须停下，并明确提醒用户配置：
 
 - `FIRA_SAAS_OP_ACCOUNT`
 - `FIRA_SAAS_OP_PASSWORD`
 
-Security boundary:
+安全边界：
 
-- Do not ask user to provide Alibaba Cloud AK/SK.
-- Do not require AK/SK in Codex user input flow.
-- Audio upload uses STS data returned by Studio `get_upload_info`.
+- 不要要求用户提供阿里云 AK/SK。
+- 不要在 Codex 与用户的交互流程里要求 AK/SK。
+- 音频上传所需的 STS 数据，应来自 Studio `get_upload_info` 的返回结果。
 
-## What This Skill Does
+## 这个 Skill 会做什么
 
-- Parse Studio URL into `studio_base` and `vertical_block_id`.
-- Read local `imagesgallery.json` and verify required files exist.
-- Create a new `imagesgallery` block under the target vertical.
-- Upload page images in page order via `handler/file_upload`.
-- Upload full MP3 via OSS multipart flow after `handler/get_upload_info`.
-- Register audio in `documents` API and bind it to block.
-- Save per-page subtitle/timeline config.
+- 将 Studio URL 解析为 `studio_base` 和 `vertical_block_id`
+- 读取本地 `imagesgallery.json`，并校验所需文件是否存在
+- 在目标 vertical 下创建一个新的 `imagesgallery` block
+- 按页面顺序通过 `handler/file_upload` 上传页面图片
+- 在调用 `handler/get_upload_info` 之后，走 OSS multipart 流程上传完整 MP3
+- 通过 `documents` API 注册音频并绑定到 block
+- 保存逐页字幕 / 时间轴配置
 
-This skill is self-contained and does not import `fira-llms` or `fira-gpt-fcs` runtime logic.
+这个 skill 是自包含的，不会导入 `fira-llms` 或 `fira-gpt-fcs` 的运行时代码。
 
-## Required Inputs
+## 必需输入
 
-- A Studio section URL (`/container/block-v1:...`) or explicit `vertical_block_id`.
-- `imagesgallery.json` (stage-B schema with `audio` and `items[].page/start/end/subtitle`).
-- Optional `--adapter` JSON (normally not needed; default template works across sites).
+- 一个 Studio 小节 URL（`/container/block-v1:...`）或显式的 `vertical_block_id`
+- `imagesgallery.json`（Stage-B schema，包含 `audio` 和 `items[].page/start/end/subtitle`）
+- 可选的 `--adapter` JSON（通常不需要；默认模板已适配大多数站点）
 
-## Workflow
+## 工作流
 
-1. Run credential preflight.
-2. Build runtime context from URL + manifest.
-3. Dry-run request rendering (recommended first).
-4. Execute real publish:
-   - create block
-   - upload images
-   - upload/register/bind audio
-   - save play config and display name
-5. Return created `block_locator`, the final clickable Studio block URL, and publish summary.
+1. 运行凭据前置检查
+2. 根据 URL + manifest 构建运行时上下文
+3. 先做 dry-run 请求渲染（推荐）
+4. 执行真实推送：
+   - 创建 block
+   - 上传图片
+   - 上传 / 注册 / 绑定音频
+   - 保存播放配置和展示名称
+5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
 
-## Batch Publish Safety
+## 批量推送安全规则
 
-If this skill is used from a larger batch workflow:
+如果这个 skill 是在更大的批量工作流里被调用：
 
-- Local preparation may be parallelized upstream, but the actual Studio publish phase must run **sequentially**.
-- Do **not** publish multiple decks to Studio concurrently with the same operator session.
-- Reason: concurrent Studio login/session refresh can fight with each other and cause intermittent auth failures such as `401`, `Not Login yet`, csrf/session invalidation, or partial audio-registration failures.
-- Safe pattern:
-  - prepare local `imagesgallery` outputs in parallel if needed
-  - publish deck A to Studio
-  - after deck A fully succeeds, publish deck B
-  - then publish deck C, and so on
+- 上游的本地准备工作可以并行，但真正的 Studio 推送阶段必须 **顺序执行**
+- **不要**在同一个运营会话里并发向 Studio 推送多个 deck
+- 原因：并发的 Studio 登录 / 会话刷新会互相打架，容易造成间歇性认证失败，例如 `401`、`Not Login yet`、csrf/session 失效，或者部分音频注册失败
+- 安全模式应当是：
+  - 如有需要，可以并行准备本地 `imagesgallery` 产物
+  - 先把 deck A 推到 Studio
+  - deck A 完整成功后，再推 deck B
+  - 然后再推 deck C，以此类推
 
-## Auth Error Retry Rule
+## 认证错误重试规则
 
-During execute mode, if a publish step fails with an authentication/session-related error, the script should:
+在 execute 模式下，如果某个推送步骤因认证 / 会话相关错误失败，脚本应当：
 
-- treat errors like `401`, `Not Login yet`, csrf/session invalidation, and similar login/auth messages as retryable auth failures
-- refresh Studio login/session
-- wait a few seconds between retries
-- retry at most **4** times
-- only apply this retry policy to auth-related failures, not generic business/data errors
+- 将 `401`、`Not Login yet`、csrf/session 失效，以及类似登录/认证错误，视为可重试的认证失败
+- 刷新 Studio 登录 / 会话
+- 每次重试前等待几秒钟
+- 最多重试 **4** 次
+- 这个重试策略只适用于认证相关失败，不适用于普通业务 / 数据错误
 
-Typical retryable cases include:
+典型可重试场景包括：
 
-- `upload_audio_register` returns `401 Not Login yet`
-- a later save step fails because csrf/session expired mid-run
+- `upload_audio_register` 返回 `401 Not Login yet`
+- 后续保存步骤因为 csrf/session 在运行中途过期而失败
 
-If the auth-related retries are exhausted, stop and report the failing step clearly.
+如果认证相关重试次数耗尽，必须停下，并清楚报告失败发生在哪个步骤。
 
-## Command Interface
+## 命令接口
 
 ```bash
 python scripts/publish_imagegallery_block.py \
@@ -110,46 +110,47 @@ python scripts/publish_imagegallery_block.py \
   --courses-base "https://courses.uat.firacademy.com"
 ```
 
-Arguments:
+参数说明：
 
-- `--studio-url`: target Studio container URL.
-- `--manifest`: local `imagesgallery.json` path.
-- `--adapter`: optional adapter config path (default uses `references/adapter.template.json`).
-- `--execute`: execute real requests.
-- `--dry-run`: print rendered request plan without sending state-changing calls.
-- `--account` / `--password`: optional override credentials (defaults to env vars).
-- `--cookie`: optional cookie auth mode.
-- `--csrf-token`: optional CSRF override.
-- `--skip-oss-multipart`: debug mode; skip OSS upload after receiving upload info.
-- `--auth-retry-max-retries`: max retries for auth/session related failures; default `4`.
-- `--auth-retry-delay-seconds`: delay between auth retries; default `3`.
+- `--studio-url`：目标 Studio 容器 URL
+- `--manifest`：本地 `imagesgallery.json` 路径
+- `--adapter`：可选适配器配置路径（默认使用 `references/adapter.template.json`）
+- `--execute`：执行真实请求
+- `--dry-run`：只打印渲染后的请求计划，不发送会改状态的调用
+- `--account` / `--password`：可选账号密码覆盖（默认取环境变量）
+- `--cookie`：可选的 Cookie 认证模式
+- `--csrf-token`：可选的 CSRF 覆盖值
+- `--skip-oss-multipart`：调试模式；拿到上传信息后跳过 OSS 上传
+- `--auth-retry-max-retries`：认证 / 会话错误的最大重试次数；默认 `4`
+- `--auth-retry-delay-seconds`：认证重试之间的等待秒数；默认 `3`
 
-## Adapter Concept
+## Adapter 概念
 
-Adapter defines request templates, but one generic adapter should cover most FIRAcademy sites because `studio_base`/`courses_base` and block locator are resolved at runtime:
+Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
 
 - `create_block`
 - `upload_image`
 - `upload_audio`
 - `save_block`
 
-Each template supports:
+每个模板支持：
 
-- `method`, `url`
-- `headers`, `params`, `json`, `data`
-- `files` (multipart file upload)
-- `extract` (extract response values into runtime context, e.g. `block_locator`)
+- `method`、`url`
+- `headers`、`params`、`json`、`data`
+- `files`（multipart 文件上传）
+- `extract`（把响应中的值提取到运行时上下文，例如 `block_locator`）
 
-## Resources
+## 资源
 
-- `scripts/publish_imagegallery_block.py`: end-to-end publisher.
-- `references/adapter.template.json`: default generic adapter.
+- `scripts/publish_imagegallery_block.py`：端到端发布脚本
+- `references/adapter.template.json`：默认通用 adapter
 
-## Notes
+## 说明
 
-- Keep adapter URLs as full URLs when customizing adapter.
-- Always run `--dry-run` first for a new site.
-- Script auto-installs `oss2` if missing.
-- Block category is `imagesgallery`.
-- After execute succeeds, always surface the final clickable Studio block URL to the user, not only the raw `block_locator`.
-- In batch completion summaries, list every created Studio block URL separately so operators can click in and do manual fine-tuning.
+- 自定义 adapter 时，请保持 adapter 里的 URL 为完整 URL
+- 第一次接入新站点时，务必先跑 `--dry-run`
+- 如果本机缺少 `oss2`，脚本会自动安装
+- block category 固定为 `imagesgallery`
+- execute 成功后，必须向用户**优先返回目标 vertical URL**，因为运营复核和细调通常要回到小节页面；不能只给原始 `block_locator`
+- 如果需要补充技术细节，可以附带新建的 `imagesgallery` block URL，但它不应作为默认主链接
+- 在批量完成总结里，要把每一个目标 `vertical` URL 分开列出，方便运营逐个点进去做人工微调
