@@ -133,5 +133,47 @@
         "time_config": "{time_config_obj}"
       }
     }
+  },
+  "reorder_children": {
+    "method": "PUT",
+    "url": "{studio_base}/xblock/{vertical_block_id}",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}"
+    },
+    "json": {
+      "children": "{vertical_children_obj}"
+    }
+  },
+  "delete_block": {
+    "method": "DELETE",
+    "url": "{studio_base}/xblock/{delete_block_locator}",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}"
+    }
+  },
+  "publish_vertical": {
+    "method": "POST",
+    "url": "{studio_base}/xblock/{vertical_block_id}",
+    "headers": {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "X-CSRFToken": "{csrftoken}",
+      "X-Requested-With": "XMLHttpRequest",
+      "X-HTTP-Method-Override": "PATCH",
+      "Origin": "{studio_base}",
+      "Referer": "{block_url}"
+    },
+    "json": {
+      "publish": "make_public"
+    }
   }
 }

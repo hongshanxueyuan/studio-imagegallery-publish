@@ -61,6 +61,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
    - 上传图片
    - 上传 / 注册 / 绑定音频
    - 保存播放配置和展示名称
+   - 如提供课程结构信息，则按课程结构执行就地替换 / 删除旧块 / 发布 vertical
 5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
 
 ## 批量推送安全规则
@@ -110,6 +111,22 @@ python scripts/publish_imagegallery_block.py \
   --courses-base "https://courses.uat.firacademy.com"
 ```
 
+```bash
+python scripts/publish_imagegallery_block.py \
+  --studio-url "https://studio.uat.firacademy.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --manifest "/path/to/imagesgallery/imagesgallery.json" \
+  --course-structure-json "/path/to/fira_course-....json" \
+  --source-vertical-block-id "block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --execute
+```
+
+```bash
+python scripts/publish_imagegallery_block.py \
+  --targets-file "/path/to/imagegallery-push-studio-targets.json" \
+  --report-file "/path/to/imagegallery-publish-report.json" \
+  --execute
+```
+
 参数说明：
 
 - `--studio-url`：目标 Studio 容器 URL
@@ -123,13 +140,19 @@ python scripts/publish_imagegallery_block.py \
 - `--skip-oss-multipart`：调试模式；拿到上传信息后跳过 OSS 上传
 - `--auth-retry-max-retries`：认证 / 会话错误的最大重试次数；默认 `4`
 - `--auth-retry-delay-seconds`：认证重试之间的等待秒数；默认 `3`
+- `--course-structure-json`：启用课程结构驱动的就地替换逻辑
+- `--source-vertical-block-id`：当目标课是导入副本时，用源课 vertical locator 做课程结构匹配
+- `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
+- `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`manual_followup_failed`
 
 ## Adapter 概念
-
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
 
 - `create_block`
 - `upload_image`
+- `reorder_children`
+- `delete_block`
+- `publish_vertical`
 - `upload_audio`
 - `save_block`
 
@@ -154,3 +177,4 @@ Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用
 - execute 成功后，必须向用户**优先返回目标 vertical URL**，因为运营复核和细调通常要回到小节页面；不能只给原始 `block_locator`
 - 如果需要补充技术细节，可以附带新建的 `imagesgallery` block URL，但它不应作为默认主链接
 - 在批量完成总结里，要把每一个目标 `vertical` URL 分开列出，方便运营逐个点进去做人工微调
+- 批量 rerun 时，脚本会在每个目标开始前重新读取 `course_structure_json`，避免整轮都沿用同一份旧快照
