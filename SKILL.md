@@ -7,9 +7,9 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 使用这个 skill，把本地 `imagesgallery` 产物（图片 + 音频 + 时间轴字幕）发布到 Studio。
 
-## 凭据前置检查（执行前必须完成）
+## 真实推送的凭据前置检查
 
-这个 skill 在创建和编辑 block 之前，必须先完成认证。
+真实推送创建或编辑 block 之前，必须先完成认证。`--dry-run` 不访问 Studio 或 OSS，也不会登录；不需要认证输入，请求计划中的认证字段会显示为 `<redacted>`。
 
 优先使用的认证输入：
 
@@ -22,7 +22,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 3. 现有的 Studio Cookie：
    - `--cookie`
 
-如果以上方式都没有提供，这个 skill 必须停下，并明确提醒用户配置：
+如果执行真实推送时以上方式都没有提供，这个 skill 必须停下，并明确提醒用户配置：
 
 - `FIRA_SAAS_OP_ACCOUNT`
 - `FIRA_SAAS_OP_PASSWORD`
@@ -53,7 +53,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 ## 工作流
 
-1. 运行凭据前置检查
+1. 仅在真实推送前运行凭据检查；dry-run 无需凭据
 2. 根据 URL + manifest 构建运行时上下文
 3. 先做 dry-run 请求渲染（推荐）
 4. 执行真实推送：
@@ -116,7 +116,7 @@ python scripts/publish_imagegallery_block.py \
 - `--manifest`：本地 `imagesgallery.json` 路径
 - `--adapter`：可选适配器配置路径（默认使用 `references/adapter.template.json`）
 - `--execute`：执行真实请求
-- `--dry-run`：只打印渲染后的请求计划，不发送会改状态的调用
+- `--dry-run`：离线打印渲染后的请求计划，不登录、不向 Studio 或 OSS 发请求；认证字段使用 `<redacted>` 占位符，也不要求认证输入
 - `--account` / `--password`：可选账号密码覆盖（默认取环境变量）
 - `--cookie`：可选的 Cookie 认证模式
 - `--csrf-token`：可选的 CSRF 覆盖值

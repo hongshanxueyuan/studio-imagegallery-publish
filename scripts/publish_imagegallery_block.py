@@ -357,6 +357,29 @@ def build_files(files_spec: dict[str, Any], ctx: dict[str, Any]) -> dict[str, An
     return out
 
 
+def redact_sensitive_fields(value: Any) -> Any:
+    sensitive_hints = (
+        "authorization",
+        "cookie",
+        "credential",
+        "csrf",
+        "password",
+        "secret",
+        "session",
+        "token",
+    )
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>"
+            if any(hint in str(key).lower() for hint in sensitive_hints)
+            else redact_sensitive_fields(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_fields(item) for item in value]
+    return value
+
+
 def call_template(
     session: requests.Session,
     name: str,
@@ -379,10 +402,10 @@ def call_template(
         "method": method,
         "url": url,
         "request": {
-            "headers": headers,
-            "params": params,
-            "json": json_body,
-            "data": data_body,
+            "headers": redact_sensitive_fields(headers),
+            "params": redact_sensitive_fields(params),
+            "json": redact_sensitive_fields(json_body),
+            "data": redact_sensitive_fields(data_body),
             "has_files": bool(files_spec),
         },
     }
@@ -443,8 +466,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not vertical_block_id:
         raise ValueError("无法从 studio_url 解析 vertical_block_id，请显式传 --vertical-block-id")
 
+    execute = bool(args.execute)
     session = requests.Session()
-    csrftoken = args.csrf_token or ""
+    csrftoken = (args.csrf_token or "") if execute else ""
 
     account = (args.account or os.environ.get("FIRA_SAAS_OP_ACCOUNT", "")).strip()
     password = (args.password or os.environ.get("FIRA_SAAS_OP_PASSWORD", "")).strip()
@@ -452,13 +476,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not courses_base:
         courses_base = derive_courses_base_from_studio_base(studio_base)
 
-    if not args.cookie and (not account or not password):
+    if execute and not args.cookie and (not account or not password):
         raise ValueError(
             "缺少登录凭证。请提供 --account/--password，或配置环境变量 "
             "FIRA_SAAS_OP_ACCOUNT / FIRA_SAAS_OP_PASSWORD。"
         )
 
-    if account and password and courses_base:
+    if execute and account and password and courses_base:
         session, login_csrf = login_and_get_studio_session(
             account=account,
             password=password,
@@ -468,7 +492,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if not csrftoken:
             csrftoken = login_csrf
 
-    if args.cookie:
+    if execute and args.cookie:
         cookies = parse_cookie_header(args.cookie)
         for k, v in cookies.items():
             session.cookies.set(k, v, domain=urlparse(studio_base).hostname or "")
@@ -524,7 +548,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ctx["courses_json"] = json.dumps({ctx["course_key"]: False}, ensure_ascii=False)
 
     logs: list[dict[str, Any]] = []
-    execute = bool(args.execute)
     can_refresh_auth = bool(execute and account and password and courses_base)
 
     def refresh_auth_session() -> None:
