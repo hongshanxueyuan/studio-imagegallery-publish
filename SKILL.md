@@ -66,6 +66,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 ## HTML 来源课程的重复要点清理
 
+- 修改来源元数据的生成或传递时，也检查 `ppt-to-imagesgallery` 的[批任务字段传递](https://github.com/hongshanxueyuan/ppt-to-imagesgallery/blob/main/scripts/plan_batch_jobs.py)、[Stage-A manifest 生成](https://github.com/hongshanxueyuan/ppt-to-imagesgallery/blob/main/scripts/build_imagesgallery.py)和[Stage-B 字段保留](https://github.com/hongshanxueyuan/ppt-to-imagesgallery/blob/main/scripts/synthesize_imagesgallery_audio.py)。这三处共同决定 `section-list.json` 中的来源信息如何到达发布器。
 - 新生成的 `imagesgallery.json` 应携带顶层 `block_type`、`section_id` 和 `section_title`。
 - 发布器优先读取 manifest 的 `block_type`。旧 manifest 缺少该字段时，使用 `section-list.json`：先按 `section_id` 精确匹配；只有 ID 不可用时才允许按唯一小节标题匹配。
 - 来源标记缺失、冲突或匹配不唯一时，正常发布仍可替换正文，但不会自动删除 HTML；结果会标记人工跟进并在可识别时附上目标 block 链接。
