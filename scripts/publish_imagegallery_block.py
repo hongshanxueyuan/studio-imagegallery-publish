@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import mimetypes
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import time
 from json import JSONDecodeError
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -36,6 +38,237 @@ AUTH_ERROR_HINTS = (
 )
 BLOCK_LOCATOR_PREFIX_RE = re.compile(r"^(block-v1:)([^+]+\+[^+]+\+[^+]+)")
 HTML_MAIN_BODY_HINTS = ("正文", "文字讲解", "课程内容", "main", "body", "content")
+HTML_SUMMARY_HEADING = "本节要点"
+
+
+class VisibleTextParser(HTMLParser):
+    BLOCK_TAGS = {"address", "article", "blockquote", "br", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "p", "section"}
+    HIDDEN_TAGS = {"audio", "iframe", "object", "script", "style", "svg", "video"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hidden_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.HIDDEN_TAGS:
+            self.hidden_depth += 1
+        if tag in self.BLOCK_TAGS and self.hidden_depth == 0:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.HIDDEN_TAGS and self.hidden_depth:
+            self.hidden_depth -= 1
+        if tag in self.BLOCK_TAGS and self.hidden_depth == 0:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.hidden_depth == 0:
+            self.parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self.hidden_depth == 0:
+            self.parts.append(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:
+        if self.hidden_depth == 0:
+            self.parts.append(html.unescape(f"&#{name};"))
+
+
+def visible_text(value: Any) -> str:
+    raw = str(value or "")
+    raw = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", raw)
+    raw = re.sub(r"!\[[^\]]*\]\[[^]]*\]", " ", raw)
+    parser = VisibleTextParser()
+    try:
+        parser.feed(raw)
+        text = "".join(parser.parts)
+    except Exception:
+        text = re.sub(r"<[^>]*>", " ", raw)
+    return html.unescape(text)
+
+
+def first_visible_line(value: Any) -> str:
+    for line in visible_text(value).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^#{1,6}\s*", "", line).strip()
+        if line:
+            return re.sub(r"\s+", " ", line)
+    return ""
+
+
+def gallery_summary_heading(manifest: dict[str, Any]) -> str:
+    items = manifest.get("items")
+    if not isinstance(items, list) or not items:
+        return ""
+    final_item = max(
+        (item for item in items if isinstance(item, dict)),
+        key=lambda item: int(item.get("page", item.get("page_number", 0)) or 0),
+        default={},
+    )
+    for key in ("heading", "title", "page_title", "subtitle", "speech", "text", "content"):
+        if key in final_item:
+            heading = first_visible_line(final_item.get(key))
+            if heading:
+                return heading
+    return ""
+
+
+def gallery_summary_heading_from_block(block: dict[str, Any]) -> str:
+    visited: set[int] = set()
+
+    def find_page_list(value: Any, depth: int = 0) -> list[dict[str, Any]] | None:
+        if depth > 8 or value is None or id(value) in visited:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    return find_page_list(json.loads(text), depth + 1)
+                except JSONDecodeError:
+                    return None
+            return None
+        visited.add(id(value))
+        if isinstance(value, list):
+            if value and all(isinstance(item, dict) for item in value) and any(
+                any(key in item for key in ("subtitle", "heading", "title", "page", "page_number"))
+                for item in value
+            ):
+                return value
+            for item in value:
+                found = find_page_list(item, depth + 1)
+                if found is not None:
+                    return found
+            return None
+        if isinstance(value, dict):
+            for key in ("time_config", "items", "pages", "slides"):
+                candidate = value.get(key)
+                if isinstance(candidate, list) and candidate and all(isinstance(item, dict) for item in candidate):
+                    return candidate
+            for nested in value.values():
+                found = find_page_list(nested, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    pages = find_page_list(block)
+    if not pages:
+        return ""
+    final_page = max(
+        pages,
+        key=lambda item: int(item.get("page", item.get("page_number", 0)) or 0),
+    )
+    return gallery_summary_heading({"items": [final_page]})
+
+
+def summary_block_name(block: dict[str, Any]) -> str:
+    metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+    for key in ("name", "display_name", "title"):
+        for source in (block, metadata):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def is_summary_html_block(block: dict[str, Any]) -> bool:
+    name = first_visible_line(summary_block_name(block))
+    if name == HTML_SUMMARY_HEADING:
+        return True
+    for key in ("html", "text", "body", "content"):
+        value = block.get(key)
+        if isinstance(value, str) and first_visible_line(value).startswith(HTML_SUMMARY_HEADING):
+            return True
+    metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+    return any(
+        isinstance(metadata.get(key), str)
+        and first_visible_line(metadata[key]).startswith(HTML_SUMMARY_HEADING)
+        for key in ("html", "text", "body", "content")
+    )
+
+
+def terminal_summary_blocks(vertical: dict[str, Any]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for block in reversed(vertical.get("blocks", [])):
+        if not isinstance(block, dict) or block_category(block) != "html":
+            break
+        if block_locator(block) and is_summary_html_block(block):
+            matches.append(block)
+    return list(reversed(matches))
+
+
+def plan_summary_cleanup_only(
+    course_structure: dict[str, Any],
+    *,
+    source_vertical_block_id: str,
+    target_vertical_block_id: str,
+) -> dict[str, Any]:
+    source_id = str(source_vertical_block_id or "").strip()
+    target_id = str(target_vertical_block_id or source_id).strip()
+    records = iter_section_vertical_records(course_structure)
+    record_by_vertical = {
+        str(record["vertical"].get("block_location", "")).strip(): record
+        for record in records
+        if str(record["vertical"].get("block_location", "")).strip()
+    }
+    record = record_by_vertical.get(source_id) or record_by_vertical.get(target_id)
+    if record is None:
+        raise PublishFailure("course_structure_lookup", f"target vertical not found: {target_id or source_id}")
+
+    vertical = record["vertical"]
+    galleries = [
+        block for block in vertical.get("blocks", [])
+        if isinstance(block, dict)
+        and block_category(block) == "imagesgallery"
+        and block_locator(block)
+        and gallery_summary_heading_from_block(block) == HTML_SUMMARY_HEADING
+    ]
+    summary_blocks = terminal_summary_blocks(vertical)
+    working_vertical_id = remap_block_locator_course(
+        str(vertical.get("block_location", "")).strip(),
+        source_id,
+        target_id,
+    )
+    current_children = [
+        remap_block_locator_course(block_locator(block), source_id, target_id)
+        for block in vertical.get("blocks", [])
+        if isinstance(block, dict) and block_locator(block)
+    ]
+    gallery = galleries[0] if len(galleries) == 1 else None
+    summary = summary_blocks[0] if len(summary_blocks) == 1 else None
+    status = (
+        "ready" if gallery is not None and summary is not None and len(galleries) == 1 and len(summary_blocks) == 1 else
+        "ambiguous_gallery" if len(galleries) > 1 else
+        "ambiguous_summary" if len(summary_blocks) > 1 else
+        "gallery_summary_missing" if not galleries else
+        "summary_target_missing"
+    )
+    return {
+        "result_type": "cleanup_only",
+        "cleanup_only": True,
+        "cleanup_only_status": status,
+        "source_vertical_block_id": source_id,
+        "target_vertical_block_id": target_id,
+        "working_vertical_block_id": working_vertical_id,
+        "working_vertical_name": str(vertical.get("name", "")),
+        "current_children": current_children,
+        "matched_source_block_locator": "",
+        "matched_source_block_category": "",
+        "matched_summary_block_locator": remap_block_locator_course(block_locator(summary), source_id, target_id) if summary else "",
+        "matched_summary_component_name": summary_block_name(summary) if summary else "",
+        "summary_cleanup_required": True,
+        "summary_cleanup_status": "matched" if summary else "not_found",
+        "summary_cleanup_candidates": [
+            {"block_locator": block_locator(block), "component_name": summary_block_name(block)}
+            for block in summary_blocks
+        ],
+        "existing_gallery_block_locator": remap_block_locator_course(block_locator(gallery), source_id, target_id) if gallery else "",
+        "existing_gallery_component_name": summary_block_name(gallery) if gallery else "",
+        "existing_gallery_heading": HTML_SUMMARY_HEADING if gallery else "",
+        "all_structure_block_ids": collect_structure_block_ids(course_structure),
+    }
 
 
 class SafeDict(dict):
@@ -60,6 +293,7 @@ class PublishFailure(RuntimeError):
     def __init__(self, step_name: str, message: str, *, payload: Any = None):
         self.step_name = step_name
         self.payload = payload
+        self.steps: list[dict[str, Any]] = []
         super().__init__(message)
 
 
@@ -98,6 +332,101 @@ def course_key_from_vertical_block_id(vertical_block_id: str) -> str:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def section_list_records(section_list_path: Path) -> list[dict[str, Any]]:
+    data = read_json(section_list_path)
+    if isinstance(data, list):
+        return [record for record in data if isinstance(record, dict)]
+    if not isinstance(data, dict):
+        return []
+    records = data.get("sections")
+    if isinstance(records, list):
+        return [record for record in records if isinstance(record, dict)]
+    nested: list[dict[str, Any]] = []
+    for chapter in data.get("chapters", []):
+        if isinstance(chapter, dict):
+            nested.extend(
+                section for section in chapter.get("sections", [])
+                if isinstance(section, dict)
+            )
+    return nested
+
+
+def find_section_list_path(manifest_path: Path, explicit_path: str = "") -> Path | None:
+    if explicit_path:
+        candidate = Path(explicit_path).expanduser().resolve()
+        return candidate if candidate.is_file() else None
+    for directory in (manifest_path.parent, *manifest_path.parent.parents):
+        candidate = directory / "section-list.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def resolve_source_block_type(
+    manifest: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    manifest_path: Path,
+    section_list_json: str = "",
+) -> dict[str, str]:
+    manifest_type = str(manifest.get("block_type", "") or "").strip().lower()
+    target_type = str(target.get("block_type", target.get("source_block_type", "")) or "").strip().lower()
+    manifest_id = str(manifest.get("section_id", "") or "").strip()
+    target_id = str(target.get("section_id", "") or "").strip()
+    manifest_title = str(manifest.get("section_title", "") or "").strip()
+    target_title = str(target.get("section_title", target.get("section_name", "")) or "").strip()
+
+    if manifest_id and target_id and manifest_id != target_id:
+        return {"status": "conflict", "block_type": "", "reason": "manifest and publish target have conflicting section_id values"}
+    if manifest_title and target_title and manifest_title != target_title:
+        return {"status": "conflict", "block_type": "", "reason": "manifest and publish target have conflicting section titles"}
+    if manifest_type and target_type and manifest_type != target_type:
+        return {"status": "conflict", "block_type": "", "reason": "manifest and publish target have conflicting block_type values"}
+
+    if manifest_type:
+        return {"status": "resolved", "block_type": manifest_type, "reason": "source type read from gallery manifest"}
+
+    section_path = find_section_list_path(manifest_path, section_list_json)
+    if section_path is None:
+        if target_type:
+            return {"status": "resolved", "block_type": target_type, "reason": "source type read from publish target"}
+        return {"status": "missing", "block_type": "", "reason": "no section-list.json source metadata was found"}
+    try:
+        records = section_list_records(section_path)
+    except Exception as exc:
+        return {"status": "missing", "block_type": "", "reason": f"could not read section-list.json: {exc}"}
+
+    section_id = manifest_id or target_id
+    section_title = manifest_title or target_title
+    if section_id:
+        matches = [record for record in records if str(record.get("section_id", "") or "").strip() == section_id]
+        if not matches:
+            return {"status": "missing", "block_type": "", "reason": f"section-list.json has no section_id {section_id}"}
+        if len(matches) != 1:
+            return {"status": "ambiguous", "block_type": "", "reason": f"section-list.json has multiple records for section_id {section_id}"}
+    elif section_title:
+        matches = [
+            record for record in records
+            if any(
+                str(record.get(key, "") or "").strip() == section_title
+                for key in ("section_title", "title", "resource_title")
+            )
+        ]
+        if not matches:
+            return {"status": "missing", "block_type": "", "reason": f"section-list.json has no section titled {section_title}"}
+        if len(matches) != 1:
+            return {"status": "ambiguous", "block_type": "", "reason": f"section-list.json has multiple records titled {section_title}"}
+    else:
+        return {"status": "missing", "block_type": "", "reason": "section metadata has neither section_id nor title"}
+
+    source_type = str(matches[0].get("block_type", "") or "").strip().lower()
+    if not source_type:
+        return {"status": "missing", "block_type": "", "reason": "matched section-list.json record has no block_type"}
+    if target_type and target_type != source_type:
+        return {"status": "conflict", "block_type": "", "reason": "publish target and section-list.json have conflicting block_type values"}
+    return {"status": "resolved", "block_type": source_type, "reason": f"source type read from {section_path.name}"}
 
 
 def read_json_with_diagnostics(path: Path, *, step_name: str) -> Any:
@@ -171,6 +500,12 @@ def normalize_concise_block(node: dict[str, Any], *, block_order: str) -> dict[s
         "block_order": block_order,
         "html": text_value,
         "text": text_value,
+        "metadata": metadata,
+        "content": node.get("content", metadata.get("content", "")),
+        "play_config": node.get("play_config", metadata.get("play_config", {})),
+        "time_config": node.get("time_config", metadata.get("time_config", [])),
+        "items": node.get("items", metadata.get("items", [])),
+        "data": node.get("data", metadata.get("data", {})),
         "published": node.get("published"),
     }
 
@@ -425,6 +760,8 @@ def plan_publish_replacement(
     source_vertical_block_id: str,
     target_vertical_block_id: str,
     excluded_block_locators: list[str] | None = None,
+    summary_detection_requested: bool = False,
+    summary_cleanup_required: bool = False,
 ) -> dict[str, Any]:
     source_vertical_block_id = str(source_vertical_block_id or "").strip()
     target_vertical_block_id = str(target_vertical_block_id or source_vertical_block_id).strip()
@@ -444,6 +781,13 @@ def plan_publish_replacement(
         excluded_block_locators=excluded,
     )
     target_record = lookup_record
+    summary_matches = terminal_summary_blocks(target_record["vertical"]) if summary_detection_requested else []
+    summary_match_locators = {
+        block_locator(block)
+        for block in summary_matches
+        if block_locator(block)
+    }
+    excluded_for_body = excluded | summary_match_locators
     matched_block: dict[str, Any] | None = None
     working_record = target_record
     match_scope = "fallback"
@@ -460,7 +804,7 @@ def plan_publish_replacement(
     else:
         matched_block = pick_best_html_candidate(
             target_record["vertical"],
-            excluded_block_locators=excluded,
+            excluded_block_locators=excluded_for_body,
         )
         if matched_block is not None:
             match_scope = "target_vertical"
@@ -472,7 +816,7 @@ def plan_publish_replacement(
                     continue
                 candidate = pick_best_html_candidate(
                     vertical,
-                    excluded_block_locators=excluded,
+                    excluded_block_locators=excluded_for_body if vertical is target_record["vertical"] else excluded,
                 )
                 if candidate is None:
                     continue
@@ -503,6 +847,15 @@ def plan_publish_replacement(
         )
         matched_source_block_category = block_category(matched_block)
 
+    matched_summary_block = summary_matches[0] if len(summary_matches) == 1 else None
+    summary_cleanup_status = (
+        "matched" if matched_summary_block is not None else
+        "ambiguous" if len(summary_matches) > 1 else
+        "not_found" if summary_cleanup_required else
+        "not_requested"
+    )
+    matched_summary_locator = block_locator(matched_summary_block) if matched_summary_block else ""
+
     return {
         "course_kind": course_kind,
         "result_type": result_type,
@@ -518,6 +871,18 @@ def plan_publish_replacement(
         "current_children": current_children,
         "matched_source_block_locator": matched_source_block_locator,
         "matched_source_block_category": matched_source_block_category,
+        "summary_detection_requested": bool(summary_detection_requested),
+        "summary_cleanup_required": bool(summary_cleanup_required),
+        "summary_cleanup_status": summary_cleanup_status,
+        "summary_cleanup_candidates": [
+            {
+                "block_locator": block_locator(block),
+                "component_name": summary_block_name(block),
+            }
+            for block in summary_matches
+        ],
+        "matched_summary_block_locator": matched_summary_locator,
+        "matched_summary_component_name": summary_block_name(matched_summary_block) if matched_summary_block else "",
         "all_structure_block_ids": [
             remap_block_locator_course(block_id, source_vertical_block_id, target_vertical_block_id)
             for block_id in collect_structure_block_ids(course_structure)
@@ -912,6 +1277,8 @@ def maybe_fetch_live_replacement_plan(
     source_vertical_block_id: str,
     target_vertical_block_id: str,
     excluded_block_locators: list[str] | None = None,
+    summary_detection_requested: bool = False,
+    summary_cleanup_required: bool = False,
     args: argparse.Namespace,
     timeout: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -945,6 +1312,8 @@ def maybe_fetch_live_replacement_plan(
                 source_vertical_block_id=source_vertical_block_id,
                 target_vertical_block_id=target_vertical_block_id,
                 excluded_block_locators=excluded_block_locators,
+                summary_detection_requested=summary_detection_requested,
+                summary_cleanup_required=summary_cleanup_required,
             ),
             "live_target",
         )
@@ -954,6 +1323,62 @@ def maybe_fetch_live_replacement_plan(
             "course_key": course_key,
             "working_vertical_block_id": live_plan.get("working_vertical_block_id", ""),
             "matched_source_block_locator": live_plan.get("matched_source_block_locator", ""),
+        }
+    except PublishFailure as exc:
+        return None, {
+            "step": "load_live_target_structure",
+            "status": "warning",
+            "course_key": course_key,
+            "note": str(exc),
+        }
+
+
+def maybe_fetch_live_cleanup_plan(
+    *,
+    studio_url: str,
+    source_vertical_block_id: str,
+    target_vertical_block_id: str,
+    args: argparse.Namespace,
+    timeout: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not bool(getattr(args, "execute", False)):
+        return None, None
+    studio_base = studio_base_from_url(studio_url)
+    course_key = course_key_from_vertical_block_id(target_vertical_block_id)
+    if not studio_base or not course_key:
+        return None, None
+    session, _csrftoken, auth_ready = build_studio_session_from_args(
+        studio_base=studio_base,
+        studio_url=studio_url,
+        args=args,
+        allow_login=True,
+    )
+    if not auth_ready:
+        return None, {
+            "step": "load_live_target_structure",
+            "status": "warning",
+            "course_key": course_key,
+            "note": "execute mode requires an authenticated live target structure before cleanup-only actions",
+        }
+    try:
+        structure = fetch_live_course_structure(
+            session,
+            studio_base=studio_base,
+            course_key=course_key,
+            timeout=timeout,
+        )
+        plan = plan_summary_cleanup_only(
+            structure,
+            source_vertical_block_id=source_vertical_block_id,
+            target_vertical_block_id=target_vertical_block_id,
+        )
+        plan["plan_source"] = "live_target"
+        return plan, {
+            "step": "load_live_target_structure",
+            "status": "ok",
+            "course_key": course_key,
+            "working_vertical_block_id": plan.get("working_vertical_block_id", ""),
+            "matched_summary_block_locator": plan.get("matched_summary_block_locator", ""),
         }
     except PublishFailure as exc:
         return None, {
@@ -1143,12 +1568,16 @@ def load_course_structure_snapshot(course_structure_path: Path) -> dict[str, Any
 def group_batch_results(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     replaced = [result for result in results if result.get("status") == "replaced"]
     fallback_inserted = [result for result in results if result.get("status") == "fallback_inserted"]
+    cleaned = [result for result in results if result.get("status") == "cleaned"]
+    cleanup_planned = [result for result in results if result.get("status") == "cleanup_planned"]
     failed = [result for result in results if result.get("status") == "failed"]
     manual_followup_failed = [result for result in failed if bool(result.get("requires_manual_followup", True))]
     unexpected_failed = [result for result in failed if not bool(result.get("requires_manual_followup", True))]
     return {
         "replaced": replaced,
         "fallback_inserted": fallback_inserted,
+        "cleaned": cleaned,
+        "cleanup_planned": cleanup_planned,
         "failed": failed,
         "manual_followup_failed": manual_followup_failed,
         "unexpected_failed": unexpected_failed,
@@ -1161,6 +1590,8 @@ def build_batch_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total": len(results),
         "replaced_count": len(grouped["replaced"]),
         "fallback_inserted_count": len(grouped["fallback_inserted"]),
+        "cleaned_count": len(grouped["cleaned"]),
+        "cleanup_planned_count": len(grouped["cleanup_planned"]),
         "failed_count": len(grouped["failed"]),
         "manual_followup_failed_count": len(grouped["manual_followup_failed"]),
         "unexpected_failed_count": len(grouped["unexpected_failed"]),
@@ -1291,6 +1722,136 @@ def operator_vertical_urls(studio_base: str, replacement_plan: dict[str, Any], f
     return working_vertical_url, requested_vertical_url
 
 
+def process_cleanup_only_target(
+    target: dict[str, Any],
+    course_structure: dict[str, Any],
+    args: argparse.Namespace,
+    adapter: dict[str, Any],
+    *,
+    target_vertical_block_id: str,
+    source_vertical_block_id: str,
+    studio_vertical_url: str,
+) -> dict[str, Any]:
+    studio_base = studio_base_from_url(studio_vertical_url)
+    plan = plan_summary_cleanup_only(
+        course_structure,
+        source_vertical_block_id=source_vertical_block_id,
+        target_vertical_block_id=target_vertical_block_id,
+    )
+    plan["plan_source"] = "course_structure_json"
+    live_step = None
+    if bool(getattr(args, "execute", False)):
+        live_plan, live_step = maybe_fetch_live_cleanup_plan(
+            studio_url=studio_vertical_url,
+            source_vertical_block_id=source_vertical_block_id,
+            target_vertical_block_id=target_vertical_block_id,
+            args=args,
+            timeout=int(getattr(args, "timeout", 30)),
+        )
+        if live_plan is None:
+            return {
+                "status": "failed",
+                "target_vertical_block_id": target_vertical_block_id,
+                "target_vertical_url": studio_vertical_url,
+                "failed_step": "load_live_target_structure",
+                "failure_bucket": "manual_followup",
+                "requires_manual_followup": True,
+                "note": str((live_step or {}).get("note") or "cleanup-only execution needs a fresh live target structure"),
+                "steps": [live_step] if live_step else [],
+            }
+        plan = live_plan
+    if live_step:
+        plan["preflight_steps"] = [live_step]
+
+    if plan.get("cleanup_only_status") != "ready":
+        operator_vertical_url = build_container_block_url(studio_base, str(plan.get("working_vertical_block_id", ""))) or studio_vertical_url
+        candidates = list(plan.get("summary_cleanup_candidates", []))
+        for candidate in candidates:
+            candidate["block_url"] = build_container_block_url(studio_base, str(candidate.get("block_locator", "")))
+        return {
+            "status": "failed",
+            "cleanup_only": True,
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": operator_vertical_url,
+            "failed_step": "cleanup_preflight",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": {
+                "ambiguous_gallery": "multiple existing galleries end with 本节要点; choose the correct gallery manually",
+                "ambiguous_summary": "multiple terminal HTML summary components match; choose the correct component manually",
+                "gallery_summary_missing": "no existing gallery in this vertical ends with 本节要点; no cleanup was performed",
+                "summary_target_missing": "no terminal HTML summary component was found; no cleanup was performed",
+            }.get(str(plan.get("cleanup_only_status")), "cleanup-only preflight could not identify a safe target"),
+            "summary_cleanup": {
+                "status": str(plan.get("cleanup_only_status", "failed")),
+                "gallery_heading": str(plan.get("existing_gallery_heading", "")),
+                "gallery_locator": str(plan.get("existing_gallery_block_locator", "")),
+                "gallery_url": build_container_block_url(studio_base, str(plan.get("existing_gallery_block_locator", ""))),
+                "block_locator": str(plan.get("matched_summary_block_locator", "")),
+                "block_url": build_container_block_url(studio_base, str(plan.get("matched_summary_block_locator", ""))),
+                "component_name": str(plan.get("matched_summary_component_name", "")),
+                "candidates": candidates,
+            },
+            "steps": list(plan.get("preflight_steps", [])),
+        }
+
+    working_vertical_url = build_container_block_url(studio_base, str(plan.get("working_vertical_block_id", ""))) or studio_vertical_url
+    try:
+        result = apply_in_place_publish_actions(
+            {
+                "studio_base": studio_base,
+                "block_locator": "",
+                "steps": list(plan.get("preflight_steps", [])),
+            },
+            adapter=adapter,
+            replacement_plan=plan,
+            studio_url=studio_vertical_url,
+            execute=bool(getattr(args, "execute", False)),
+            timeout=int(getattr(args, "timeout", 30)),
+            args=args,
+            cleanup_only=True,
+        )
+        result["cleanup_only"] = True
+        result["target_name"] = str(target.get("name", ""))
+        return result
+    except PublishFailure as exc:
+        steps = list(exc.steps or plan.get("preflight_steps", []))
+        summary_locator = str(plan.get("matched_summary_block_locator", ""))
+        failed_delete = any(
+            step.get("step") == "delete_block"
+            and step.get("status") == "failed"
+            and step.get("block_locator") == summary_locator
+            for step in steps
+        )
+        return {
+            "status": "failed",
+            "cleanup_only": True,
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": build_container_block_url(studio_base, str(plan.get("working_vertical_block_id", ""))) or studio_vertical_url,
+            "existing_gallery_block_locator": str(plan.get("existing_gallery_block_locator", "")),
+            "existing_gallery_block_url": build_container_block_url(studio_base, str(plan.get("existing_gallery_block_locator", ""))),
+            "matched_summary_block_locator": summary_locator,
+            "matched_summary_block_url": build_container_block_url(studio_base, summary_locator),
+            "matched_summary_component_name": str(plan.get("matched_summary_component_name", "")),
+            "failed_step": exc.step_name,
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": str(exc),
+            "summary_cleanup": {
+                "status": "failed" if failed_delete else "not_completed",
+                "gallery_heading": str(plan.get("existing_gallery_heading", "")),
+                "gallery_locator": str(plan.get("existing_gallery_block_locator", "")),
+                "gallery_url": build_container_block_url(studio_base, str(plan.get("existing_gallery_block_locator", ""))),
+                "block_locator": summary_locator,
+                "block_url": build_container_block_url(studio_base, summary_locator),
+                "component_name": str(plan.get("matched_summary_component_name", "")),
+            },
+            "steps": steps,
+            "completed_steps": [step.get("step", "") for step in steps if step.get("status") not in {"failed", "warning"}],
+            "failed_steps": [step.get("step", "") for step in steps if step.get("status") == "failed"],
+        }
+
+
 def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     adapter_path = Path(args.adapter).expanduser().resolve()
@@ -1409,6 +1970,8 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
             max_retries=normalize_auth_retry_max_retries(getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
             delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
         )
+        if execute and "status" not in record:
+            record["status"] = "ok"
         if retry_events:
             record["auth_retry_attempts"] = len(retry_events)
             record["auth_retry_events"] = retry_events
@@ -1555,6 +2118,7 @@ def apply_in_place_publish_actions(
     timeout: int,
     args: argparse.Namespace,
     publish_only: bool = False,
+    cleanup_only: bool = False,
 ) -> dict[str, Any]:
     studio_base = str(single_publish_result.get("studio_base", "")).strip()
     if not studio_base:
@@ -1564,29 +2128,42 @@ def apply_in_place_publish_actions(
     replacement_plan = dict(replacement_plan)
     created_block_locator = str(single_publish_result.get("block_locator", "") or single_publish_result.get("created_block_locator", "")).strip()
 
-    if not publish_only and not created_block_locator:
+    if not publish_only and not cleanup_only and not created_block_locator:
         if execute:
             raise PublishFailure("create_block", "missing created imagesgallery block locator")
         created_block_locator = "__dry_run_created_imagesgallery__"
 
     requested_vertical_url = build_container_block_url(studio_base, str(replacement_plan.get("target_vertical_block_id", ""))) or studio_url
-    live_plan, live_step = maybe_fetch_live_replacement_plan(
-        studio_url=requested_vertical_url,
-        source_vertical_block_id=str(replacement_plan.get("source_vertical_block_id", "")),
-        target_vertical_block_id=str(replacement_plan.get("target_vertical_block_id", "")),
-        excluded_block_locators=[created_block_locator] if created_block_locator else [],
-        args=args,
-        timeout=timeout,
-    )
-    if live_step:
-        steps.append(live_step)
-    if execute and not publish_only and live_plan is None:
-        raise PublishFailure(
-            "load_live_target_structure",
-            str((live_step or {}).get("note") or "execute mode requires a fresh live target structure before in-place replacement"),
+    if not cleanup_only:
+        live_plan, live_step = maybe_fetch_live_replacement_plan(
+            studio_url=requested_vertical_url,
+            source_vertical_block_id=str(replacement_plan.get("source_vertical_block_id", "")),
+            target_vertical_block_id=str(replacement_plan.get("target_vertical_block_id", "")),
+            excluded_block_locators=[created_block_locator] if created_block_locator else [],
+            summary_detection_requested=bool(replacement_plan.get("summary_detection_requested", False)),
+            summary_cleanup_required=bool(replacement_plan.get("summary_cleanup_required", False)),
+            args=args,
+            timeout=timeout,
         )
-    if live_plan is not None:
-        replacement_plan = live_plan
+        if live_step:
+            steps.append(live_step)
+        if execute and not publish_only and live_plan is None:
+            raise PublishFailure(
+                "load_live_target_structure",
+                str((live_step or {}).get("note") or "execute mode requires a fresh live target structure before in-place replacement"),
+            )
+        if live_plan is not None:
+            if publish_only:
+                live_plan["result_type"] = replacement_plan.get("result_type", live_plan.get("result_type", "replaced"))
+            replacement_plan = live_plan
+
+    if replacement_plan.get("summary_cleanup_required") and replacement_plan.get("summary_cleanup_status") == "ambiguous":
+        exc = PublishFailure(
+            "summary_match",
+            "multiple terminal HTML summary components match; vertical publish stopped for manual follow-up",
+        )
+        exc.steps = steps.copy()
+        raise exc
 
     working_vertical_block_id = str(replacement_plan.get("working_vertical_block_id", "")).strip()
     matched_source_block_locator = str(replacement_plan.get("matched_source_block_locator", "")).strip()
@@ -1610,14 +2187,22 @@ def apply_in_place_publish_actions(
     }
 
     current_children = list(replacement_plan.get("current_children", []))
-    validate_replacement_plan(
-        replacement_plan,
-        created_block_locator=created_block_locator,
-        publish_only=publish_only,
-    )
-    if publish_only:
+    if cleanup_only:
+        summary_locator = str(replacement_plan.get("matched_summary_block_locator", "")).strip()
+        if not summary_locator or summary_locator not in current_children:
+            exc = PublishFailure("summary_match", "cleanup-only target is not present in the current vertical")
+            exc.steps = steps.copy()
+            raise exc
         desired_children = current_children
     else:
+        validate_replacement_plan(
+            replacement_plan,
+            created_block_locator=created_block_locator,
+            publish_only=publish_only,
+        )
+    if publish_only:
+        desired_children = current_children
+    elif not cleanup_only:
         desired_children = build_vertical_children(
             [*current_children, created_block_locator],
             new_block_locator=created_block_locator,
@@ -1636,25 +2221,75 @@ def apply_in_place_publish_actions(
     ctx["vertical_children_obj"] = desired_children
     operator_vertical_url, requested_vertical_url = operator_vertical_urls(studio_base, replacement_plan, studio_url)
 
-    def call_optional_step(step_name: str) -> None:
+    def call_optional_step(step_name: str, *, delete_locator: str = "") -> None:
         tmpl = adapter.get(step_name)
         if not tmpl:
-            raise PublishFailure(step_name, f"adapter missing required step: {step_name}")
+            exc = PublishFailure(step_name, f"adapter missing required step: {step_name}")
+            exc.steps = steps.copy()
+            raise exc
+        if delete_locator:
+            ctx["delete_block_locator"] = delete_locator
         try:
-            steps.append(call_template(session, step_name, tmpl, ctx, execute, timeout))
+            record = call_template(session, step_name, tmpl, ctx, execute, timeout)
+            if execute and "status" not in record:
+                record["status"] = "ok"
+            if delete_locator:
+                record.setdefault("block_locator", delete_locator)
+            steps.append(record)
         except TemplateCallError as exc:
-            raise PublishFailure(step_name, str(exc), payload=exc.payload) from exc
+            steps.append(
+                {
+                    "step": step_name,
+                    "status": "failed",
+                    "block_locator": delete_locator or None,
+                    "reason": str(exc),
+                }
+            )
+            failure = PublishFailure(step_name, str(exc), payload=exc.payload)
+            failure.steps = steps.copy()
+            raise failure from exc
 
-    if not publish_only and desired_children != [*current_children, created_block_locator]:
+    if not publish_only and not cleanup_only and desired_children != [*current_children, created_block_locator]:
         call_optional_step("reorder_children")
 
-    if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
-        call_optional_step("delete_block")
+    if not publish_only and not cleanup_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
+        call_optional_step("delete_block", delete_locator=matched_source_block_locator)
+
+    matched_summary_block_locator = str(replacement_plan.get("matched_summary_block_locator", "")).strip()
+    if (
+        not publish_only
+        and replacement_plan.get("summary_cleanup_required")
+        and matched_summary_block_locator
+        and matched_summary_block_locator != matched_source_block_locator
+    ):
+        call_optional_step("delete_block", delete_locator=matched_summary_block_locator)
 
     call_optional_step("publish_vertical")
 
+    summary_cleanup = {
+        "status": (
+            "not_found" if replacement_plan.get("summary_cleanup_status") == "not_found" else
+            "planned" if cleanup_only and not execute else
+            "deleted" if cleanup_only and execute else
+            "planned" if not execute and matched_summary_block_locator else
+            "deleted" if execute and matched_summary_block_locator else
+            "not_requested"
+        ),
+        "gallery_heading": HTML_SUMMARY_HEADING if replacement_plan.get("summary_cleanup_required") else "",
+        "block_locator": matched_summary_block_locator,
+        "block_url": build_container_block_url(studio_base, matched_summary_block_locator),
+        "component_name": str(replacement_plan.get("matched_summary_component_name", "")),
+        "candidates": list(replacement_plan.get("summary_cleanup_candidates", [])),
+    }
+    if summary_cleanup["status"] == "not_found":
+        summary_cleanup["reason"] = "gallery has a final summary page but no terminal HTML summary component was found"
+    if cleanup_only:
+        summary_cleanup["gallery_locator"] = str(replacement_plan.get("existing_gallery_block_locator", ""))
+        summary_cleanup["gallery_url"] = build_container_block_url(studio_base, summary_cleanup["gallery_locator"])
+        summary_cleanup["evidence"] = "existing gallery final page heading is 本节要点"
+
     result = {
-        "status": str(replacement_plan.get("result_type", "fallback_inserted")),
+        "status": ("cleaned" if execute else "cleanup_planned") if cleanup_only else str(replacement_plan.get("result_type", "fallback_inserted")),
         "target_vertical_block_id": str(replacement_plan.get("target_vertical_block_id", "")),
         "working_vertical_block_id": working_vertical_block_id,
         "target_vertical_url": operator_vertical_url,
@@ -1662,14 +2297,27 @@ def apply_in_place_publish_actions(
         "working_vertical_url": working_vertical_url,
         "created_block_locator": created_block_locator,
         "created_imagegallery_block_url": build_container_block_url(studio_base, created_block_locator),
+        "existing_gallery_block_locator": str(replacement_plan.get("existing_gallery_block_locator", "")),
+        "existing_gallery_block_url": build_container_block_url(studio_base, str(replacement_plan.get("existing_gallery_block_locator", ""))),
         "matched_source_block_locator": matched_source_block_locator,
         "matched_source_block_url": build_container_block_url(studio_base, matched_source_block_locator),
-        "note": "replaced existing source block in place" if replacement_plan.get("result_type") == "replaced" else "inserted new imagesgallery at the top of the target vertical",
+        "matched_summary_block_locator": matched_summary_block_locator,
+        "matched_summary_block_url": summary_cleanup["block_url"],
+        "matched_summary_component_name": summary_cleanup["component_name"],
+        "summary_cleanup": summary_cleanup,
+        "note": (
+            "removed the duplicate terminal HTML summary from the existing gallery vertical"
+            if cleanup_only else
+            "replaced existing source block in place" if replacement_plan.get("result_type") == "replaced" else
+            "inserted new imagesgallery at the top of the target vertical"
+        ),
         "course_kind": replacement_plan.get("course_kind", ""),
         "match_scope": replacement_plan.get("match_scope", ""),
         "plan_source": replacement_plan.get("plan_source", ""),
         "requires_manual_followup": False,
         "steps": steps,
+        "completed_steps": [step.get("step", "") for step in steps if step.get("status") not in {"failed", "warning"}],
+        "failed_steps": [step.get("step", "") for step in steps if step.get("status") == "failed"],
     }
     if publish_only:
         result["note"] = "reused the previously created imagesgallery block and retried the final vertical publish"
@@ -1696,19 +2344,86 @@ def process_publish_target(
         raise PublishFailure("target_vertical", f"target missing target_vertical_block_location: {target}")
     if not studio_vertical_url:
         raise PublishFailure("target_vertical", f"target missing studio_vertical_url: {target}")
+    if bool(target.get("cleanup_only", False)) or bool(getattr(args, "cleanup_only", False)):
+        return process_cleanup_only_target(
+            target,
+            course_structure,
+            args,
+            adapter,
+            target_vertical_block_id=target_vertical_block_id,
+            source_vertical_block_id=source_vertical_block_id,
+            studio_vertical_url=studio_vertical_url,
+        )
+
+    manifest_path = Path(str(target.get("manifest", ""))).expanduser().resolve()
+    manifest = read_json(manifest_path)
+    source_metadata = resolve_source_block_type(
+        manifest,
+        target,
+        manifest_path=manifest_path,
+        section_list_json=str(target.get("section_list_json", "") or getattr(args, "section_list_json", "")),
+    )
+    final_heading = gallery_summary_heading(manifest)
+    summary_page_present = final_heading == HTML_SUMMARY_HEADING
+    source_type_is_html = source_metadata["status"] == "resolved" and source_metadata["block_type"] == "html"
+    summary_cleanup_required = summary_page_present and source_type_is_html
+    if not summary_page_present:
+        summary_cleanup_info = {
+            "status": "not_required",
+            "gallery_heading": final_heading,
+            "reason": "gallery final page is not 本节要点",
+        }
+    elif source_metadata["status"] != "resolved":
+        summary_cleanup_info = {
+            "status": "manual_followup",
+            "gallery_heading": final_heading,
+            "source_metadata_status": source_metadata["status"],
+            "reason": source_metadata["reason"],
+        }
+    elif not source_type_is_html:
+        summary_cleanup_info = {
+            "status": "not_required",
+            "gallery_heading": final_heading,
+            "source_block_type": source_metadata["block_type"],
+            "reason": "summary cleanup only applies to HTML-origin galleries",
+        }
+    else:
+        summary_cleanup_info = {
+            "status": "pending",
+            "gallery_heading": final_heading,
+            "source_block_type": source_metadata["block_type"],
+            "source_metadata_reason": source_metadata["reason"],
+        }
 
     replacement_plan = mark_replacement_plan_source(
         plan_publish_replacement(
             course_structure,
             source_vertical_block_id=source_vertical_block_id,
             target_vertical_block_id=target_vertical_block_id,
+            summary_detection_requested=summary_page_present,
+            summary_cleanup_required=summary_cleanup_required,
         ),
         "course_structure_json",
     )
+    if (
+        summary_cleanup_required
+        and str(replacement_plan.get("working_vertical_block_id", "")).strip() != target_vertical_block_id
+    ):
+        summary_cleanup_required = False
+        summary_cleanup_info = {
+            "status": "manual_followup",
+            "gallery_heading": final_heading,
+            "source_block_type": source_metadata["block_type"],
+            "reason": "main-body replacement resolves to a different vertical than the terminal summary",
+        }
+        replacement_plan["summary_cleanup_required"] = False
+    replacement_plan["summary_cleanup_info"] = summary_cleanup_info
     live_plan, live_step = maybe_fetch_live_replacement_plan(
         studio_url=studio_vertical_url,
         source_vertical_block_id=source_vertical_block_id,
         target_vertical_block_id=target_vertical_block_id,
+        summary_detection_requested=summary_page_present,
+        summary_cleanup_required=summary_cleanup_required,
         args=args,
         timeout=int(getattr(args, "timeout", 30)),
     )
@@ -1733,6 +2448,64 @@ def process_publish_target(
         }
     if live_plan is not None:
         replacement_plan = live_plan
+        replacement_plan["summary_cleanup_info"] = summary_cleanup_info
+        if (
+            summary_cleanup_required
+            and str(replacement_plan.get("working_vertical_block_id", "")).strip() != target_vertical_block_id
+        ):
+            summary_cleanup_required = False
+            replacement_plan["summary_cleanup_required"] = False
+            summary_cleanup_info = {
+                "status": "manual_followup",
+                "gallery_heading": final_heading,
+                "source_block_type": source_metadata["block_type"],
+                "reason": "live main-body replacement resolves to a different vertical than the terminal summary",
+            }
+            replacement_plan["summary_cleanup_info"] = summary_cleanup_info
+
+    summary_candidates = []
+    for candidate in replacement_plan.get("summary_cleanup_candidates", []):
+        item = dict(candidate)
+        item["block_url"] = build_container_block_url(
+            studio_base_from_url(studio_vertical_url),
+            str(item.get("block_locator", "")),
+        )
+        summary_candidates.append(item)
+    if summary_cleanup_info["status"] == "manual_followup":
+        summary_cleanup_info["candidates"] = summary_candidates
+        if len(summary_candidates) == 1:
+            summary_cleanup_info.update(
+                {
+                    "block_locator": str(summary_candidates[0].get("block_locator", "")),
+                    "block_url": str(summary_candidates[0].get("block_url", "")),
+                    "component_name": str(summary_candidates[0].get("component_name", "")),
+                }
+            )
+
+    if summary_cleanup_required and replacement_plan.get("summary_cleanup_status") == "ambiguous":
+        operator_vertical_url, requested_vertical_url = operator_vertical_urls(
+            studio_base_from_url(studio_vertical_url),
+            replacement_plan,
+            studio_vertical_url,
+        )
+        candidates = summary_candidates
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": operator_vertical_url,
+            "requested_target_vertical_url": requested_vertical_url,
+            "working_vertical_block_id": str(replacement_plan.get("working_vertical_block_id", "")),
+            "failed_step": "summary_match",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": "multiple terminal HTML summary components match; no gallery was created and the vertical was not published",
+            "summary_cleanup": {
+                **summary_cleanup_info,
+                "status": "ambiguous",
+                "candidates": candidates,
+            },
+            "steps": [live_step] if live_step else [],
+        }
     rerun_action = resolve_rerun_action(
         previous_result,
         current_structure_block_ids=list(replacement_plan.get("all_structure_block_ids", [])),
@@ -1752,7 +2525,7 @@ def process_publish_target(
                 "target_vertical_block_id": target_vertical_block_id,
                 "target_vertical_url": operator_vertical_url,
                 "requested_target_vertical_url": requested_vertical_url,
-                "requires_manual_followup": False,
+                "requires_manual_followup": bool((previous_result or {}).get("requires_manual_followup", False)),
                 "note": rerun_action["reason"],
             }
         )
@@ -1820,7 +2593,15 @@ def process_publish_target(
             adapter=adapter,
             replacement_plan={
                 **replacement_plan,
-                "result_type": str((previous_result or {}).get("status") or replacement_plan.get("result_type", "replaced")),
+                "result_type": str(
+                    (previous_result or {}).get("planned_result_type")
+                    or (previous_result or {}).get("status")
+                    or replacement_plan.get("result_type", "replaced")
+                ),
+                "summary_cleanup_required": False,
+                "summary_detection_requested": False,
+                "summary_cleanup_status": "not_requested",
+                "matched_summary_block_locator": "",
             },
             studio_url=studio_vertical_url,
             execute=bool(getattr(args, "execute", False)),
@@ -1829,6 +2610,8 @@ def process_publish_target(
             publish_only=True,
         )
         resumed["resumed_from_previous_run"] = True
+        if previous_result and previous_result.get("summary_cleanup"):
+            resumed["summary_cleanup"] = previous_result["summary_cleanup"]
         return resumed
 
     working_vertical_block_id = str(replacement_plan.get("working_vertical_block_id", "")).strip()
@@ -1845,7 +2628,7 @@ def process_publish_target(
     if preflight_steps:
         single_publish_result["steps"] = [*preflight_steps, *list(single_publish_result.get("steps", []))]
     try:
-        return apply_in_place_publish_actions(
+        result = apply_in_place_publish_actions(
             single_publish_result,
             adapter=adapter,
             replacement_plan=replacement_plan,
@@ -1854,8 +2637,39 @@ def process_publish_target(
             timeout=int(getattr(args, "timeout", 30)),
             args=args,
         )
+        if summary_cleanup_info["status"] == "pending":
+            cleanup_action_status = result["summary_cleanup"].get("status", "pending")
+            result["summary_cleanup"].update(summary_cleanup_info)
+            result["summary_cleanup"]["status"] = cleanup_action_status
+        elif summary_cleanup_info["status"] == "manual_followup":
+            result["summary_cleanup"] = summary_cleanup_info
+            result["requires_manual_followup"] = True
+        else:
+            result["summary_cleanup"] = summary_cleanup_info
+        return result
     except PublishFailure as exc:
         operator_vertical_url, requested_vertical_url = operator_vertical_urls(studio_base, replacement_plan, studio_vertical_url)
+        failure_steps = list(exc.steps or single_publish_result.get("steps", []))
+        failed_step_records = [step for step in failure_steps if step.get("step") == exc.step_name and step.get("status") == "failed"]
+        summary_deleted = any(
+            step.get("step") == "delete_block"
+            and step.get("block_locator") == replacement_plan.get("matched_summary_block_locator")
+            and step.get("status") != "failed"
+            for step in failure_steps
+        )
+        failure_summary_cleanup = dict(summary_cleanup_info)
+        if summary_cleanup_required:
+            failure_summary_cleanup.update(
+                {
+                    "status": "failed" if failed_step_records and exc.step_name == "delete_block" and any(
+                        step.get("block_locator") == replacement_plan.get("matched_summary_block_locator")
+                        for step in failed_step_records
+                    ) else "deleted" if summary_deleted else "not_completed",
+                    "block_locator": str(replacement_plan.get("matched_summary_block_locator", "")),
+                    "block_url": build_container_block_url(studio_base, str(replacement_plan.get("matched_summary_block_locator", ""))),
+                    "component_name": str(replacement_plan.get("matched_summary_component_name", "")),
+                }
+            )
         failed = {
             "status": "failed",
             "target_vertical_block_id": target_vertical_block_id,
@@ -1864,14 +2678,22 @@ def process_publish_target(
             "requested_target_vertical_url": requested_vertical_url,
             "created_block_locator": str(single_publish_result.get("block_locator", "")),
             "created_imagegallery_block_url": str(single_publish_result.get("created_imagegallery_block_url", "")),
+            "planned_result_type": str(replacement_plan.get("result_type", "fallback_inserted")),
             "matched_source_block_locator": str(replacement_plan.get("matched_source_block_locator", "")),
+            "matched_source_block_url": build_container_block_url(studio_base, str(replacement_plan.get("matched_source_block_locator", ""))),
+            "matched_summary_block_locator": str(replacement_plan.get("matched_summary_block_locator", "")),
+            "matched_summary_block_url": str(failure_summary_cleanup.get("block_url", "")),
+            "matched_summary_component_name": str(failure_summary_cleanup.get("component_name", "")),
             "failed_step": exc.step_name,
             "failure_bucket": "manual_followup",
             "requires_manual_followup": True,
             "note": str(exc),
+            "summary_cleanup": failure_summary_cleanup,
             "course_kind": replacement_plan.get("course_kind", ""),
             "match_scope": replacement_plan.get("match_scope", ""),
-            "steps": list(single_publish_result.get("steps", [])),
+            "steps": failure_steps,
+            "completed_steps": [step.get("step", "") for step in failure_steps if step.get("status") not in {"failed", "warning"}],
+            "failed_steps": [step.get("step", "") for step in failure_steps if step.get("status") == "failed"],
         }
         return failed
 
@@ -1881,8 +2703,13 @@ def run_in_place_publish(args: argparse.Namespace) -> dict[str, Any]:
     adapter = load_adapter(args.adapter)
     target_vertical_block_id = str(args.vertical_block_id or parse_vertical_block_id(args.studio_url))
     target = {
-        "name": Path(args.manifest).stem,
+        "name": Path(str(getattr(args, "manifest", "") or "cleanup-only")).stem,
         "manifest": args.manifest,
+        "section_id": str(getattr(args, "section_id", "") or ""),
+        "section_title": str(getattr(args, "section_title", "") or ""),
+        "block_type": str(getattr(args, "block_type", "") or ""),
+        "section_list_json": str(getattr(args, "section_list_json", "") or ""),
+        "cleanup_only": bool(getattr(args, "cleanup_only", False)),
         "source_vertical_block_location": str(args.source_vertical_block_id or target_vertical_block_id),
         "target_vertical_block_location": target_vertical_block_id,
         "studio_vertical_url": normalize_block_url(args.studio_url),
@@ -1908,12 +2735,15 @@ def run_batch_publish(
         else default_batch_report_path(str(targets_path))
     )
     previous_results_by_key = load_previous_batch_results(report_path)
+    section_list_json = str(payload.get("section_list_json", "") or getattr(args, "section_list_json", "")).strip()
 
     run_target = publish_target_fn or process_publish_target
     results: list[dict[str, Any]] = []
     targets = list(payload.get("targets") or [])
     for raw_target in targets:
         target = dict(raw_target or {})
+        if section_list_json:
+            target.setdefault("section_list_json", section_list_json)
         target_key = batch_target_key(target)
         previous_result = previous_results_by_key.get(target_key)
         course_structure = load_course_structure_snapshot(course_structure_path)
@@ -1963,6 +2793,8 @@ def run_batch_publish(
         "results": results,
         "replaced": grouped["replaced"],
         "fallback_inserted": grouped["fallback_inserted"],
+        "cleaned": grouped["cleaned"],
+        "cleanup_planned": grouped["cleanup_planned"],
         "manual_followup_failed": grouped["manual_followup_failed"],
         "failed": grouped["failed"],
         "summary": build_batch_summary(results),
@@ -1996,6 +2828,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vertical-block-id", default="")
     p.add_argument("--block-url", default="")
     p.add_argument("--source-vertical-block-id", default="")
+    p.add_argument("--section-id", default="", help="source section ID for section-list metadata fallback")
+    p.add_argument("--section-title", default="", help="source section title used only when section ID is unavailable")
+    p.add_argument("--block-type", default="", help="source block_type metadata override")
+    p.add_argument("--section-list-json", default="", help="section-list.json used to recover gallery source metadata")
+    p.add_argument("--cleanup-only", action="store_true", help="remove a verified duplicate HTML summary without creating a gallery")
     p.add_argument("--course-structure-json", default="")
     p.add_argument("--targets-file", default="")
     p.add_argument("--report-file", default="")
@@ -2028,7 +2865,7 @@ def main() -> int:
     if args.targets_file:
         out = run_batch_publish(args)
     elif args.course_structure_json:
-        if not args.manifest:
+        if not args.manifest and not args.cleanup_only:
             raise SystemExit("--manifest is required when --course-structure-json is set")
         if not args.studio_url:
             raise SystemExit("--studio-url is required when --course-structure-json is set")
