@@ -1027,6 +1027,54 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 self.assertEqual("planned", result["summary_cleanup"]["status"])
                 self.assertEqual("本节要点", result["summary_cleanup"]["gallery_heading"])
 
+    def test_parent_section_list_is_not_used_implicitly_for_manifest_source_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_dir = tmp_path / "another-course" / "gallery"
+            manifest_dir.mkdir(parents=True)
+            manifest_path = self._write_manifest_bundle(manifest_dir)
+            self._mark_manifest_source(
+                manifest_path,
+                block_type=None,
+                section_id="1.1",
+                section_title="1.1 示例课程",
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("block_type", None)
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+            unrelated_section_list = tmp_path / "section-list.json"
+            unrelated_section_list.write_text(
+                json.dumps(
+                    {"sections": [{"section_id": "1.1", "section_title": "1.1 示例课程", "block_type": "html"}]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            course_structure = self._make_course_structure(
+                include_gallery=False,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            self._add_terminal_summary(course_structure)
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+
+            result = module.run_in_place_publish(self._in_place_args(manifest_path, course_path))
+            explicit_path_result = module.run_in_place_publish(
+                self._in_place_args(
+                    manifest_path,
+                    course_path,
+                    section_list_json=str(unrelated_section_list),
+                )
+            )
+
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual("manual_followup", result["summary_cleanup"]["status"])
+        delete_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
+        self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
+        self.assertEqual("planned", explicit_path_result["summary_cleanup"]["status"])
+
     def test_missing_ambiguous_and_conflicting_source_metadata_never_triggers_summary_deletion(self) -> None:
         scenarios = ("missing", "ambiguous", "conflicting")
         for scenario in scenarios:
@@ -1797,6 +1845,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("新建的 `imagesgallery` block URL", skill_doc)
         self.assertIn("--cleanup-only", skill_doc)
         self.assertIn("--section-list-json", skill_doc)
+        self.assertIn("只检查 manifest 同目录", skill_doc)
         self.assertIn("摘要清理状态", skill_doc)
         self.assertIn("失败步骤", skill_doc)
 

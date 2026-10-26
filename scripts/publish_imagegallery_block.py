@@ -357,11 +357,21 @@ def find_section_list_path(manifest_path: Path, explicit_path: str = "") -> Path
     if explicit_path:
         candidate = Path(explicit_path).expanduser().resolve()
         return candidate if candidate.is_file() else None
-    for directory in (manifest_path.parent, *manifest_path.parent.parents):
-        candidate = directory / "section-list.json"
-        if candidate.is_file():
-            return candidate
-    return None
+    candidate = manifest_path.parent / "section-list.json"
+    return candidate if candidate.is_file() else None
+
+
+def summarize_steps(steps: list[dict[str, Any]]) -> dict[str, list[str]]:
+    return {
+        "completed_steps": [
+            step.get("step", "") for step in steps
+            if step.get("status") not in {"failed", "warning"}
+        ],
+        "failed_steps": [
+            step.get("step", "") for step in steps
+            if step.get("status") == "failed"
+        ],
+    }
 
 
 def resolve_source_block_type(
@@ -1847,8 +1857,7 @@ def process_cleanup_only_target(
                 "component_name": str(plan.get("matched_summary_component_name", "")),
             },
             "steps": steps,
-            "completed_steps": [step.get("step", "") for step in steps if step.get("status") not in {"failed", "warning"}],
-            "failed_steps": [step.get("step", "") for step in steps if step.get("status") == "failed"],
+            **summarize_steps(steps),
         }
 
 
@@ -2316,8 +2325,7 @@ def apply_in_place_publish_actions(
         "plan_source": replacement_plan.get("plan_source", ""),
         "requires_manual_followup": False,
         "steps": steps,
-        "completed_steps": [step.get("step", "") for step in steps if step.get("status") not in {"failed", "warning"}],
-        "failed_steps": [step.get("step", "") for step in steps if step.get("status") == "failed"],
+        **summarize_steps(steps),
     }
     if publish_only:
         result["note"] = "reused the previously created imagesgallery block and retried the final vertical publish"
@@ -2692,8 +2700,7 @@ def process_publish_target(
             "course_kind": replacement_plan.get("course_kind", ""),
             "match_scope": replacement_plan.get("match_scope", ""),
             "steps": failure_steps,
-            "completed_steps": [step.get("step", "") for step in failure_steps if step.get("status") not in {"failed", "warning"}],
-            "failed_steps": [step.get("step", "") for step in failure_steps if step.get("status") == "failed"],
+            **summarize_steps(failure_steps),
         }
         return failed
 

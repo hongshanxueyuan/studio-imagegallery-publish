@@ -171,7 +171,7 @@ python scripts/publish_imagegallery_block.py \
 - `--section-id`：manifest 没有来源标记时，用于回查 `section-list.json` 的小节 ID
 - `--section-title`：仅当小节 ID 不可用时，用于唯一标题回退
 - `--block-type`：来源 block 类型元数据；与 manifest 或 `section-list.json` 冲突时会禁止自动摘要清理
-- `--section-list-json`：显式指定来源元数据回查文件；未指定时，从 manifest 目录向上查找 `section-list.json`
+- `--section-list-json`：显式指定来源元数据回查文件；未指定时只检查 manifest 同目录中的 `section-list.json`。如果文件位于其他目录，请显式传入路径，避免误用其他课程的来源信息。
 - `--cleanup-only`：只预览或删除已验证 gallery 对应的末尾 HTML“本节要点”，不上传新 gallery
 - `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
 - `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`cleaned`、`manual_followup_failed`
