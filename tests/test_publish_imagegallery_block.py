@@ -49,6 +49,55 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         )
         return manifest_path
 
+    def _in_place_args(self, manifest_path: Path, course_path: Path, *, execute: bool = False, cleanup_only: bool = False, section_list_json: str = "") -> argparse.Namespace:
+        vertical_id = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+        return argparse.Namespace(
+            studio_url=f"https://studio.example.com/container/{vertical_id}",
+            manifest=str(manifest_path),
+            adapter=str(ADAPTER_PATH),
+            execute=execute,
+            dry_run=not execute,
+            timeout=30,
+            vertical_block_id=vertical_id,
+            block_url="",
+            source_vertical_block_id=vertical_id,
+            section_id="",
+            section_title="",
+            block_type="",
+            section_list_json=section_list_json,
+            cleanup_only=cleanup_only,
+            course_structure_json=str(course_path),
+            courses_base="",
+            account="",
+            password="",
+            cookie="csrftoken=fake",
+            csrf_token="",
+            skip_oss_multipart=True,
+            auth_retry_max_retries=4,
+            auth_retry_delay_seconds=0,
+            targets_file="",
+            report_file="",
+        )
+
+    def _mark_manifest_source(self, manifest_path: Path, *, block_type: str | None, section_id: str = "1.1", section_title: str = "1.1 示例课程", subtitle: str = "# 本节要点\n总结内容") -> None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if block_type is not None:
+            manifest["block_type"] = block_type
+        manifest["section_id"] = section_id
+        manifest["section_title"] = section_title
+        manifest["items"][0]["subtitle"] = subtitle
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    def _add_terminal_summary(self, course_structure: dict, *, locator: str = "block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary", name: str = "要点小结") -> dict:
+        block = {
+            "name": name,
+            "category": "html",
+            "block_location": locator,
+            "html": "  <h2>### 本节要点</h2><p><img src='slide.png'/>总结正文</p>",
+        }
+        course_structure["chapters"][0]["sections"][0]["verticals"][0]["blocks"].append(block)
+        return block
+
     def _make_course_structure(self, *, include_gallery: bool, include_target_html: bool, include_section_html: bool) -> dict:
         target_vertical_blocks = [
             {
@@ -660,6 +709,611 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             result["matched_source_block_url"],
         )
 
+    def test_html_origin_publish_deletes_the_unique_terminal_summary_after_saving_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = self._write_manifest_bundle(tmp_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["block_type"] = "html"
+            manifest["section_id"] = "1.1"
+            manifest["section_title"] = "1.1 示例课程"
+            manifest["items"][0]["subtitle"] = "# 本节要点\n总结内容"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+            course_structure = self._make_course_structure(
+                include_gallery=False,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            terminal_summary = {
+                "name": "要点小结",
+                "category": "html",
+                "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary",
+                "html": "  <h2>### 本节要点</h2><p><img src='slide.png'/>总结正文</p>",
+            }
+            target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
+            target_vertical["blocks"].append(terminal_summary)
+
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                studio_url="https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                manifest=str(manifest_path),
+                adapter=str(ADAPTER_PATH),
+                execute=False,
+                dry_run=True,
+                timeout=30,
+                vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                course_structure_json=str(course_path),
+                courses_base="",
+                account="",
+                password="",
+                cookie="csrftoken=fake",
+                csrf_token="",
+                skip_oss_multipart=False,
+                auth_retry_max_retries=4,
+                auth_retry_delay_seconds=0,
+                targets_file="",
+                report_file="",
+            )
+
+            result = module.run_in_place_publish(args)
+
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual("要点小结", result["matched_summary_component_name"])
+        self.assertEqual(
+            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary",
+            result["matched_summary_block_url"],
+        )
+        steps = result["steps"]
+        save_index = max(index for index, step in enumerate(steps) if step["step"] == "save_block")
+        delete_indexes = [index for index, step in enumerate(steps) if step["step"] == "delete_block"]
+        publish_index = next(index for index, step in enumerate(steps) if step["step"] == "publish_vertical")
+        self.assertEqual(2, len(delete_indexes))
+        self.assertLess(save_index, min(delete_indexes))
+        self.assertLess(max(delete_indexes), publish_index)
+        deleted_urls = [steps[index]["url"] for index in delete_indexes]
+        self.assertTrue(any(url.endswith("block@terminal-summary") for url in deleted_urls))
+
+    def test_cleanup_only_dry_run_previews_existing_gallery_and_exact_html_target_without_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            course_structure = self._make_course_structure(
+                include_gallery=True,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
+            gallery = next(block for block in target_vertical["blocks"] if block["category"] == "imagesgallery")
+            gallery["metadata"] = {
+                "play_config": {
+                    "time_config": [
+                        {"page": 1, "subtitle": "课程正文"},
+                        {"page": 2, "subtitle": "## 本节要点\n最后一页"},
+                    ]
+                }
+            }
+            summary = {
+                "name": "本节要点",
+                "category": "html",
+                "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@cleanup-summary",
+                "html": "<h2>本节要点</h2><p>旧摘要</p>",
+            }
+            target_vertical["blocks"].append(summary)
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+
+            args = argparse.Namespace(
+                studio_url="https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                manifest="",
+                adapter=str(ADAPTER_PATH),
+                execute=False,
+                dry_run=True,
+                timeout=30,
+                vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                course_structure_json=str(course_path),
+                section_id="1.1",
+                section_title="1.1 示例课程",
+                section_list_json="",
+                cleanup_only=True,
+                courses_base="",
+                account="",
+                password="",
+                cookie="csrftoken=fake",
+                csrf_token="",
+                skip_oss_multipart=False,
+                auth_retry_max_retries=4,
+                auth_retry_delay_seconds=0,
+                targets_file="",
+                report_file="",
+            )
+
+            result = module.run_in_place_publish(args)
+
+        self.assertEqual("cleanup_planned", result["status"])
+        self.assertEqual("本节要点", result["summary_cleanup"]["evidence"].split("heading is ")[-1])
+        self.assertTrue(result["existing_gallery_block_url"].endswith("block@legacygallery"))
+        self.assertTrue(result["matched_summary_block_url"].endswith("block@cleanup-summary"))
+        self.assertEqual(
+            ["delete_block", "publish_vertical"],
+            [step["step"] for step in result["steps"]],
+        )
+        self.assertEqual("dry-run", result["steps"][0]["status"])
+        self.assertEqual("", result["created_block_locator"])
+
+    def test_cleanup_only_execute_uses_fresh_fake_adapter_and_never_uploads_a_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            course_structure = self._make_course_structure(
+                include_gallery=True,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
+            gallery = next(block for block in target_vertical["blocks"] if block["category"] == "imagesgallery")
+            gallery["metadata"] = {"play_config": {"time_config": [{"page": 1, "subtitle": "第一部分"}, {"page": 2, "subtitle": "# 本节要点"}]}}
+            target_vertical["blocks"].append(
+                {
+                    "name": "本节要点",
+                    "category": "html",
+                    "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@execute-cleanup-summary",
+                    "html": "<h2>本节要点</h2><p>旧摘要</p>",
+                }
+            )
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+            live_plan = module.plan_summary_cleanup_only(
+                course_structure,
+                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            )
+            args = self._in_place_args(Path(""), course_path, execute=True, cleanup_only=True)
+            calls: list[tuple[str, str]] = []
+
+            def fake_adapter(_session, name, _template, ctx, _execute, _timeout):
+                calls.append((name, str(ctx.get("delete_block_locator", ""))))
+                return {"step": name, "status": "ok"}
+
+            with patch.object(module, "maybe_fetch_live_cleanup_plan", return_value=(live_plan, {"step": "load_live_target_structure", "status": "ok"})):
+                with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
+                    with patch.object(module, "call_template", side_effect=fake_adapter):
+                        result = module.run_in_place_publish(args)
+
+        self.assertEqual("cleaned", result["status"])
+        self.assertEqual(
+            [
+                ("delete_block", "block-v1:FIRAx+1040045+20260807+type@html+block@execute-cleanup-summary"),
+                ("publish_vertical", "block-v1:FIRAx+1040045+20260807+type@html+block@execute-cleanup-summary"),
+            ],
+            calls,
+        )
+        self.assertEqual("", result["created_imagegallery_block_url"])
+        self.assertTrue(result["existing_gallery_block_url"].endswith("block@legacygallery"))
+        self.assertEqual("deleted", result["summary_cleanup"]["status"])
+
+    def test_cleanup_only_refuses_to_delete_without_a_summary_gallery_in_the_same_vertical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            course_structure = self._make_course_structure(
+                include_gallery=True,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            gallery = next(
+                block
+                for block in course_structure["chapters"][0]["sections"][0]["verticals"][0]["blocks"]
+                if block["category"] == "imagesgallery"
+            )
+            gallery["metadata"] = {"play_config": {"time_config": [{"page": 1, "subtitle": "没有摘要页"}]}}
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+
+            result = module.run_in_place_publish(
+                self._in_place_args(Path(""), course_path, cleanup_only=True)
+            )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("cleanup_preflight", result["failed_step"])
+        self.assertEqual("gallery_summary_missing", result["summary_cleanup"]["status"])
+        self.assertIn("no existing gallery", result["note"])
+        self.assertEqual([], result["steps"])
+
+    def test_summary_delete_failure_keeps_gallery_and_skips_publish_without_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = self._write_manifest_bundle(tmp_path)
+            self._mark_manifest_source(manifest_path, block_type="html")
+            course_structure = self._make_course_structure(
+                include_gallery=False,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            summary = self._add_terminal_summary(course_structure)
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+            plan = module.plan_publish_replacement(
+                course_structure,
+                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                summary_detection_requested=True,
+                summary_cleanup_required=True,
+            )
+            args = self._in_place_args(manifest_path, course_path, execute=True)
+            calls: list[tuple[str, str]] = []
+            created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@newgallery"
+
+            def fake_adapter(_session, name, _template, ctx, _execute, _timeout):
+                locator = str(ctx.get("delete_block_locator", ""))
+                calls.append((name, locator))
+                if name == "create_block":
+                    ctx["block_locator"] = created_locator
+                if name == "delete_block" and locator == summary["block_location"]:
+                    raise module.TemplateCallError(name, 500, {"detail": "delete failed"})
+                return {"step": name, "status": "ok", "url": "fake://" + name}
+
+            with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
+                with patch.object(module, "maybe_fetch_live_replacement_plan", return_value=(plan, {"step": "load_live_target_structure", "status": "ok"})):
+                    with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
+                        with patch.object(module, "call_template", side_effect=fake_adapter):
+                            result = module.process_publish_target(
+                                {
+                                    "name": "1.1",
+                                    "manifest": str(manifest_path),
+                                    "section_id": "1.1",
+                                    "target_vertical_block_location": "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                                    "source_vertical_block_location": "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                                    "studio_vertical_url": "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                                },
+                                course_structure,
+                                args,
+                                self.adapter,
+                            )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("delete_block", result["failed_step"])
+        self.assertTrue(result["created_imagegallery_block_url"].endswith("block@newgallery"))
+        self.assertTrue(result["target_vertical_url"].endswith("block@targetvertical"))
+        self.assertTrue(result["matched_summary_block_url"].endswith("block@terminal-summary"))
+        self.assertEqual("failed", result["summary_cleanup"]["status"])
+        self.assertIn(("delete_block", plan["matched_source_block_locator"]), calls)
+        self.assertIn(("delete_block", summary["block_location"]), calls)
+        self.assertNotIn("publish_vertical", [name for name, _locator in calls])
+        self.assertNotIn("rollback", [name for name, _locator in calls])
+        self.assertIn("save_block", result["completed_steps"])
+        self.assertIn("delete_block", result["failed_steps"])
+
+    def test_section_list_source_fallback_prefers_section_id_and_uses_unique_title_only_without_id(self) -> None:
+        for use_section_id in (True, False):
+            with self.subTest(use_section_id=use_section_id), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                manifest_path = self._write_manifest_bundle(tmp_path)
+                self._mark_manifest_source(
+                    manifest_path,
+                    block_type=None,
+                    section_id="1.1" if use_section_id else "",
+                    section_title="共同标题",
+                )
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest.pop("block_type", None)
+                if not use_section_id:
+                    manifest.pop("section_id", None)
+                    manifest.pop("section_title", None)
+                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+                section_list_path = tmp_path / "section-list.json"
+                sections = [
+                    {"section_id": "1.1", "section_title": "共同标题", "block_type": "html"},
+                    {"section_id": "1.2", "section_title": "共同标题", "block_type": "imagesgallery"},
+                ] if use_section_id else [
+                    {"section_id": "unique-id", "section_title": "唯一标题", "block_type": "html"},
+                ]
+                section_list_path.write_text(json.dumps({"sections": sections}, ensure_ascii=False), encoding="utf-8")
+                course_structure = self._make_course_structure(
+                    include_gallery=False,
+                    include_target_html=True,
+                    include_section_html=False,
+                )
+                self._add_terminal_summary(course_structure)
+                course_path = tmp_path / "course.json"
+                course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+                args = self._in_place_args(manifest_path, course_path, section_list_json=str(section_list_path))
+                if not use_section_id:
+                    args.section_title = "唯一标题"
+
+                result = module.run_in_place_publish(args)
+
+                self.assertEqual("planned", result["summary_cleanup"]["status"])
+                self.assertEqual("本节要点", result["summary_cleanup"]["gallery_heading"])
+
+    def test_missing_ambiguous_and_conflicting_source_metadata_never_triggers_summary_deletion(self) -> None:
+        scenarios = ("missing", "ambiguous", "conflicting")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                manifest_path = self._write_manifest_bundle(tmp_path)
+                self._mark_manifest_source(manifest_path, block_type="html" if scenario == "conflicting" else None)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if scenario != "conflicting":
+                    manifest.pop("block_type", None)
+                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+                section_list_path = tmp_path / "section-list.json"
+                if scenario == "ambiguous":
+                    section_list_path.write_text(
+                        json.dumps(
+                            {"sections": [
+                                {"section_id": "1.1", "section_title": "1.1 示例课程", "block_type": "html"},
+                                {"section_id": "1.1", "section_title": "1.1 示例课程", "block_type": "imagesgallery"},
+                            ]},
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                course_structure = self._make_course_structure(
+                    include_gallery=False,
+                    include_target_html=True,
+                    include_section_html=False,
+                )
+                summary = self._add_terminal_summary(course_structure)
+                course_path = tmp_path / "course.json"
+                course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+                args = self._in_place_args(
+                    manifest_path,
+                    course_path,
+                    section_list_json=str(section_list_path) if scenario == "ambiguous" else "",
+                )
+                target = {
+                    "name": "1.1",
+                    "manifest": str(manifest_path),
+                    "section_id": "1.1",
+                    "section_title": "1.1 示例课程",
+                    "block_type": "imagesgallery" if scenario == "conflicting" else "",
+                    "target_vertical_block_location": args.vertical_block_id,
+                    "source_vertical_block_location": args.vertical_block_id,
+                    "studio_vertical_url": args.studio_url,
+                }
+                result = module.process_publish_target(target, course_structure, args, self.adapter)
+
+                self.assertEqual("replaced", result["status"])
+                self.assertTrue(result["requires_manual_followup"])
+                self.assertEqual("manual_followup", result["summary_cleanup"]["status"])
+                deleted_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
+                self.assertTrue(deleted_urls)
+                self.assertFalse(any(url.endswith("block@terminal-summary") for url in deleted_urls))
+
+    def test_no_summary_gallery_origin_zero_matches_and_ambiguous_matches_have_distinct_outcomes(self) -> None:
+        for scenario in ("gallery_without_summary", "html_no_match", "html_nonterminal_summary", "imagegallery_origin", "ambiguous_summary"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                manifest_path = self._write_manifest_bundle(tmp_path)
+                source_type = "imagesgallery" if scenario == "imagegallery_origin" else "html"
+                subtitle = "普通课程内容" if scenario == "gallery_without_summary" else "# 本节要点\n总结内容"
+                self._mark_manifest_source(manifest_path, block_type=source_type, subtitle=subtitle)
+                include_gallery = scenario == "imagegallery_origin"
+                course_structure = self._make_course_structure(
+                    include_gallery=include_gallery,
+                    include_target_html=True,
+                    include_section_html=False,
+                )
+                if scenario in {"gallery_without_summary", "html_nonterminal_summary", "imagegallery_origin"}:
+                    self._add_terminal_summary(course_structure)
+                    if scenario == "html_nonterminal_summary":
+                        course_structure["chapters"][0]["sections"][0]["verticals"][0]["blocks"].append(
+                            {
+                                "name": "随堂练习",
+                                "category": "problem",
+                                "block_location": "block-v1:FIRAx+1040045+20260807+type@problem+block@after-summary",
+                            }
+                        )
+                elif scenario == "html_no_match":
+                    pass
+                else:
+                    self._add_terminal_summary(course_structure, locator="block-v1:FIRAx+1040045+20260807+type@html+block@summary-one")
+                    self._add_terminal_summary(course_structure, locator="block-v1:FIRAx+1040045+20260807+type@html+block@summary-two", name="总结")
+                course_path = tmp_path / "course.json"
+                course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+
+                result = module.run_in_place_publish(self._in_place_args(manifest_path, course_path))
+
+                if scenario == "ambiguous_summary":
+                    self.assertEqual("failed", result["status"])
+                    self.assertEqual("summary_match", result["failed_step"])
+                    self.assertEqual("ambiguous", result["summary_cleanup"]["status"])
+                    self.assertEqual(2, len(result["summary_cleanup"]["candidates"]))
+                    self.assertEqual([], result["steps"])
+                    continue
+                self.assertEqual("replaced", result["status"])
+                delete_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
+                if scenario == "gallery_without_summary":
+                    self.assertEqual("not_required", result["summary_cleanup"]["status"])
+                    self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
+                elif scenario == "html_no_match":
+                    self.assertEqual("not_found", result["summary_cleanup"]["status"])
+                    self.assertIn("no terminal HTML summary component", result["summary_cleanup"]["reason"])
+                elif scenario == "html_nonterminal_summary":
+                    self.assertEqual("not_found", result["summary_cleanup"]["status"])
+                    self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
+                else:
+                    self.assertEqual("not_required", result["summary_cleanup"]["status"])
+                    self.assertTrue(any(url.endswith("block@legacygallery") for url in delete_urls))
+                    self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
+
+    def test_publish_only_retry_reuses_saved_gallery_and_does_not_repeat_deletions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = self._write_manifest_bundle(tmp_path)
+            self._mark_manifest_source(manifest_path, block_type="html")
+            initial_structure = self._make_course_structure(
+                include_gallery=False,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            self._add_terminal_summary(initial_structure)
+            current_structure = initial_structure
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(initial_structure, ensure_ascii=False), encoding="utf-8")
+            args = self._in_place_args(manifest_path, course_path, execute=True)
+            target = {
+                "name": "1.1",
+                "manifest": str(manifest_path),
+                "section_id": "1.1",
+                "target_vertical_block_location": args.vertical_block_id,
+                "source_vertical_block_location": args.vertical_block_id,
+                "studio_vertical_url": args.studio_url,
+            }
+            created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@newgallery"
+            calls: list[str] = []
+            first_publish_failed = False
+
+            def fake_live_plan(**kwargs):
+                return (
+                    module.plan_publish_replacement(
+                        current_structure,
+                        source_vertical_block_id=kwargs["source_vertical_block_id"],
+                        target_vertical_block_id=kwargs["target_vertical_block_id"],
+                        summary_detection_requested=kwargs.get("summary_detection_requested", False),
+                        summary_cleanup_required=kwargs.get("summary_cleanup_required", False),
+                        excluded_block_locators=kwargs.get("excluded_block_locators", []),
+                    ),
+                    {"step": "load_live_target_structure", "status": "ok"},
+                )
+
+            def fake_adapter(_session, name, _template, ctx, _execute, _timeout):
+                nonlocal first_publish_failed
+                calls.append(name)
+                if name == "create_block":
+                    ctx["block_locator"] = created_locator
+                if name == "publish_vertical" and not first_publish_failed:
+                    first_publish_failed = True
+                    raise module.TemplateCallError(name, 500, {"detail": "publish failed"})
+                return {"step": name, "status": "ok"}
+
+            with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
+                with patch.object(module, "maybe_fetch_live_replacement_plan", side_effect=fake_live_plan):
+                    with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
+                        with patch.object(module, "call_template", side_effect=fake_adapter):
+                            first_result = module.process_publish_target(target, initial_structure, args, self.adapter)
+                            self.assertEqual("failed", first_result["status"])
+                            self.assertEqual("publish_vertical", first_result["failed_step"])
+                            self.assertEqual("deleted", first_result["summary_cleanup"]["status"])
+
+                            target_vertical = current_structure["chapters"][0]["sections"][0]["verticals"][0]
+                            target_vertical["blocks"] = [
+                                block for block in target_vertical["blocks"]
+                                if block.get("block_location") not in {
+                                    "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml",
+                                    "block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary",
+                                }
+                            ]
+                            target_vertical["blocks"].append(
+                                {
+                                    "name": "有声幻灯片",
+                                    "category": "imagesgallery",
+                                    "block_location": created_locator,
+                                }
+                            )
+                            start_retry_calls = len(calls)
+                            second_result = module.process_publish_target(
+                                target,
+                                current_structure,
+                                args,
+                                self.adapter,
+                                previous_result=first_result,
+                            )
+
+        self.assertEqual("replaced", second_result["status"])
+        self.assertTrue(second_result["resumed_from_previous_run"])
+        self.assertEqual(["publish_vertical"], calls[start_retry_calls:])
+        self.assertEqual("deleted", second_result["summary_cleanup"]["status"])
+        self.assertEqual(created_locator, second_result["created_block_locator"])
+
+    def test_batch_continues_after_summary_cleanup_failure_and_completes_later_vertical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = self._write_manifest_bundle(tmp_path)
+            self._mark_manifest_source(manifest_path, block_type="html")
+            course_structure = self._make_course_structure(
+                include_gallery=False,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            summary = self._add_terminal_summary(course_structure)
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+            targets_path = tmp_path / "targets.json"
+            report_path = tmp_path / "report.json"
+            target_vertical_id = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+            later_vertical_id = "block-v1:FIRAx+1040045+20260807+type@vertical+block@latervertical"
+            targets_path.write_text(
+                json.dumps(
+                    {
+                        "course_structure_json": str(course_path),
+                        "targets": [
+                            {
+                                "name": "1.1 cleanup failure",
+                                "manifest": str(manifest_path),
+                                "target_vertical_block_location": target_vertical_id,
+                                "source_vertical_block_location": target_vertical_id,
+                                "studio_vertical_url": f"https://studio.example.com/container/{target_vertical_id}",
+                            },
+                            {
+                                "name": "1.2 later success",
+                                "manifest": str(manifest_path),
+                                "target_vertical_block_location": later_vertical_id,
+                                "source_vertical_block_location": later_vertical_id,
+                                "studio_vertical_url": f"https://studio.example.com/container/{later_vertical_id}",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = self._in_place_args(manifest_path, course_path, execute=True)
+            args.targets_file = str(targets_path)
+            args.report_file = str(report_path)
+            calls: list[str] = []
+
+            def fake_runner(target, structure, publish_args, adapter, previous_result=None):
+                if target["name"] == "1.2 later success":
+                    calls.append(target["name"])
+                    return {"status": "replaced", "target_vertical_url": target["studio_vertical_url"], "steps": []}
+                calls.append(target["name"])
+                plan = module.plan_publish_replacement(
+                    structure,
+                    source_vertical_block_id=target["source_vertical_block_location"],
+                    target_vertical_block_id=target["target_vertical_block_location"],
+                    summary_detection_requested=True,
+                    summary_cleanup_required=True,
+                )
+                created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@batch-gallery"
+
+                def fake_live_plan(**kwargs):
+                    return (plan, {"step": "load_live_target_structure", "status": "ok"})
+
+                def fake_adapter(_session, name, _template, ctx, _execute, _timeout):
+                    if name == "create_block":
+                        ctx["block_locator"] = created_locator
+                    if name == "delete_block" and ctx.get("delete_block_locator") == summary["block_location"]:
+                        raise module.TemplateCallError(name, 500, {"detail": "summary cleanup failed"})
+                    return {"step": name, "status": "ok"}
+
+                with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
+                    with patch.object(module, "maybe_fetch_live_replacement_plan", side_effect=fake_live_plan):
+                        with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
+                            with patch.object(module, "call_template", side_effect=fake_adapter):
+                                return module.process_publish_target(target, structure, publish_args, adapter, previous_result=previous_result)
+
+            result = module.run_batch_publish(args, publish_target_fn=fake_runner)
+
+        self.assertEqual(["1.1 cleanup failure", "1.2 later success"], calls)
+        self.assertEqual(1, result["summary"]["failed_count"])
+        self.assertEqual(1, result["summary"]["replaced_count"])
+        self.assertEqual("delete_block", result["failed"][0]["failed_step"])
+        self.assertTrue(result["failed"][0]["matched_summary_block_url"].endswith("block@terminal-summary"))
+        self.assertEqual("1.2 later success", result["replaced"][0]["name"])
+
     def test_apply_in_place_publish_actions_supports_dry_run_without_created_locator(self) -> None:
         result = module.apply_in_place_publish_actions(
             {
@@ -734,7 +1388,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
         login_mock.assert_called_once()
         self.assertEqual(
-            ["csrf-from-login", "csrf-from-login", "csrf-from-login"],
+            ["<redacted>", "<redacted>", "<redacted>"],
             [step["request"]["headers"]["X-CSRFToken"] for step in result["steps"]],
         )
 
@@ -935,6 +1589,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("live fetch failed", str(ctx.exception))
 
     def test_process_publish_target_cleans_orphaned_created_block_before_fresh_rerun(self) -> None:
+        bundle_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(bundle_dir.cleanup)
+        manifest_path = self._write_manifest_bundle(Path(bundle_dir.name))
         course_structure = self._make_course_structure(
             include_gallery=True,
             include_target_html=False,
@@ -978,7 +1635,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         result = module.process_publish_target(
                             {
                                 "name": "1.1",
-                                "manifest": "a.json",
+                                "manifest": str(manifest_path),
                                 "source_vertical_block_location": "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
                                 "target_vertical_block_location": "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
                                 "studio_vertical_url": "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
@@ -1138,6 +1795,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("最多重试 **4** 次", skill_doc)
         self.assertIn("目标 vertical URL", skill_doc)
         self.assertIn("新建的 `imagesgallery` block URL", skill_doc)
+        self.assertIn("--cleanup-only", skill_doc)
+        self.assertIn("--section-list-json", skill_doc)
+        self.assertIn("摘要清理状态", skill_doc)
+        self.assertIn("失败步骤", skill_doc)
 
 
 if __name__ == "__main__":

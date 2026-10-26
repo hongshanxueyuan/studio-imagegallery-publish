@@ -64,6 +64,32 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
    - 如提供课程结构信息，则按课程结构执行就地替换 / 删除旧块 / 发布 vertical
 5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
 
+## HTML 来源课程的重复要点清理
+
+- 新生成的 `imagesgallery.json` 应携带顶层 `block_type`、`section_id` 和 `section_title`。
+- 发布器优先读取 manifest 的 `block_type`。旧 manifest 缺少该字段时，使用 `section-list.json`：先按 `section_id` 精确匹配；只有 ID 不可用时才允许按唯一小节标题匹配。
+- 来源标记缺失、冲突或匹配不唯一时，正常发布仍可替换正文，但不会自动删除 HTML；结果会标记人工跟进并在可识别时附上目标 block 链接。
+- 仅当来源为 HTML、图库最后一页标题是“本节要点”，且目标 vertical 末尾有唯一匹配的 HTML 组件时，正常发布才会额外删除该组件。图库完成保存后才删除正文和旧摘要；任一删除失败都会停止发布，不会回滚已完成的 Studio 操作。
+- 已完成课程可使用 cleanup-only。先运行 dry-run 检查 vertical、图库末页摘要证据和唯一 HTML 删除目标，再使用相同参数运行 `--execute`。cleanup-only 不创建或上传新 gallery：
+
+```bash
+python scripts/publish_imagegallery_block.py \
+  --studio-url "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --course-structure-json "/path/to/course-structure.json" \
+  --cleanup-only \
+  --dry-run
+```
+
+```bash
+python scripts/publish_imagegallery_block.py \
+  --studio-url "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --course-structure-json "/path/to/course-structure.json" \
+  --cleanup-only \
+  --execute
+```
+
+执行前会重新读取 Studio 课程结构，并要求同一 vertical 中存在末页标题为“本节要点”的 gallery 和唯一末尾 HTML 摘要组件。
+
 ## 批量推送安全规则
 
 如果这个 skill 是在更大的批量工作流里被调用：
@@ -140,10 +166,17 @@ python scripts/publish_imagegallery_block.py \
 - `--skip-oss-multipart`：调试模式；拿到上传信息后跳过 OSS 上传
 - `--auth-retry-max-retries`：认证 / 会话错误的最大重试次数；默认 `4`
 - `--auth-retry-delay-seconds`：认证重试之间的等待秒数；默认 `3`
-- `--course-structure-json`：启用课程结构驱动的就地替换逻辑
+- `--course-structure-json`：课程结构快照；用于就地替换，也为 cleanup-only dry-run 提供预览数据
 - `--source-vertical-block-id`：当目标课是导入副本时，用源课 vertical locator 做课程结构匹配
+- `--section-id`：manifest 没有来源标记时，用于回查 `section-list.json` 的小节 ID
+- `--section-title`：仅当小节 ID 不可用时，用于唯一标题回退
+- `--block-type`：来源 block 类型元数据；与 manifest 或 `section-list.json` 冲突时会禁止自动摘要清理
+- `--section-list-json`：显式指定来源元数据回查文件；未指定时，从 manifest 目录向上查找 `section-list.json`
+- `--cleanup-only`：只预览或删除已验证 gallery 对应的末尾 HTML“本节要点”，不上传新 gallery
 - `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
-- `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`manual_followup_failed`
+- `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`cleaned`、`manual_followup_failed`
+
+每个 vertical 的结果会包含可点击的目标 vertical URL、旧 HTML 摘要 block 链接与组件名（如已定位）、新建或复用的 gallery URL、摘要清理状态、已完成和失败步骤，以及失败原因或人工跟进说明。
 
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
