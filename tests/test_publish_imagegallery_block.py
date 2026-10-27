@@ -94,6 +94,28 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _set_interrupted_order_checkpoint(self, operation_path: Path, *, failed: bool = False) -> None:
+        state = json.loads(operation_path.read_text(encoding="utf-8"))
+        state["galleries"][0]["gallery_locator"] = "block-v1:ORG+COURSE+RUN+type@imagesgallery+block@gallery123"
+        publish = {
+            "gallery_key": "gallery-1",
+            "status": "failed" if failed else "in_progress",
+            "completed_stage": "images_uploaded",
+            "images_started": True,
+            "images": [
+                {"page": 1, "image": "page-001.png", "asset_id": "asset-001"},
+                {"page": 2, "image": "page-002.png", "asset_id": "asset-002"},
+            ],
+            "asset_ids": ["asset-001", "asset-002"],
+            "steps": [],
+        }
+        if failed:
+            publish["failed_step"] = "change_files_order"
+        else:
+            publish["active_step"] = "change_files_order"
+        state["galleries"][0]["publish"] = publish
+        operation_path.write_text(json.dumps(state), encoding="utf-8")
+
     def _run_publisher_cli(self, manifest_path: Path, operation_path: Path, fake_session, *, gallery_key: str = "gallery-1") -> tuple[int, str, str]:
         args = [
             "publish_imagegallery_block.py",
@@ -136,11 +158,21 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             return None
 
     class _FakeStudioSession:
-        def __init__(self, *, missing_upload_id: bool = False, incomplete_files: bool = False, fail_audio_prepare_once: bool = False):
+        def __init__(
+            self,
+            *,
+            missing_upload_id: bool = False,
+            incomplete_files: bool = False,
+            fail_audio_prepare_once: bool = False,
+            file_asset_ids: list[str] | None = None,
+            fail_get_files: bool = False,
+        ):
             self.cookies = PublishImageGalleryBlockTests._FakeCookies()
             self.missing_upload_id = missing_upload_id
             self.incomplete_files = incomplete_files
             self.fail_audio_prepare_once = fail_audio_prepare_once
+            self.file_asset_ids = file_asset_ids
+            self.fail_get_files = fail_get_files
             self.audio_prepare_count = 0
             self.calls: list[tuple[str, str]] = []
 
@@ -164,9 +196,13 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 page_index = sum(call_path.endswith("/handler/file_upload") for _verb, call_path in self.calls)
                 return PublishImageGalleryBlockTests._FakeResponse({"id": f"asset-{page_index:03d}"})
             if path.endswith("/handler/get_files"):
-                files = [{"id": "asset-001", "display_name": "page-001.png"}]
-                if not self.incomplete_files:
-                    files.append({"id": "asset-002", "display_name": "page-002.png"})
+                if self.fail_get_files:
+                    return PublishImageGalleryBlockTests._FakeResponse({"message": "unavailable"}, status_code=503)
+                asset_ids = self.file_asset_ids or ["asset-001", "asset-002"]
+                filenames = {"asset-001": "page-001.png", "asset-002": "page-002.png"}
+                files = [{"id": asset_id, "display_name": filenames.get(asset_id, "unexpected.png")} for asset_id in asset_ids]
+                if self.incomplete_files:
+                    files = files[:1]
                 return PublishImageGalleryBlockTests._FakeResponse({"files": files, "total_count": len(files)})
             if path.endswith("/handler/change_files_order"):
                 return PublishImageGalleryBlockTests._FakeResponse({"ok": True})
@@ -1977,6 +2013,98 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             self.assertEqual(["asset-001"], publish["asset_ids"])
             self.assertNotIn("response", json.dumps(final_state))
             self.assertNotIn("sts-secret-access-key", second_stdout + json.dumps(final_state))
+
+    def test_cli_reconciles_interrupted_file_order_before_replaying_order_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_multi_page_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            self._set_interrupted_order_checkpoint(operation_path)
+            fake = self._FakeStudioSession()
+
+            exit_code, stdout, stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            publish = json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["publish"]
+            self.assertEqual("saved", publish["completed_stage"])
+            self.assertIn("change_files_order_reconciliation", [step["step"] for step in publish["steps"]])
+
+    def test_cli_retries_interrupted_file_order_when_same_assets_are_still_out_of_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_multi_page_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            self._set_interrupted_order_checkpoint(operation_path, failed=True)
+            fake = self._FakeStudioSession(file_asset_ids=["asset-002", "asset-001"])
+
+            exit_code, stdout, stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls))
+            self.assertEqual(1, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            publish = json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["publish"]
+            self.assertEqual("saved", publish["completed_stage"])
+            self.assertEqual("completed", publish["status"])
+
+    def test_cli_keeps_interrupted_order_pending_when_get_files_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_multi_page_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            self._set_interrupted_order_checkpoint(operation_path, failed=True)
+            fake = self._FakeStudioSession(fail_get_files=True)
+
+            first_exit, first_stdout, first_stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(1, first_exit)
+            self.assertEqual("", first_stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            publish = json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["publish"]
+            self.assertEqual("failed", publish["status"])
+            self.assertEqual("images_uploaded", publish["completed_stage"])
+            self.assertEqual("change_files_order", publish["failed_step"])
+            self.assertNotIn("unavailable", first_stdout)
+
+            second_exit, second_stdout, second_stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(1, second_exit)
+            self.assertEqual("", second_stderr)
+            self.assertEqual(2, sum(path.endswith("/handler/get_files") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+
+    def test_cli_does_not_retry_interrupted_order_when_remote_asset_ids_differ(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_multi_page_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            self._set_interrupted_order_checkpoint(operation_path)
+            fake = self._FakeStudioSession(file_asset_ids=["asset-001", "foreign-asset"])
+
+            exit_code, stdout, stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(0, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            publish = json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["publish"]
+            self.assertEqual("failed", publish["status"])
+            self.assertEqual("images_uploaded", publish["completed_stage"])
+            self.assertEqual("change_files_order", publish["failed_step"])
+            self.assertNotIn("foreign-asset", stdout)
 
     def test_operation_file_requires_one_matching_gallery_key_before_studio_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
