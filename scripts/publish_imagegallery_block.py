@@ -9,12 +9,13 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from json import JSONDecodeError
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse, urlsplit, urlunsplit
 
 import requests
 
@@ -283,9 +284,7 @@ class TemplateCallError(RuntimeError):
         self.step_name = step_name
         self.status_code = int(status_code)
         self.payload = payload
-        payload_text = payload_to_text(payload)
-        self.payload_text = payload_text[:500]
-        super().__init__(f"{step_name} 失败: HTTP {status_code}, body={payload}")
+        super().__init__(f"{step_name} failed (HTTP {status_code})")
 
     def is_auth_related(self) -> bool:
         return is_auth_related_failure(self.status_code, self.payload)
@@ -1041,7 +1040,6 @@ def call_with_auth_retry(
                     "reason": "auth_error",
                     "step": exc.step_name,
                     "status_code": exc.status_code,
-                    "message": exc.payload_text,
                 }
             )
             if delay_seconds > 0:
@@ -1262,25 +1260,27 @@ def fetch_live_course_structure(
     )
     payload, parse_warning = decode_response_payload(resp)
     if resp.status_code >= 400:
-        raise PublishFailure(
-            "load_live_course_structure",
-            f"load_live_course_structure 失败: HTTP {resp.status_code}, url={url}, body={payload_to_text(payload)[:500]}",
-            payload=payload,
-        )
+        error = PublishFailure("load_live_course_structure", f"Studio course structure request failed (HTTP {resp.status_code})", payload=payload)
+        error.safe_summary = f"Studio course structure request failed (HTTP {resp.status_code})"
+        raise error
     if parse_warning:
-        raise PublishFailure(
+        error = PublishFailure(
             "load_live_course_structure",
-            f"load_live_course_structure 返回了无法解析的 JSON: url={url}, error={parse_warning}, body={payload_to_text(payload)[:500]}",
+            "Studio course structure response was not valid JSON",
             payload=payload,
         )
+        error.safe_summary = "Studio course structure response was not valid JSON"
+        raise error
     try:
         return normalize_course_structure_payload(payload)
     except Exception as exc:
-        raise PublishFailure(
+        error = PublishFailure(
             "load_live_course_structure",
-            f"load_live_course_structure 返回的课程结构无法标准化: url={url}, error={exc}",
+            "Studio course structure could not be normalized",
             payload=payload,
-        ) from exc
+        )
+        error.safe_summary = "Studio course structure could not be normalized"
+        raise error from exc
 
 
 def maybe_fetch_live_replacement_plan(
@@ -1341,7 +1341,7 @@ def maybe_fetch_live_replacement_plan(
             "step": "load_live_target_structure",
             "status": "warning",
             "course_key": course_key,
-            "note": str(exc),
+            "note": safe_error_summary(exc),
         }
 
 
@@ -1397,7 +1397,7 @@ def maybe_fetch_live_cleanup_plan(
             "step": "load_live_target_structure",
             "status": "warning",
             "course_key": course_key,
-            "note": str(exc),
+            "note": safe_error_summary(exc),
         }
 
 
@@ -1472,6 +1472,87 @@ def redact_sensitive_fields(value: Any) -> Any:
     return value
 
 
+def safe_step_name(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_.\[\]-]+", "_", str(value or "step"))[:120]
+
+
+def safe_error_summary(exc: Exception, *, step_name: str = "") -> str:
+    explicit_summary = getattr(exc, "safe_summary", "")
+    if isinstance(explicit_summary, str) and explicit_summary:
+        return explicit_summary[:240]
+    step = safe_step_name(step_name or getattr(exc, "step_name", "publish"))
+    if isinstance(exc, TemplateCallError):
+        return f"Studio request failed (HTTP {exc.status_code}) during {step}"
+    if isinstance(exc, ValueError):
+        return str(exc)[:240]
+    return f"Publishing failed during {step}"
+
+
+def safe_step_record(record: dict[str, Any], *, page_image: str = "") -> dict[str, Any]:
+    safe: dict[str, Any] = {
+        "step": safe_step_name(record.get("step")),
+        "status": safe_step_name(record.get("status", "ok")),
+    }
+    status_code = record.get("response_status")
+    if isinstance(status_code, int):
+        safe["http_status"] = status_code
+    for key in ("asset_id", "block_locator"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            safe[key] = value
+    if page_image:
+        safe["page_image"] = Path(page_image.replace("\\", "/")).name
+    retry_attempts = record.get("auth_retry_attempts")
+    if isinstance(retry_attempts, int) and retry_attempts > 0:
+        safe["auth_retry_attempts"] = retry_attempts
+    retry_events = record.get("auth_retry_events")
+    if isinstance(retry_events, list):
+        safe["auth_retry_events"] = [
+            {
+                "retry_index": event.get("retry_index"),
+                "reason": "auth_error",
+                "step": safe_step_name(event.get("step")),
+                "http_status": event.get("status_code"),
+            }
+            for event in retry_events
+            if isinstance(event, dict)
+        ]
+    return safe
+
+
+def safe_preview_url(url: str) -> str:
+    parsed = urlsplit(url)
+    safe_query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if any(hint in key.lower() for hint in ("auth", "cookie", "csrf", "credential", "password", "secret", "session", "token")):
+            value = "<redacted>"
+        safe_query.append((key, value))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(safe_query), ""))
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path = path.expanduser().resolve()
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+        temp_file.write(encoded)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+    try:
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 def call_template(
     session: requests.Session,
     name: str,
@@ -1492,17 +1573,17 @@ def call_template(
     record: dict[str, Any] = {
         "step": name,
         "method": method,
-        "url": url,
-        "request": {
+    }
+
+    if not execute:
+        record["url"] = safe_preview_url(url)
+        record["request"] = {
             "headers": redact_sensitive_fields(headers),
             "params": redact_sensitive_fields(params),
             "json": redact_sensitive_fields(json_body),
             "data": redact_sensitive_fields(data_body),
             "has_files": bool(files_spec),
-        },
-    }
-
-    if not execute:
+        }
         record["status"] = "dry-run"
         return record
 
@@ -1519,9 +1600,8 @@ def call_template(
     )
     record["response_status"] = resp.status_code
     payload, parse_warning = decode_response_payload(resp)
-    record["response"] = payload
     if parse_warning:
-        record["response_parse_warning"] = parse_warning
+        record["response_parse_warning"] = "Studio returned invalid JSON"
 
     if resp.status_code >= 400:
         raise TemplateCallError(name, resp.status_code, payload)
@@ -1530,16 +1610,318 @@ def call_template(
     if parse_warning and isinstance(extract, dict) and extract:
         raise PublishFailure(
             name,
-            f"{name} 成功返回但响应不是可提取的 JSON: url={url}, error={parse_warning}, body={payload_to_text(payload)[:500]}",
+            f"{name} succeeded with an invalid response",
             payload=payload,
         )
     if isinstance(extract, dict):
         for k, p in extract.items():
             ctx[k] = get_by_path(payload, str(p))
         if extract:
-            record["extracted"] = {k: ctx.get(k) for k in extract}
+            if name == "create_block":
+                locator = ctx.get("block_locator")
+                if isinstance(locator, str) and locator:
+                    record["block_locator"] = locator
+
+    if name == "upload_audio_prepare" and isinstance(payload, dict):
+        for key in ("Credentials", "region", "bucket", "file_key"):
+            if key in payload:
+                ctx[key] = payload[key]
+
+    if name.startswith("upload_image"):
+        asset_id = ""
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            asset_id = str(payload[0].get("id") or payload[0].get("asset_key") or "").strip()
+        elif isinstance(payload, dict):
+            asset_id = str(payload.get("id") or payload.get("asset_key") or "").strip()
+        if asset_id:
+            record["asset_id"] = asset_id
 
     return record
+
+
+class PublishCheckpoint:
+    def __init__(self, path: Path, operation: dict[str, Any], gallery_index: int, gallery_key: str):
+        self.path = path.expanduser().resolve()
+        self.operation = operation
+        self.gallery_index = gallery_index
+        self.gallery_key = gallery_key
+        self.gallery = operation["galleries"][gallery_index]
+        previous = self.gallery.get("publish")
+        previous = previous if isinstance(previous, dict) else {}
+        reconciliation_count = previous.get("reconciliation_count", 0)
+        if not isinstance(reconciliation_count, int) or reconciliation_count < 0:
+            reconciliation_count = 0
+        self.state: dict[str, Any] = {
+            "gallery_key": gallery_key,
+            "status": previous.get("status") if previous.get("status") in {"in_progress", "failed", "completed"} else "not_started",
+            "completed_stage": previous.get("completed_stage") if isinstance(previous.get("completed_stage"), str) else "",
+            "active_step": safe_step_name(previous.get("active_step")) if previous.get("active_step") else "",
+            "failed_step": safe_step_name(previous.get("failed_step")) if previous.get("failed_step") else "",
+            "asset_ids": [str(value) for value in previous.get("asset_ids", []) if isinstance(value, str) and value],
+            "images": self._safe_images(previous.get("images")),
+            "steps": self._safe_steps(previous.get("steps")),
+            "images_started": bool(previous.get("images_started", False)),
+            "reconciliation_count": reconciliation_count,
+        }
+        error_summary = previous.get("error_summary")
+        if isinstance(error_summary, str) and error_summary:
+            self.state["error_summary"] = "Previous publishing attempt failed; review the recorded safe step diagnostics"
+        failed_page_image = previous.get("failed_page_image")
+        if isinstance(failed_page_image, str) and failed_page_image:
+            self.state["failed_page_image"] = Path(failed_page_image.replace("\\", "/")).name
+        audio_document_id = previous.get("audio_document_id")
+        if isinstance(audio_document_id, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", audio_document_id):
+            self.state["audio_document_id"] = audio_document_id
+        self.gallery_locator = str(self.gallery.get("gallery_locator") or previous.get("gallery_locator") or "").strip()
+        self.resume = bool(self.state["completed_stage"] or self.state["active_step"] or self.state["status"] in {"in_progress", "failed"})
+
+    @staticmethod
+    def _safe_images(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        images = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            page = item.get("page")
+            image = item.get("image")
+            asset_id = item.get("asset_id")
+            if isinstance(page, int) and isinstance(image, str) and isinstance(asset_id, str) and asset_id:
+                images.append({"page": page, "image": Path(image.replace("\\", "/")).name, "asset_id": asset_id})
+        return images
+
+    @staticmethod
+    def _safe_steps(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        steps = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            record = {
+                "step": safe_step_name(item.get("step")),
+                "status": safe_step_name(item.get("status", "ok")),
+            }
+            for key in ("http_status", "asset_id", "block_locator", "page_image", "auth_retry_attempts"):
+                if isinstance(item.get(key), (str, int)):
+                    record[key] = item[key]
+            retry_events = item.get("auth_retry_events")
+            if isinstance(retry_events, list):
+                record["auth_retry_events"] = [
+                    {
+                        "retry_index": event.get("retry_index"),
+                        "reason": "auth_error",
+                        "step": safe_step_name(event.get("step")),
+                        "http_status": event.get("http_status"),
+                    }
+                    for event in retry_events
+                    if isinstance(event, dict)
+                ]
+            steps.append(record)
+        return steps
+
+    @classmethod
+    def load(cls, path_value: str, gallery_key: str, *, manifest_path: Path, vertical_block_id: str) -> "PublishCheckpoint":
+        path = Path(path_value).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError("operation file must already exist and be created by the batch caller")
+        try:
+            operation = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, JSONDecodeError) as exc:
+            raise ValueError("operation file is not readable JSON") from exc
+        galleries = operation.get("galleries") if isinstance(operation, dict) else None
+        if not isinstance(galleries, list):
+            raise ValueError("operation file must contain a galleries list")
+        matches = [index for index, gallery in enumerate(galleries) if isinstance(gallery, dict) and gallery.get("gallery_key") == gallery_key]
+        if len(matches) != 1:
+            raise ValueError("operation file must contain exactly one matching gallery_key")
+        gallery = galleries[matches[0]]
+        recorded_manifest = gallery.get("manifest")
+        if recorded_manifest and Path(str(recorded_manifest)).expanduser().resolve() != manifest_path:
+            raise ValueError("operation gallery manifest does not match --manifest")
+        recorded_vertical = str(gallery.get("vertical_locator") or "").strip()
+        if recorded_vertical and recorded_vertical != vertical_block_id:
+            raise ValueError("operation gallery vertical_locator does not match --studio-url")
+        return cls(path, operation, matches[0], gallery_key)
+
+    def persist(self) -> None:
+        if self.gallery_locator:
+            self.gallery["gallery_locator"] = self.gallery_locator
+        self.gallery["publish"] = self.state
+        atomic_write_json(self.path, self.operation)
+
+    def mark_started(self, step: str, *, page_image: str = "") -> None:
+        self.state["status"] = "in_progress"
+        self.state["active_step"] = safe_step_name(step)
+        self.state.pop("error_summary", None)
+        self.state["failed_step"] = ""
+        if page_image:
+            self.state["active_page_image"] = Path(page_image.replace("\\", "/")).name
+        if safe_step_name(step).startswith("upload_image["):
+            self.state["images_started"] = True
+        self.persist()
+
+    def record_success(
+        self,
+        record: dict[str, Any],
+        *,
+        stage: str = "",
+        page_image: str = "",
+        images: list[dict[str, Any]] | None = None,
+        audio_document_id: str = "",
+    ) -> None:
+        safe = safe_step_record(record, page_image=page_image)
+        identity = (safe["step"], safe.get("page_image", ""))
+        self.state["steps"] = [
+            item for item in self.state["steps"]
+            if (item["step"], item.get("page_image", "")) != identity
+        ] + [safe]
+        self.state["active_step"] = ""
+        self.state.pop("active_page_image", None)
+        if safe.get("block_locator"):
+            self.gallery_locator = safe["block_locator"]
+        if images is not None:
+            self.state["images"] = self._safe_images(images)
+            self.state["asset_ids"] = [item["asset_id"] for item in self.state["images"]]
+        if audio_document_id and re.fullmatch(r"[0-9a-fA-F-]{36}", audio_document_id):
+            self.state["audio_document_id"] = audio_document_id
+        if stage:
+            self.state["completed_stage"] = stage
+        self.state["status"] = "in_progress"
+        self.persist()
+
+    def set_stage(self, stage: str) -> None:
+        self.state["completed_stage"] = stage
+        self.state["active_step"] = ""
+        self.state.pop("active_page_image", None)
+        self.state["status"] = "in_progress"
+        self.persist()
+
+    def fail(self, exc: Exception, step_name: str, *, page_image: str = "") -> None:
+        self.state["status"] = "failed"
+        self.state["failed_step"] = safe_step_name(step_name)
+        self.state["active_step"] = ""
+        self.state.pop("active_page_image", None)
+        self.state["error_summary"] = str(getattr(exc, "safe_summary", "") or safe_error_summary(exc, step_name=step_name))[:240]
+        if isinstance(exc, TemplateCallError):
+            self.state["failure_http_status"] = exc.status_code
+        failed_record: dict[str, Any] = {"step": safe_step_name(step_name), "status": "failed"}
+        if isinstance(exc, TemplateCallError):
+            failed_record["http_status"] = exc.status_code
+        if page_image:
+            failed_image = Path(page_image.replace("\\", "/")).name
+            self.state["failed_page_image"] = failed_image
+            failed_record["page_image"] = failed_image
+        identity = (failed_record["step"], failed_record.get("page_image", ""))
+        self.state["steps"] = [
+            item for item in self.state["steps"]
+            if (item["step"], item.get("page_image", "")) != identity
+        ] + [failed_record]
+        self.persist()
+
+    def complete(self) -> None:
+        self.state["status"] = "completed"
+        self.state["completed_stage"] = "saved"
+        self.state["active_step"] = ""
+        self.state["failed_step"] = ""
+        self.state.pop("active_page_image", None)
+        self.state.pop("failed_page_image", None)
+        self.state.pop("error_summary", None)
+        self.persist()
+
+
+def manifest_image_name(item: dict[str, Any]) -> str:
+    return Path(str(item.get("image", "")).replace("\\", "/")).name
+
+
+def reconcile_gallery_images(
+    session: requests.Session,
+    *,
+    studio_base: str,
+    gallery_locator: str,
+    block_url: str,
+    context: dict[str, Any],
+    manifest_items: list[dict[str, Any]],
+    timeout: int,
+    refresh_auth_fn: Any = None,
+    auth_retry_max_retries: int = DEFAULT_AUTH_RETRY_MAX_RETRIES,
+    auth_retry_delay_seconds: float = DEFAULT_AUTH_RETRY_DELAY_SECONDS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    url = f"{studio_base.rstrip('/')}/preview/xblock/{gallery_locator}/handler/get_files"
+
+    def get_files() -> tuple[Any, int]:
+        response = session.request(
+            method="POST",
+            url=url,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "X-CSRFToken": str(context.get("csrftoken", "")),
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": block_url,
+            },
+            json={"current_page": 0, "page_size": 100},
+            timeout=timeout,
+        )
+        payload, parse_warning = decode_response_payload(response)
+        if response.status_code >= 400:
+            raise TemplateCallError("get_files_reconciliation", response.status_code, payload)
+        if parse_warning:
+            error = PublishFailure("get_files_reconciliation", "Studio returned invalid get_files JSON", payload=payload)
+            error.safe_summary = "Studio get_files response could not be read"
+            raise error
+        return payload, int(response.status_code)
+
+    (payload, status_code), retry_events = call_with_auth_retry(
+        get_files,
+        refresh_auth_fn,
+        max_retries=auth_retry_max_retries,
+        delay_seconds=auth_retry_delay_seconds,
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        error = PublishFailure("get_files_reconciliation", "Studio returned an invalid get_files shape", payload=payload)
+        error.safe_summary = "Studio get_files response did not contain a valid files list"
+        raise error
+    files = payload["files"]
+    total_count = payload.get("total_count")
+    if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count != len(files) or len(files) != len(manifest_items):
+        error = PublishFailure("get_files_reconciliation", "Studio get_files count did not match the manifest")
+        error.safe_summary = f"Studio get_files returned {len(files)} file records for {len(manifest_items)} manifest pages"
+        raise error
+
+    expected_names = [manifest_image_name(item) for item in manifest_items]
+    if len(set(expected_names)) != len(expected_names):
+        error = PublishFailure("get_files_reconciliation", "manifest filenames are ambiguous")
+        error.safe_summary = "Manifest page filenames do not uniquely identify uploaded files"
+        raise error
+
+    matches: list[dict[str, Any]] = []
+    used_asset_ids: set[str] = set()
+    for index, (file_record, manifest_item) in enumerate(zip(files, manifest_items), start=1):
+        if not isinstance(file_record, dict):
+            raise PublishFailure("get_files_reconciliation", "Studio get_files contained an invalid file record")
+        remote_name = str(
+            file_record.get("display_name")
+            or file_record.get("name")
+            or file_record.get("filename")
+            or file_record.get("file_name")
+            or ""
+        ).replace("\\", "/").rsplit("/", 1)[-1]
+        expected_name = expected_names[index - 1]
+        asset_id = str(file_record.get("id") or file_record.get("asset_key") or "").strip()
+        if remote_name != expected_name or not asset_id or asset_id in used_asset_ids:
+            error = PublishFailure("get_files_reconciliation", "Studio files did not uniquely match manifest order")
+            error.safe_summary = f"Studio get_files did not uniquely match manifest page {index} ({expected_name})"
+            raise error
+        used_asset_ids.add(asset_id)
+        matches.append({"page": int(manifest_item["page"]), "image": expected_name, "asset_id": asset_id})
+    return matches, {
+        "step": "get_files_reconciliation",
+        "status": "ok",
+        "response_status": status_code,
+        "auth_retry_attempts": len(retry_events),
+        "auth_retry_events": retry_events,
+    }
 
 
 def load_adapter(adapter_path: str) -> dict[str, Any]:
@@ -1663,12 +2045,12 @@ def cleanup_orphaned_created_block(
         "step": step_name,
         "cleanup_target_block_locator": block_locator,
         "method": method,
-        "url": url,
+        "url": safe_preview_url(url),
         "request": {
-            "headers": headers,
-            "params": params,
-            "json": json_body,
-            "data": data_body,
+            "headers": redact_sensitive_fields(headers),
+            "params": redact_sensitive_fields(params),
+            "json": redact_sensitive_fields(json_body),
+            "data": redact_sensitive_fields(data_body),
         },
     }
 
@@ -1683,9 +2065,8 @@ def cleanup_orphaned_created_block(
     )
     payload, parse_warning = decode_response_payload(resp)
     record["response_status"] = resp.status_code
-    record["response"] = payload
     if parse_warning:
-        record["response_parse_warning"] = parse_warning
+        record["response_parse_warning"] = "Studio returned invalid JSON"
 
     if resp.status_code in {200, 202, 204}:
         record["status"] = "deleted"
@@ -1694,11 +2075,13 @@ def cleanup_orphaned_created_block(
         record["status"] = "already_missing"
         return record
 
-    raise PublishFailure(
+    error = PublishFailure(
         step_name,
-        f"{step_name} 失败: HTTP {resp.status_code}, url={url}, body={payload_to_text(payload)[:500]}",
+        f"{step_name} failed (HTTP {resp.status_code})",
         payload=payload,
     )
+    error.safe_summary = f"Studio request failed (HTTP {resp.status_code}) during {safe_step_name(step_name)}"
+    raise error
 
 
 def build_publish_args_for_target(
@@ -1848,7 +2231,7 @@ def process_cleanup_only_target(
             "failed_step": exc.step_name,
             "failure_bucket": "manual_followup",
             "requires_manual_followup": True,
-            "note": str(exc),
+            "note": safe_error_summary(exc),
             "summary_cleanup": {
                 "status": "failed" if failed_delete else "not_completed",
                 "gallery_heading": str(plan.get("existing_gallery_heading", "")),
@@ -1865,36 +2248,53 @@ def process_cleanup_only_target(
 
 def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
-    adapter_path = Path(args.adapter).expanduser().resolve()
     manifest = ensure_manifest(manifest_path)
-    adapter = read_json(adapter_path)
-
+    adapter = read_json(Path(args.adapter).expanduser().resolve())
     studio_url = args.studio_url.strip()
-    u = urlparse(studio_url)
-    studio_base = f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else ""
+    parsed_url = urlparse(studio_url)
+    studio_base = f"{parsed_url.scheme}://{parsed_url.netloc}" if parsed_url.scheme and parsed_url.netloc else ""
     if not studio_base:
-        raise ValueError("studio_url 无效")
+        raise ValueError("studio_url is invalid")
 
     vertical_block_id = args.vertical_block_id or parse_vertical_block_id(studio_url)
     if not vertical_block_id:
-        raise ValueError("无法从 studio_url 解析 vertical_block_id，请显式传 --vertical-block-id")
+        raise ValueError("studio_url does not contain a vertical_block_id")
+
+    operation_file = str(getattr(args, "operation_file", "") or "").strip()
+    gallery_key = str(getattr(args, "gallery_key", "") or "").strip()
+    if bool(operation_file) != bool(gallery_key):
+        raise ValueError("--operation-file and --gallery-key must be supplied together")
+    if operation_file and not args.execute:
+        raise ValueError("--operation-file is available only with --execute")
+    checkpoint = (
+        PublishCheckpoint.load(operation_file, gallery_key, manifest_path=manifest_path, vertical_block_id=vertical_block_id)
+        if operation_file
+        else None
+    )
+    if checkpoint and checkpoint.state["status"] == "completed" and checkpoint.state["completed_stage"] == "saved" and checkpoint.gallery_locator:
+        locator = checkpoint.gallery_locator
+        gallery_url = build_container_block_url(studio_base, locator)
+        return {
+            "mode": "execute" if args.execute else "dry-run",
+            "studio_base": studio_base,
+            "vertical_block_id": vertical_block_id,
+            "target_vertical_url": build_container_block_url(studio_base, vertical_block_id),
+            "block_locator": locator,
+            "created_imagegallery_block_url": gallery_url,
+            "created_block_url": gallery_url,
+            "asset_ids": list(checkpoint.state["asset_ids"]),
+            "steps": list(checkpoint.state["steps"]),
+            "resumed": True,
+        }
 
     execute = bool(args.execute)
     session = requests.Session()
     csrftoken = (args.csrf_token or "") if execute else ""
-
     account = (args.account or os.environ.get("FIRA_SAAS_OP_ACCOUNT", "")).strip()
     password = (args.password or os.environ.get("FIRA_SAAS_OP_PASSWORD", "")).strip()
-    courses_base = args.courses_base
-    if not courses_base:
-        courses_base = derive_courses_base_from_studio_base(studio_base)
-
+    courses_base = args.courses_base or derive_courses_base_from_studio_base(studio_base)
     if execute and not args.cookie and (not account or not password):
-        raise ValueError(
-            "缺少登录凭证。请提供 --account/--password，或配置环境变量 "
-            "FIRA_SAAS_OP_ACCOUNT / FIRA_SAAS_OP_PASSWORD。"
-        )
-
+        raise ValueError("execute mode requires Studio credentials or --cookie")
     if execute and account and password and courses_base:
         session, login_csrf = login_and_get_studio_session(
             account=account,
@@ -1904,36 +2304,22 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not csrftoken:
             csrftoken = login_csrf
-
     if execute and args.cookie:
         cookies = parse_cookie_header(args.cookie)
-        for k, v in cookies.items():
-            session.cookies.set(k, v, domain=urlparse(studio_base).hostname or "")
+        for key, value in cookies.items():
+            session.cookies.set(key, value, domain=urlparse(studio_base).hostname or "")
         if not csrftoken:
             csrftoken = cookies.get("csrftoken", "")
 
     items_obj = [
-        {
-            "page": int(i["page"]),
-            "image": i["image"],
-            "subtitle": i["subtitle"],
-            "start": int(i["start"]),
-            "end": int(i["end"]),
-        }
-        for i in manifest["items"]
+        {"page": int(item["page"]), "image": item["image"], "subtitle": item["subtitle"], "start": int(item["start"]), "end": int(item["end"])}
+        for item in manifest["items"]
     ]
     time_config_obj = [
-        {
-            "page": int(i["page"]),
-            "start": int(i["start"]),
-            "end": int(i["end"]),
-            "subtitle": i["subtitle"],
-        }
-        for i in manifest["items"]
+        {"page": int(item["page"]), "start": int(item["start"]), "end": int(item["end"]), "subtitle": item["subtitle"]}
+        for item in manifest["items"]
     ]
-
     canonical_block_url = normalize_block_url(args.block_url or studio_url)
-
     ctx: dict[str, Any] = {
         "studio_url": studio_url,
         "studio_base": studio_base,
@@ -1959,8 +2345,21 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
     }
     if ctx["course_key"]:
         ctx["courses_json"] = json.dumps({ctx["course_key"]: False}, ensure_ascii=False)
+    if checkpoint and checkpoint.state.get("audio_document_id"):
+        ctx["edx_document_id"] = checkpoint.state["audio_document_id"]
+        ctx["audio_document_id"] = f"{ctx['edx_document_id']}.{ctx['audio_post_fix']}"
 
-    logs: list[dict[str, Any]] = []
+    logs = list(checkpoint.state["steps"]) if checkpoint else []
+    if checkpoint and checkpoint.state["active_step"] == "create_block" and not checkpoint.gallery_locator:
+        error = PublishFailure("create_block", "previous create_block result is ambiguous")
+        error.safe_summary = "The create_block result is incomplete; review Studio before retrying"
+        checkpoint.fail(error, "create_block")
+        raise error
+    if checkpoint and checkpoint.state["status"] == "failed" and checkpoint.state["failed_step"] == "create_block" and not checkpoint.gallery_locator:
+        error = PublishFailure("create_block", "previous create_block result is ambiguous")
+        error.safe_summary = "The create_block result is incomplete; review Studio before retrying"
+        raise error
+
     can_refresh_auth = bool(execute and account and password and courses_base)
 
     def refresh_auth_session() -> None:
@@ -1974,13 +2373,19 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         csrftoken = login_csrf
         ctx["csrftoken"] = csrftoken
 
-    def call_step(name: str, tmpl: dict[str, Any]) -> dict[str, Any]:
-        record, retry_events = call_with_auth_retry(
-            lambda: call_template(session, name, tmpl, ctx, execute, args.timeout),
-            refresh_auth_session if can_refresh_auth else None,
-            max_retries=normalize_auth_retry_max_retries(getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
-            delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
-        )
+    def start_and_call(name: str, tmpl: dict[str, Any], *, page_image: str = "") -> dict[str, Any]:
+        if checkpoint:
+            checkpoint.mark_started(name, page_image=page_image)
+        try:
+            record, retry_events = call_with_auth_retry(
+                lambda: call_template(session, name, tmpl, ctx, execute, args.timeout),
+                refresh_auth_session if can_refresh_auth else None,
+                max_retries=normalize_auth_retry_max_retries(getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
+                delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
+            )
+        except Exception as exc:
+            mark_failure(exc, name, page_image=page_image)
+            raise
         if execute and "status" not in record:
             record["status"] = "ok"
         if retry_events:
@@ -1988,128 +2393,276 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
             record["auth_retry_events"] = retry_events
         return record
 
+    def accept_step(
+        record: dict[str, Any],
+        *,
+        stage: str = "",
+        page_image: str = "",
+        images: list[dict[str, Any]] | None = None,
+        audio_document_id: str = "",
+    ) -> None:
+        logs.append(record)
+        if checkpoint:
+            checkpoint.record_success(
+                record,
+                stage=stage,
+                page_image=page_image,
+                images=images,
+                audio_document_id=audio_document_id,
+            )
+
+    def mark_failure(exc: Exception, step: str, *, page_image: str = "") -> None:
+        diagnostics: dict[str, Any] = {
+            "completed_stage": checkpoint.state["completed_stage"] if checkpoint else "",
+            "asset_ids": list(ctx.get("uploaded_asset_ids", [])),
+            "steps": [safe_step_record(record) for record in logs],
+        }
+        if page_image:
+            diagnostics["failed_page_image"] = Path(page_image.replace("\\", "/")).name
+        setattr(exc, "safe_diagnostics", diagnostics)
+        if checkpoint and checkpoint.state["status"] != "failed":
+            checkpoint.fail(exc, step, page_image=page_image)
+
+    def run_reconciliation(failed_step: str, *, page_image: str = "") -> list[dict[str, Any]]:
+        if checkpoint and checkpoint.state["reconciliation_count"] >= 1:
+            error = PublishFailure(failed_step, "image recovery already attempted")
+            error.safe_summary = "Studio image recovery was already attempted; no images were uploaded again"
+            checkpoint.fail(error, failed_step, page_image=page_image)
+            raise error
+        if checkpoint:
+            checkpoint.state["reconciliation_count"] += 1
+            checkpoint.mark_started("get_files_reconciliation", page_image=page_image)
+            checkpoint.state["reconciliation_count"] += 0
+            checkpoint.persist()
+        try:
+            images, record = reconcile_gallery_images(
+                session,
+                studio_base=studio_base,
+                gallery_locator=str(ctx.get("block_locator", "")),
+                block_url=canonical_block_url,
+                context=ctx,
+                manifest_items=list(manifest["items"]),
+                timeout=args.timeout,
+                refresh_auth_fn=refresh_auth_session if can_refresh_auth else None,
+                auth_retry_max_retries=normalize_auth_retry_max_retries(getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
+                auth_retry_delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
+            )
+        except Exception as exc:
+            failed_reconciliation = {
+                "step": "get_files_reconciliation",
+                "status": "failed",
+                "response_status": exc.status_code if isinstance(exc, TemplateCallError) else None,
+            }
+            logs.append(failed_reconciliation)
+            safe_exc = exc if isinstance(exc, Exception) else Exception("reconciliation failed")
+            mark_failure(safe_exc, failed_step, page_image=page_image)
+            if isinstance(exc, Exception):
+                exc.step_name = failed_step
+            raise
+        logs.append(record)
+        if checkpoint:
+            checkpoint.record_success(record, images=images)
+        ctx["uploaded_asset_ids"] = [image["asset_id"] for image in images]
+        return images
+
     for key in ("create_block", "upload_image", "save_block"):
         if key not in adapter:
-            raise ValueError(f"adapter 缺失步骤: {key}")
+            raise ValueError(f"adapter missing step {key}")
 
-    logs.append(call_step("create_block", adapter["create_block"]))
-
-    for idx, item in enumerate(manifest["items"], start=1):
-        ctx.update(
-            {
-                "index": idx,
-                "page": int(item["page"]),
-                "page_number": int(item["page"]),
-                "image_file": item["_image_abs"],
-                "image_rel": item["image"],
-                "subtitle": item["subtitle"],
-                "start": int(item["start"]),
-                "end": int(item["end"]),
-            }
-        )
-        image_step = call_step(f"upload_image[{idx}]", adapter["upload_image"])
-        logs.append(image_step)
-        resp = image_step.get("response")
-        asset_id = ""
-        if isinstance(resp, list) and resp and isinstance(resp[0], dict):
-            asset_id = str(resp[0].get("id", "")).strip()
-        elif isinstance(resp, dict):
-            asset_id = str(resp.get("id", "")).strip()
-        if asset_id:
-            ctx["uploaded_asset_ids"] = [*ctx.get("uploaded_asset_ids", []), asset_id]
-
-    if "change_files_order" in adapter:
-        logs.append(
-            call_step(
-                "change_files_order",
-                adapter["change_files_order"],
-            )
-        )
-
-    if "upload_audio_prepare" in adapter:
-        prepare_step = call_step(
-            "upload_audio_prepare",
-            adapter["upload_audio_prepare"],
-        )
-        logs.append(prepare_step)
-        if isinstance(prepare_step.get("response"), dict):
-            resp_obj = prepare_step["response"]
-            for key in ("Credentials", "region", "bucket", "file_key"):
-                if key in resp_obj:
-                    ctx[key] = resp_obj[key]
-        if execute and not args.skip_oss_multipart:
-            multipart_result = sts_multipart_upload_audio(ctx)
-            logs.append(
-                {
-                    "step": "upload_audio_multipart",
-                    "status": "ok",
-                    "result": multipart_result,
-                }
-            )
-            ctx["audio_object_key"] = multipart_result["object_key"]
+    if checkpoint and checkpoint.gallery_locator:
+        ctx["block_locator"] = checkpoint.gallery_locator
+    elif checkpoint and checkpoint.resume and checkpoint.state["completed_stage"]:
+        error = PublishFailure("create_block", "checkpoint is missing its gallery locator")
+        error.safe_summary = "The saved publish stage is missing its Gallery locator"
+        checkpoint.fail(error, "create_block")
+        raise error
+    else:
+        create_step = start_and_call("create_block", adapter["create_block"])
+        locator = create_step.get("block_locator") or ctx.get("block_locator")
+        accept_step(create_step, stage="block_created")
+        if execute and (not isinstance(locator, str) or not locator.strip()):
+            error = PublishFailure("create_block", "Studio did not return a usable block locator")
+            error.safe_summary = "Studio created no usable Gallery locator"
+            mark_failure(error, "create_block")
+            raise error
+        if isinstance(locator, str) and locator.strip():
+            ctx["block_locator"] = locator.strip()
         elif not execute:
-            logs.append(
-                {
-                    "step": "upload_audio_multipart",
-                    "status": "dry-run",
-                    "note": "execute 模式下会执行 OSS multipart 上传；缺少 oss2 时会自动安装",
-                }
-            )
-        else:
-            logs.append(
-                {
-                    "step": "upload_audio_multipart",
-                    "status": "skipped",
-                    "note": "--skip-oss-multipart 已启用，跳过 OSS multipart 上传",
-                }
-            )
-        if not ctx.get("edx_document_id") and ctx.get("file_key"):
-            maybe_id = maybe_extract_uuid(str(ctx["file_key"]))
-            if maybe_id:
-                ctx["edx_document_id"] = maybe_id
+            ctx["block_locator"] = "__dry_run_created_imagesgallery__"
+        if checkpoint and isinstance(locator, str) and locator.strip():
+            checkpoint.gallery_locator = locator.strip()
+            checkpoint.persist()
+
+    stage_order = {
+        "": 0,
+        "block_created": 1,
+        "images_uploaded": 2,
+        "images_ordered": 3,
+        "audio_prepared": 4,
+        "audio_uploaded": 5,
+        "audio_registered": 6,
+        "audio_binding_saved": 7,
+        "audio_bound": 8,
+        "saved": 9,
+    }
+
+    def completed_rank() -> int:
+        stage = checkpoint.state.get("completed_stage", "") if checkpoint else ""
+        return stage_order.get(stage, 0)
+
+    def valid_saved_images(value: Any) -> list[dict[str, Any]] | None:
+        if not isinstance(value, list) or len(value) != len(manifest["items"]):
+            return None
+        saved: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        for item, record in zip(manifest["items"], value):
+            if not isinstance(record, dict):
+                return None
+            if record.get("page") != int(item["page"]) or record.get("image") != manifest_image_name(item):
+                return None
+            asset_id = record.get("asset_id")
+            if not isinstance(asset_id, str) or not asset_id or asset_id in ids:
+                return None
+            ids.add(asset_id)
+            saved.append({"page": int(item["page"]), "image": manifest_image_name(item), "asset_id": asset_id})
+        return saved
+
+    checkpoint_images = valid_saved_images(checkpoint.state.get("images")) if checkpoint else None
+    image_started = bool(checkpoint and (checkpoint.state["images_started"] or checkpoint.state["images"]))
+    images = checkpoint_images or []
+    if checkpoint and image_started and checkpoint_images is None:
+        images = run_reconciliation("resume_image_reconciliation")
+        if checkpoint:
+            checkpoint.set_stage("images_uploaded")
+    elif checkpoint and checkpoint_images and completed_rank() < stage_order["images_uploaded"]:
+        checkpoint.set_stage("images_uploaded")
+
+    if checkpoint and checkpoint.state["status"] == "completed" and checkpoint.state["completed_stage"] == "saved":
+        images = checkpoint_images or []
+    else:
+        if not images:
+            for idx, item in enumerate(manifest["items"], start=1):
+                page_image = manifest_image_name(item)
+                ctx.update(
+                    {
+                        "index": idx,
+                        "page": int(item["page"]),
+                        "page_number": int(item["page"]),
+                        "image_file": item["_image_abs"],
+                        "image_rel": item["image"],
+                        "subtitle": item["subtitle"],
+                        "start": int(item["start"]),
+                        "end": int(item["end"]),
+                    }
+                )
+                image_step = start_and_call(f"upload_image[{idx}]", adapter["upload_image"], page_image=page_image)
+                asset_id = str(image_step.get("asset_id", "")).strip()
+                if not execute:
+                    accept_step(image_step, page_image=page_image)
+                    continue
+                if not asset_id:
+                    accept_step(image_step, page_image=page_image)
+                    images = run_reconciliation(f"upload_image[{idx}]", page_image=page_image)
+                    break
+                if any(saved["asset_id"] == asset_id for saved in images):
+                    error = PublishFailure(f"upload_image[{idx}]", "Studio returned a duplicate image asset ID")
+                    error.safe_summary = f"Studio returned a duplicate asset ID for {page_image}"
+                    mark_failure(error, f"upload_image[{idx}]", page_image=page_image)
+                    raise error
+                images.append({"page": int(item["page"]), "image": page_image, "asset_id": asset_id})
+                accept_step(image_step, page_image=page_image, images=images)
+            if execute and len(images) != len(manifest["items"]):
+                error = PublishFailure("upload_image", "not every manifest image was confirmed")
+                error.safe_summary = "Not every manifest image has a confirmed Studio asset ID"
+                mark_failure(error, "upload_image")
+                raise error
+            if checkpoint and completed_rank() < stage_order["images_uploaded"]:
+                checkpoint.set_stage("images_uploaded")
+
+    ctx["uploaded_asset_ids"] = [image["asset_id"] for image in images]
+    if not checkpoint or completed_rank() < stage_order["images_ordered"]:
+        if "change_files_order" in adapter:
+            order_step = start_and_call("change_files_order", adapter["change_files_order"])
+            accept_step(order_step, stage="images_ordered")
+        elif checkpoint:
+            checkpoint.set_stage("images_ordered")
+
+    rank = completed_rank()
+    if "upload_audio_prepare" in adapter and rank < stage_order["audio_uploaded"]:
+        prepare_step = start_and_call("upload_audio_prepare", adapter["upload_audio_prepare"])
+        accept_step(prepare_step)
+        file_key = ctx.get("file_key")
+        if execute and (not isinstance(file_key, str) or not file_key.strip()):
+            error = PublishFailure("upload_audio_prepare", "Studio returned no usable file_key")
+            error.safe_summary = "Studio audio preparation did not return a usable file_key"
+            mark_failure(error, "upload_audio_prepare")
+            raise error
+        if execute and not ctx.get("edx_document_id"):
+            ctx["edx_document_id"] = maybe_extract_uuid(file_key)
         if ctx.get("edx_document_id"):
             ctx["audio_document_id"] = f"{ctx['edx_document_id']}.{ctx['audio_post_fix']}"
+        accept_step(prepare_step, stage="audio_prepared", audio_document_id=str(ctx.get("edx_document_id", "")))
 
-    if "upload_audio" in adapter:
-        logs.append(call_step("upload_audio", adapter["upload_audio"]))
+        if execute and not args.skip_oss_multipart:
+            if checkpoint:
+                checkpoint.mark_started("upload_audio_multipart")
+            try:
+                multipart_result = sts_multipart_upload_audio(ctx)
+            except Exception as exc:
+                mark_failure(exc, "upload_audio_multipart")
+                raise
+            multipart_step = {"step": "upload_audio_multipart", "status": "ok", "result": {"parts": multipart_result["parts"], "size": multipart_result["size"]}}
+            logs.append(multipart_step)
+            if checkpoint:
+                checkpoint.record_success(multipart_step, stage="audio_uploaded", audio_document_id=str(ctx.get("edx_document_id", "")))
+            ctx["audio_object_key"] = multipart_result["object_key"]
+        elif not execute:
+            logs.append({"step": "upload_audio_multipart", "status": "dry-run", "note": "execute mode uploads audio through OSS multipart"})
+        else:
+            skipped_step = {"step": "upload_audio_multipart", "status": "skipped", "note": "OSS multipart upload was skipped"}
+            logs.append(skipped_step)
+            if checkpoint:
+                checkpoint.record_success(skipped_step, stage="audio_uploaded", audio_document_id=str(ctx.get("edx_document_id", "")))
 
-    if "upload_audio_register" in adapter:
-        logs.append(
-            call_step(
-                "upload_audio_register",
-                adapter["upload_audio_register"],
-            )
-        )
+    if checkpoint and completed_rank() >= stage_order["audio_uploaded"] and checkpoint.state.get("audio_document_id"):
+        ctx["edx_document_id"] = checkpoint.state["audio_document_id"]
+        ctx["audio_document_id"] = f"{ctx['edx_document_id']}.{ctx['audio_post_fix']}"
 
-    if "save_audio_binding" in adapter:
-        logs.append(
-            call_step(
-                "save_audio_binding",
-                adapter["save_audio_binding"],
-            )
-        )
+    if "upload_audio" in adapter and completed_rank() < stage_order["audio_uploaded"]:
+        audio_step = start_and_call("upload_audio", adapter["upload_audio"])
+        accept_step(audio_step, stage="audio_uploaded", audio_document_id=str(ctx.get("edx_document_id", "")))
 
-    if "submit_studio_edits" in adapter:
-        logs.append(
-            call_step(
-                "submit_studio_edits",
-                adapter["submit_studio_edits"],
-            )
-        )
-    logs.append(call_step("save_block", adapter["save_block"]))
+    if "upload_audio_register" in adapter and completed_rank() < stage_order["audio_registered"]:
+        register_step = start_and_call("upload_audio_register", adapter["upload_audio_register"])
+        accept_step(register_step, stage="audio_registered", audio_document_id=str(ctx.get("edx_document_id", "")))
+
+    if "save_audio_binding" in adapter and completed_rank() < stage_order["audio_binding_saved"]:
+        binding_step = start_and_call("save_audio_binding", adapter["save_audio_binding"])
+        accept_step(binding_step, stage="audio_binding_saved", audio_document_id=str(ctx.get("edx_document_id", "")))
+
+    if "submit_studio_edits" in adapter and completed_rank() < stage_order["audio_bound"]:
+        edits_step = start_and_call("submit_studio_edits", adapter["submit_studio_edits"])
+        accept_step(edits_step, stage="audio_bound", audio_document_id=str(ctx.get("edx_document_id", "")))
+
+    if completed_rank() < stage_order["saved"]:
+        save_step = start_and_call("save_block", adapter["save_block"])
+        accept_step(save_step, stage="saved", audio_document_id=str(ctx.get("edx_document_id", "")))
+        if checkpoint:
+            checkpoint.complete()
 
     target_vertical_url = build_container_block_url(studio_base, vertical_block_id)
-    created_imagegallery_block_url = build_container_block_url(studio_base, str(ctx.get("block_locator", "")))
-
-    return {
+    result_block_locator = str(ctx.get("block_locator", "")) if execute else ""
+    created_imagegallery_block_url = build_container_block_url(studio_base, result_block_locator) if result_block_locator else ""
+    result = {
         "mode": "execute" if execute else "dry-run",
         "studio_base": studio_base,
         "courses_base": courses_base,
         "vertical_block_id": vertical_block_id,
         "target_vertical_url": target_vertical_url,
-        "block_locator": ctx.get("block_locator", ""),
+        "block_locator": result_block_locator,
         "created_imagegallery_block_url": created_imagegallery_block_url,
         "created_block_url": created_imagegallery_block_url,
+        "asset_ids": list(ctx.get("uploaded_asset_ids", [])),
         "auth_retry_policy": {
             "enabled": can_refresh_auth,
             "max_retries": normalize_auth_retry_max_retries(getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
@@ -2117,6 +2670,11 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         },
         "steps": logs,
     }
+    if checkpoint:
+        result["gallery_key"] = gallery_key
+        result["completed_stage"] = checkpoint.state["completed_stage"]
+        result["resumed"] = checkpoint.resume
+    return result
 
 
 def apply_in_place_publish_actions(
@@ -2253,10 +2811,10 @@ def apply_in_place_publish_actions(
                     "step": step_name,
                     "status": "failed",
                     "block_locator": delete_locator or None,
-                    "reason": str(exc),
+                    "reason": safe_error_summary(exc),
                 }
             )
-            failure = PublishFailure(step_name, str(exc), payload=exc.payload)
+            failure = PublishFailure(step_name, safe_error_summary(exc), payload=exc.payload)
             failure.steps = steps.copy()
             raise failure from exc
 
@@ -2588,7 +3146,7 @@ def process_publish_target(
                 "failed_step": exc.step_name,
                 "failure_bucket": "manual_followup",
                 "requires_manual_followup": True,
-                "note": str(exc),
+                "note": safe_error_summary(exc),
                 "steps": preflight_steps,
             }
 
@@ -2697,7 +3255,7 @@ def process_publish_target(
             "failed_step": exc.step_name,
             "failure_bucket": "manual_followup",
             "requires_manual_followup": True,
-            "note": str(exc),
+            "note": safe_error_summary(exc),
             "summary_cleanup": failure_summary_cleanup,
             "course_kind": replacement_plan.get("course_kind", ""),
             "match_scope": replacement_plan.get("match_scope", ""),
@@ -2764,7 +3322,7 @@ def run_batch_publish(
                 "failed_step": exc.step_name,
                 "failure_bucket": "manual_followup",
                 "requires_manual_followup": True,
-                "note": str(exc),
+                "note": safe_error_summary(exc),
                 "target_vertical_url": str(target.get("studio_vertical_url", "")),
             }
         except Exception as exc:
@@ -2773,7 +3331,7 @@ def run_batch_publish(
                 "failed_step": getattr(exc, "step_name", "unexpected_error"),
                 "failure_bucket": "manual_followup",
                 "requires_manual_followup": True,
-                "note": str(exc),
+                "note": safe_error_summary(exc),
                 "target_vertical_url": str(target.get("studio_vertical_url", "")),
             }
 
@@ -2845,6 +3403,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--course-structure-json", default="")
     p.add_argument("--targets-file", default="")
     p.add_argument("--report-file", default="")
+    p.add_argument("--operation-file", default="", help="shared batch-operation.json file owned by the batch caller")
+    p.add_argument("--gallery-key", default="", help="stable gallery_key identifying this Gallery in --operation-file")
 
     p.add_argument("--courses-base", default="")
     p.add_argument("--account", default="")
@@ -2864,27 +3424,68 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_AUTH_RETRY_DELAY_SECONDS,
         help=f"delay between auth-error retries in seconds (default: {DEFAULT_AUTH_RETRY_DELAY_SECONDS})",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if bool(args.operation_file) != bool(args.gallery_key):
+        p.error("--operation-file and --gallery-key must be supplied together")
+    return args
 
 
 def main() -> int:
-    args = parse_args()
-    if args.dry_run:
-        args.execute = False
-    if args.targets_file:
-        out = run_batch_publish(args)
-    elif args.course_structure_json:
-        if not args.manifest and not args.cleanup_only:
-            raise SystemExit("--manifest is required when --course-structure-json is set")
-        if not args.studio_url:
-            raise SystemExit("--studio-url is required when --course-structure-json is set")
-        out = run_in_place_publish(args)
-    else:
-        if not args.manifest:
-            raise SystemExit("--manifest is required unless --targets-file is used")
-        if not args.studio_url:
-            raise SystemExit("--studio-url is required unless --targets-file is used")
-        out = run_single_publish(args)
+    args = None
+    try:
+        args = parse_args()
+        if args.dry_run:
+            args.execute = False
+        if args.targets_file:
+            out = run_batch_publish(args)
+        elif args.course_structure_json:
+            if not args.manifest and not args.cleanup_only:
+                raise SystemExit("--manifest is required when --course-structure-json is set")
+            if not args.studio_url:
+                raise SystemExit("--studio-url is required when --course-structure-json is set")
+            out = run_in_place_publish(args)
+        else:
+            if not args.manifest:
+                raise SystemExit("--manifest is required unless --targets-file is used")
+            if not args.studio_url:
+                raise SystemExit("--studio-url is required unless --targets-file is used")
+            out = run_single_publish(args)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        failure: dict[str, Any] = {
+            "status": "failed",
+            "failed_step": safe_step_name(getattr(exc, "step_name", "publish")),
+            "error_summary": safe_error_summary(exc),
+        }
+        if isinstance(exc, TemplateCallError):
+            failure["http_status"] = exc.status_code
+        diagnostics = getattr(exc, "safe_diagnostics", None)
+        if isinstance(diagnostics, dict):
+            for key in ("completed_stage", "asset_ids", "steps", "failed_page_image"):
+                if key in diagnostics:
+                    failure[key] = diagnostics[key]
+        if args and args.operation_file and args.manifest and args.studio_url:
+            try:
+                vertical_id = args.vertical_block_id or parse_vertical_block_id(args.studio_url)
+                if vertical_id:
+                    checkpoint = PublishCheckpoint.load(
+                        args.operation_file,
+                        args.gallery_key,
+                        manifest_path=Path(args.manifest).expanduser().resolve(),
+                        vertical_block_id=vertical_id,
+                    )
+                    failure["completed_stage"] = checkpoint.state["completed_stage"]
+                    failure["asset_ids"] = list(checkpoint.state["asset_ids"])
+                    failure["steps"] = list(checkpoint.state["steps"])
+                    if checkpoint.gallery_locator:
+                        failure["gallery_locator"] = checkpoint.gallery_locator
+                    if checkpoint.state.get("failed_page_image"):
+                        failure["failed_page_image"] = checkpoint.state["failed_page_image"]
+            except Exception:
+                pass
+        print(json.dumps(failure, ensure_ascii=False, indent=2))
+        return 1
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
