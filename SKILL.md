@@ -179,6 +179,27 @@ python scripts/publish_imagegallery_block.py \
 
 每个 vertical 的结果会包含可点击的目标 vertical URL、旧 HTML 摘要 block 链接与组件名（如已定位）、新建或复用的 gallery URL、摘要清理状态、已完成和失败步骤，以及失败原因或人工跟进说明。
 
+## 单 Gallery 发布检查点
+
+批量调用方可在真实单 Gallery 发布时显式传入 `--operation-file` 和 `--gallery-key`。调用方先创建 operation 文件；发布器只更新它，不创建第二份报告。
+
+```bash
+python scripts/publish_imagegallery_block.py \
+  --studio-url "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --manifest "/path/to/imagesgallery/imagesgallery.json" \
+  --execute \
+  --operation-file "/path/to/batch-operation.json" \
+  --gallery-key "stable-gallery-key"
+```
+
+operation 文件包含 `galleries[]`。发布器要求恰有一个 `gallery_key` 与参数相同的条目，并校验其中的 `manifest` 和 `vertical_locator`（如果提供）；未传这两个参数时，单 Gallery 命令保持原有行为，不写 operation 文件。发布器保留条目中的其他调用方字段，并原子更新 `gallery_locator` 和 `publish`：
+
+- `status`、`completed_stage`：状态为 `in_progress`、`failed` 或 `completed`；阶段依次为 `block_created`、`images_uploaded`、`images_ordered`、`audio_prepared`、`audio_uploaded`、`audio_registered`、`audio_binding_saved`、`audio_bound`、`saved`。
+- `images`、`asset_ids`：已确认的页码、图片文件名和 Studio asset ID。
+- `steps`、`active_step`、`failed_step`、`error_summary`：安全的步骤状态、HTTP 状态和脱敏错误摘要。
+
+每个远程步骤开始前和确认完成后都会原子更新检查点。图片上传没有返回可用 ID 时，发布器停止后续上传和排序，只对 `get_files` 做一次恢复读取；仅当文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时才继续。状态不完整或有歧义时，保留现场并停止，不盲目重传。恢复时若图片与排序已确认，发布器从音频阶段继续。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
+
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
 

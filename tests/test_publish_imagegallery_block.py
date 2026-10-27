@@ -3,8 +3,11 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout, redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +51,138 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             encoding="utf-8",
         )
         return manifest_path
+
+    def _write_multi_page_manifest_bundle(self, root: Path, page_count: int = 2) -> Path:
+        items = []
+        for page in range(1, page_count + 1):
+            image_path = root / f"page-{page:03d}.png"
+            image_path.write_bytes(f"image-{page}".encode())
+            items.append(
+                {
+                    "page": page,
+                    "image": image_path.name,
+                    "subtitle": f"第{page}页",
+                    "start": (page - 1) * 1000,
+                    "end": page * 1000,
+                }
+            )
+        audio_path = root / "full_speech.mp3"
+        audio_path.write_bytes(b"fake-audio")
+        manifest_path = root / "imagesgallery.json"
+        manifest_path.write_text(
+            json.dumps({"audio": {"full_audio": str(audio_path)}, "items": items}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return manifest_path
+
+    def _write_operation_file(self, path: Path, manifest_path: Path, *, gallery_key: str = "gallery-1") -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "operation_id": "operation-1",
+                    "galleries": [
+                        {
+                            "gallery_key": gallery_key,
+                            "manifest": str(manifest_path),
+                            "vertical_locator": "block-v1:ORG+COURSE+RUN+type@vertical+block@vertical123",
+                            "gallery_locator": "",
+                            "operator_note": "preserve this field",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run_publisher_cli(self, manifest_path: Path, operation_path: Path, fake_session, *, gallery_key: str = "gallery-1") -> tuple[int, str, str]:
+        args = [
+            "publish_imagegallery_block.py",
+            "--studio-url",
+            "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@vertical123",
+            "--manifest",
+            str(manifest_path),
+            "--execute",
+            "--cookie",
+            "sessionid=do-not-persist; csrftoken=csrf-do-not-persist",
+            "--skip-oss-multipart",
+            "--operation-file",
+            str(operation_path),
+            "--gallery-key",
+            gallery_key,
+            "--auth-retry-delay-seconds",
+            "0",
+        ]
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch("sys.argv", args), patch.object(module.requests, "Session", return_value=fake_session), patch.dict(
+            "os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False
+        ):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = module.main()
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    class _FakeResponse:
+        def __init__(self, payload: object, status_code: int = 200):
+            self.status_code = status_code
+            self.headers = {"content-type": "application/json"}
+            self.text = json.dumps(payload)
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _FakeCookies:
+        def set(self, *_args, **_kwargs):
+            return None
+
+    class _FakeStudioSession:
+        def __init__(self, *, missing_upload_id: bool = False, incomplete_files: bool = False, fail_audio_prepare_once: bool = False):
+            self.cookies = PublishImageGalleryBlockTests._FakeCookies()
+            self.missing_upload_id = missing_upload_id
+            self.incomplete_files = incomplete_files
+            self.fail_audio_prepare_once = fail_audio_prepare_once
+            self.audio_prepare_count = 0
+            self.calls: list[tuple[str, str]] = []
+
+        def request(self, *, method: str, url: str, **_kwargs):
+            path = urlparse(url).path
+            self.calls.append((method, path))
+            if path == "/xblock/":
+                return PublishImageGalleryBlockTests._FakeResponse(
+                    {"locator": "block-v1:ORG+COURSE+RUN+type@imagesgallery+block@gallery123"}
+                )
+            if path.endswith("/handler/file_upload"):
+                if self.missing_upload_id:
+                    return PublishImageGalleryBlockTests._FakeResponse(
+                        {
+                            "message": "stored",
+                            "Credentials": {"AccessKeyId": "sts-secret-access-key", "SessionToken": "sts-secret-token"},
+                            "Cookie": "cookie-secret",
+                            "Authorization": "Bearer authorization-secret",
+                        }
+                    )
+                page_index = sum(call_path.endswith("/handler/file_upload") for _verb, call_path in self.calls)
+                return PublishImageGalleryBlockTests._FakeResponse({"id": f"asset-{page_index:03d}"})
+            if path.endswith("/handler/get_files"):
+                files = [{"id": "asset-001", "display_name": "page-001.png"}]
+                if not self.incomplete_files:
+                    files.append({"id": "asset-002", "display_name": "page-002.png"})
+                return PublishImageGalleryBlockTests._FakeResponse({"files": files, "total_count": len(files)})
+            if path.endswith("/handler/change_files_order"):
+                return PublishImageGalleryBlockTests._FakeResponse({"ok": True})
+            if path.endswith("/handler/get_upload_info"):
+                self.audio_prepare_count += 1
+                if self.fail_audio_prepare_once and self.audio_prepare_count == 1:
+                    return PublishImageGalleryBlockTests._FakeResponse(
+                        {"Credentials": {"AccessKeyId": "sts-secret-access-key"}, "message": "missing key"}
+                    )
+                return PublishImageGalleryBlockTests._FakeResponse(
+                    {
+                        "file_key": "12345678-1234-1234-1234-123456789abc",
+                        "Credentials": {"AccessKeyId": "sts-secret-access-key", "SessionToken": "sts-secret-token"},
+                    }
+                )
+            return PublishImageGalleryBlockTests._FakeResponse({"ok": True, "Authorization": "Bearer raw-secret"})
 
     def _in_place_args(self, manifest_path: Path, course_path: Path, *, execute: bool = False, cleanup_only: bool = False, section_list_json: str = "") -> argparse.Namespace:
         vertical_id = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
@@ -951,6 +1086,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                     ctx["block_locator"] = created_locator
                 if name == "delete_block" and locator == summary["block_location"]:
                     raise module.TemplateCallError(name, 500, {"detail": "delete failed"})
+                if name.startswith("upload_image"):
+                    return {"step": name, "status": "ok", "asset_id": "asset-001"}
+                if name == "upload_audio_prepare":
+                    ctx["file_key"] = "12345678-1234-1234-1234-123456789abc"
                 return {"step": name, "status": "ok", "url": "fake://" + name}
 
             with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
@@ -1235,6 +1374,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 if name == "publish_vertical" and not first_publish_failed:
                     first_publish_failed = True
                     raise module.TemplateCallError(name, 500, {"detail": "publish failed"})
+                if name.startswith("upload_image"):
+                    return {"step": name, "status": "ok", "asset_id": "asset-001"}
+                if name == "upload_audio_prepare":
+                    ctx["file_key"] = "12345678-1234-1234-1234-123456789abc"
                 return {"step": name, "status": "ok"}
 
             with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
@@ -1345,6 +1488,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         ctx["block_locator"] = created_locator
                     if name == "delete_block" and ctx.get("delete_block_locator") == summary["block_location"]:
                         raise module.TemplateCallError(name, 500, {"detail": "summary cleanup failed"})
+                    if name.startswith("upload_image"):
+                        return {"step": name, "status": "ok", "asset_id": "asset-001"}
+                    if name == "upload_audio_prepare":
+                        ctx["file_key"] = "12345678-1234-1234-1234-123456789abc"
                     return {"step": name, "status": "ok"}
 
                 with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
@@ -1735,8 +1882,148 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             30,
         )
 
-        self.assertEqual("Expecting value", record["response_parse_warning"][:15])
-        self.assertEqual("not-json", record["response"]["text"])
+        self.assertEqual("Studio returned invalid JSON", record["response_parse_warning"])
+        self.assertNotIn("response", record)
+
+    def test_cli_reconciles_missing_upload_ids_by_unique_complete_filename_order_and_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_multi_page_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            fake = self._FakeStudioSession(missing_upload_id=True)
+
+            exit_code, stdout, stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls), stdout)
+            self.assertEqual(1, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(1, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("preserve this field", gallery["operator_note"])
+            self.assertEqual("block-v1:ORG+COURSE+RUN+type@imagesgallery+block@gallery123", gallery["gallery_locator"])
+            self.assertEqual(["asset-001", "asset-002"], gallery["publish"]["asset_ids"])
+            self.assertEqual("completed", gallery["publish"]["status"])
+            output = stdout + operation_path.read_text(encoding="utf-8")
+            for secret in ("sts-secret-access-key", "sts-secret-token", "cookie-secret", "authorization-secret", "do-not-persist"):
+                self.assertNotIn(secret, output)
+            self.assertNotIn('"response"', output)
+
+    def test_cli_stops_before_ordering_when_missing_id_reconciliation_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_multi_page_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            fake = self._FakeStudioSession(missing_upload_id=True, incomplete_files=True)
+
+            exit_code, stdout, stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls), stdout)
+            self.assertEqual(0, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(1, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            result = json.loads(stdout)
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("upload_image[1]", result["failed_step"])
+            self.assertNotIn("Credentials", stdout)
+            self.assertNotIn("message", stdout)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            publish = state["galleries"][0]["publish"]
+            self.assertEqual("block_created", publish["completed_stage"])
+            self.assertEqual("failed", publish["status"])
+            self.assertEqual([], publish["asset_ids"])
+            self.assertNotIn("response", json.dumps(state))
+
+            retry_exit, retry_stdout, retry_stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(1, retry_exit)
+            self.assertEqual("", retry_stderr)
+            self.assertIn("already attempted", retry_stdout)
+            self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in fake.calls))
+            self.assertEqual(1, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+
+    def test_cli_resumes_from_audio_stage_without_reuploading_confirmed_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            fake = self._FakeStudioSession(fail_audio_prepare_once=True)
+
+            first_exit, first_stdout, first_stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+            first_state = json.loads(operation_path.read_text(encoding="utf-8"))
+            first_publish = first_state["galleries"][0]["publish"]
+            self.assertEqual(1, first_exit, first_stdout + first_stderr)
+            self.assertEqual("", first_stderr)
+            self.assertEqual("images_ordered", first_publish["completed_stage"])
+            self.assertEqual("upload_audio_prepare", first_publish["failed_step"])
+            self.assertNotIn("sts-secret-access-key", first_stdout + json.dumps(first_state))
+
+            second_exit, second_stdout, second_stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(0, second_exit, second_stderr)
+            self.assertEqual("", second_stderr)
+            self.assertEqual(1, sum(path.endswith("/handler/file_upload") for _method, path in fake.calls))
+            self.assertEqual(1, sum(path.endswith("/handler/change_files_order") for _method, path in fake.calls))
+            self.assertEqual(2, sum(path.endswith("/handler/get_upload_info") for _method, path in fake.calls))
+            final_state = json.loads(operation_path.read_text(encoding="utf-8"))
+            publish = final_state["galleries"][0]["publish"]
+            self.assertEqual("completed", publish["status"])
+            self.assertEqual("saved", publish["completed_stage"])
+            self.assertEqual(["asset-001"], publish["asset_ids"])
+            self.assertNotIn("response", json.dumps(final_state))
+            self.assertNotIn("sts-secret-access-key", second_stdout + json.dumps(final_state))
+
+    def test_operation_file_requires_one_matching_gallery_key_before_studio_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            fake = self._FakeStudioSession()
+
+            args = [
+                "publish_imagegallery_block.py",
+                "--studio-url",
+                "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@vertical123",
+                "--manifest",
+                str(manifest_path),
+                "--execute",
+                "--operation-file",
+                str(operation_path),
+            ]
+            stdout = StringIO()
+            stderr = StringIO()
+            with patch("sys.argv", args), patch.object(module.requests, "Session", return_value=fake):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as exit_context:
+                        module.main()
+
+            self.assertEqual(2, exit_context.exception.code)
+            self.assertEqual([], fake.calls)
+            self.assertIn("--operation-file and --gallery-key must be supplied together", stderr.getvalue())
+
+    def test_operation_file_rejects_duplicate_gallery_keys_before_studio_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_path = self._write_manifest_bundle(root)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, manifest_path)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            state["galleries"].append(dict(state["galleries"][0]))
+            operation_path.write_text(json.dumps(state), encoding="utf-8")
+            fake = self._FakeStudioSession()
+
+            exit_code, stdout, stderr = self._run_publisher_cli(manifest_path, operation_path, fake)
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual("", stderr)
+            self.assertIn("exactly one matching gallery_key", stdout)
+            self.assertEqual([], fake.calls)
 
     def test_auth_related_failure_detection(self) -> None:
         self.assertTrue(module.is_auth_related_failure(401, {"detail": "Not Login yet"}))
@@ -1750,7 +2037,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         def flaky_call():
             attempts["count"] += 1
             if attempts["count"] < 3:
-                raise module.TemplateCallError("upload_audio_register", 401, {"detail": "Not Login yet"})
+                raise module.TemplateCallError("upload_audio_register", 401, {"detail": "Not Login yet", "token": "retry-secret"})
             return {"ok": True}
 
         def refresh_auth():
@@ -1768,6 +2055,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertEqual(2, refreshes["count"])
         self.assertEqual(2, len(retry_events))
         self.assertEqual("upload_audio_register", retry_events[0]["step"])
+        self.assertNotIn("retry-secret", json.dumps(retry_events))
 
     def test_call_with_auth_retry_does_not_retry_non_auth_failures(self) -> None:
         with self.assertRaises(module.TemplateCallError):
