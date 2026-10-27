@@ -11,7 +11,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 import publish_imagegallery_block as publisher
@@ -193,6 +193,15 @@ class StudioClient:
             headers["Referer"] = referer
         return headers
 
+    def _call_with_auth_retry(self, request_once: Callable[[], Any]) -> tuple[Any, list[dict[str, Any]]]:
+        result, retry_events = publisher.call_with_auth_retry(
+            request_once,
+            self.refresh_auth if self.can_refresh_auth else None,
+            max_retries=publisher.normalize_auth_retry_max_retries(self.args.auth_retry_max_retries),
+            delay_seconds=max(0.0, float(self.args.auth_retry_delay_seconds)),
+        )
+        return result, publisher.safe_auth_retry_events(retry_events)
+
     def request_json(
         self,
         step: str,
@@ -217,14 +226,8 @@ class StudioClient:
                 raise publisher.TemplateCallError(step, response.status_code, payload)
             return payload, response.status_code, parse_warning
 
-        result, retry_events = publisher.call_with_auth_retry(
-            request_once,
-            self.refresh_auth if self.can_refresh_auth else None,
-            max_retries=publisher.normalize_auth_retry_max_retries(self.args.auth_retry_max_retries),
-            delay_seconds=max(0.0, float(self.args.auth_retry_delay_seconds)),
-        )
+        result, safe_retries = self._call_with_auth_retry(request_once)
         payload, status, parse_warning = result
-        safe_retries = publisher.safe_auth_retry_events(retry_events)
         return payload, status, parse_warning, safe_retries
 
     def request_template(self, step: str, template: dict[str, Any], context: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -232,13 +235,8 @@ class StudioClient:
             context["csrftoken"] = self.csrftoken
             return publisher.call_template(self.session, step, template, context, True, self.args.timeout)
 
-        result, retries = publisher.call_with_auth_retry(
-            request_once,
-            self.refresh_auth if self.can_refresh_auth else None,
-            max_retries=publisher.normalize_auth_retry_max_retries(self.args.auth_retry_max_retries),
-            delay_seconds=max(0.0, float(self.args.auth_retry_delay_seconds)),
-        )
-        return publisher.safe_step_record(result), publisher.safe_auth_retry_events(retries)
+        result, safe_retries = self._call_with_auth_retry(request_once)
+        return publisher.safe_step_record(result), safe_retries
 
 
 def read_json_call(client: StudioClient, step: str, method: str, url: str, *, params=None, body=None, referer="") -> tuple[Any, dict[str, Any] | None]:
@@ -504,19 +502,27 @@ def repair_gallery(
     adapter: dict[str, Any],
     expected_gallery_locators: set[str],
     store,
+    attempt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     history = entry.setdefault("repair_history", [])
-    attempt: dict[str, Any] = {
-        "attempt": len(history) + 1,
-        "status": "running",
-        "started_at": utc_now(),
-        "trigger_validation": copy.deepcopy(entry.get("validation", {})),
-        "initial_publish": safe_publish_state(entry.get("publish")),
-        "steps": [],
-    }
-    prior_publish = safe_publish_state(entry.get("publish"))
-    history.append(attempt)
-    entry["repair_attempts"] = max(1, int(entry.get("repair_attempts", 0)) + 1)
+    if attempt is None:
+        prior_publish = safe_publish_state(entry.get("publish"))
+        attempt = {
+            "attempt": len(history) + 1,
+            "status": "running",
+            "started_at": utc_now(),
+            "trigger_validation": copy.deepcopy(entry.get("validation", {})),
+            "initial_publish": prior_publish,
+            "steps": [],
+        }
+        history.append(attempt)
+    else:
+        prior_publish = safe_publish_state(attempt.get("initial_publish"))
+        attempt["status"] = "running"
+        attempt["resumed_at"] = utc_now()
+        for key in ("finished_at", "failed_step", "error_summary", "http_status"):
+            attempt.pop(key, None)
+    entry["repair_attempts"] = max(1, int(entry.get("repair_attempts", 0)))
     store()
 
     locator = safe_locator(entry.get("gallery_locator"))
@@ -528,57 +534,100 @@ def repair_gallery(
         raise BatchValidationError("get_files_before_repair", "Gallery file listing was incomplete before repair")
     removal_asset_keys: list[str] = []
     candidate_asset_ids: list[str] = []
-    for item in files:
-        asset_id = str(item.get("id") or item.get("asset_key") or "").strip()
-        asset_key = str(item.get("asset_key") or item.get("id") or "").strip()
-        if not asset_id or not asset_key or asset_id in candidate_asset_ids or asset_key in removal_asset_keys:
-            raise BatchValidationError("get_files_before_repair", "Gallery returned duplicate or unidentified assets before repair")
-        candidate_asset_ids.append(asset_id)
-        removal_asset_keys.append(asset_key)
-    for asset_id in prior_publish.get("asset_ids", []):
-        if asset_id not in candidate_asset_ids:
+    saved_candidates = attempt.get("candidate_asset_ids")
+    if isinstance(saved_candidates, list) and all(isinstance(item, str) and item for item in saved_candidates):
+        candidate_asset_ids = list(dict.fromkeys(saved_candidates))
+    else:
+        for item in files:
+            asset_id = str(item.get("id") or item.get("asset_key") or "").strip()
+            asset_key = str(item.get("asset_key") or item.get("id") or "").strip()
+            if not asset_id or not asset_key or asset_id in candidate_asset_ids or asset_key in removal_asset_keys:
+                raise BatchValidationError("get_files_before_repair", "Gallery returned duplicate or unidentified assets before repair")
             candidate_asset_ids.append(asset_id)
-    for image in prior_publish.get("images", []):
-        asset_id = image.get("asset_id") if isinstance(image, dict) else ""
-        if isinstance(asset_id, str) and asset_id and asset_id not in candidate_asset_ids:
-            candidate_asset_ids.append(asset_id)
+            removal_asset_keys.append(asset_key)
+        for asset_id in prior_publish.get("asset_ids", []):
+            if asset_id not in candidate_asset_ids:
+                candidate_asset_ids.append(asset_id)
+        for image in prior_publish.get("images", []):
+            asset_id = image.get("asset_id") if isinstance(image, dict) else ""
+            if isinstance(asset_id, str) and asset_id and asset_id not in candidate_asset_ids:
+                candidate_asset_ids.append(asset_id)
+    saved_removal_keys = attempt.get("removal_asset_keys")
+    if isinstance(saved_removal_keys, list) and all(isinstance(item, str) and item for item in saved_removal_keys):
+        removal_asset_keys = list(dict.fromkeys(saved_removal_keys))
+    else:
+        candidate_set = set(candidate_asset_ids)
+        for item in files:
+            asset_id = str(item.get("id") or item.get("asset_key") or "").strip()
+            asset_key = str(item.get("asset_key") or item.get("id") or "").strip()
+            if asset_id in candidate_set and asset_key and asset_key not in removal_asset_keys:
+                removal_asset_keys.append(asset_key)
     attempt["candidate_asset_ids"] = candidate_asset_ids
+    attempt["removal_asset_keys"] = removal_asset_keys
+    store()
 
-    if removal_asset_keys:
-        attempt["steps"].append({"step": "remove_gallery_files", "status": "started", "asset_ids": candidate_asset_ids})
+    attempt_steps = attempt.setdefault("steps", [])
+    remove_step = next((step for step in attempt_steps if step.get("step") == "remove_gallery_files"), None)
+    if removal_asset_keys and (not remove_step or remove_step.get("status") != "completed"):
+        current_keys = {
+            str(item.get("asset_key") or item.get("id") or "").strip()
+            for item in files
+            if isinstance(item, dict)
+        }
+        pending_removals = [asset_key for asset_key in removal_asset_keys if asset_key in current_keys]
+        if not remove_step:
+            remove_step = {"step": "remove_gallery_files", "status": "started", "asset_ids": candidate_asset_ids}
+            attempt_steps.append(remove_step)
+        else:
+            remove_step.update({"status": "started", "asset_ids": candidate_asset_ids})
+            remove_step.pop("error_summary", None)
+            remove_step.pop("http_status", None)
         store()
-        try:
-            _payload, status, _warning, retries = client.request_json(
-                "remove_gallery_files",
-                "POST",
-                f"{client.studio_base}/xblock/{locator}/handler/remove_files",
-                body={"assets": removal_asset_keys},
-                referer=referer,
-            )
-            attempt["steps"][-1].update({"status": "completed", "http_status": status})
-            if retries:
-                attempt["steps"][-1]["auth_retry_attempts"] = len(retries)
-                attempt["steps"][-1]["auth_retry_events"] = retries
+        if not pending_removals:
+            remove_step.update({"status": "completed", "verified_absent": True})
             store()
-        except Exception as exc:
-            attempt["steps"][-1].update({"status": "failed", "error_summary": safe_error(exc, "remove_gallery_files")})
-            status = safe_http_status(exc)
-            if status is not None:
-                attempt["steps"][-1]["http_status"] = status
-            store()
-            raise BatchValidationError("remove_gallery_files", attempt["steps"][-1]["error_summary"], http_status=status) from None
+        else:
+            try:
+                _payload, status, _warning, retries = client.request_json(
+                    "remove_gallery_files",
+                    "POST",
+                    f"{client.studio_base}/xblock/{locator}/handler/remove_files",
+                    body={"assets": pending_removals},
+                    referer=referer,
+                )
+                remove_step.update({"status": "completed", "http_status": status})
+                if retries:
+                    remove_step["auth_retry_attempts"] = len(retries)
+                    remove_step["auth_retry_events"] = retries
+                store()
+            except Exception as exc:
+                remove_step.update({"status": "failed", "error_summary": safe_error(exc, "remove_gallery_files")})
+                status = safe_http_status(exc)
+                if status is not None:
+                    remove_step["http_status"] = status
+                store()
+                raise BatchValidationError("remove_gallery_files", remove_step["error_summary"], http_status=status) from None
 
-    after_remove, after_total_count, verify_diagnostic = get_files(client, locator)
-    if after_remove is None:
-        raise BatchValidationError("verify_removed_gallery_files", (verify_diagnostic or {}).get("error_summary", "Gallery file removal could not be verified"), http_status=(verify_diagnostic or {}).get("http_status"))
-    if len(after_remove) != after_total_count:
-        raise BatchValidationError("verify_removed_gallery_files", "Gallery file listing was incomplete after removal")
-    after_ids = {str(item.get("id") or item.get("asset_key") or "") for item in after_remove}
-    if any(asset_id in after_ids for asset_id in candidate_asset_ids):
-        raise BatchValidationError("verify_removed_gallery_files", "Gallery still references an image scheduled for replacement")
+    if candidate_asset_ids:
+        after_remove, after_total_count, verify_diagnostic = get_files(client, locator)
+        if after_remove is None:
+            raise BatchValidationError("verify_removed_gallery_files", (verify_diagnostic or {}).get("error_summary", "Gallery file removal could not be verified"), http_status=(verify_diagnostic or {}).get("http_status"))
+        if len(after_remove) != after_total_count:
+            raise BatchValidationError("verify_removed_gallery_files", "Gallery file listing was incomplete after removal")
+        after_ids = {str(item.get("id") or item.get("asset_key") or "") for item in after_remove}
+        if any(asset_id in after_ids for asset_id in candidate_asset_ids):
+            raise BatchValidationError("verify_removed_gallery_files", "Gallery still references an image scheduled for replacement")
 
-    cleanup: dict[str, Any] = {"status": "complete", "steps": [], "deleted_asset_ids": [], "retained_asset_ids": [], "skipped_asset_ids": []}
-    attempt["asset_cleanup"] = cleanup
+    cleanup = attempt.get("asset_cleanup")
+    if not isinstance(cleanup, dict):
+        cleanup = {"status": "complete", "steps": [], "deleted_asset_ids": [], "retained_asset_ids": [], "skipped_asset_ids": []}
+        attempt["asset_cleanup"] = cleanup
+    cleanup.setdefault("steps", [])
+    cleanup.setdefault("deleted_asset_ids", [])
+    cleanup.setdefault("retained_asset_ids", [])
+    cleanup.setdefault("skipped_asset_ids", [])
+    cleanup["status"] = "complete"
+    cleanup.pop("error_summary", None)
     store()
     if candidate_asset_ids:
         references, _locators, reference_error = scan_course_gallery_references(
@@ -589,21 +638,40 @@ def repair_gallery(
         if references is None or assets is None:
             cleanup["status"] = "incomplete"
             cleanup["error_summary"] = (reference_error or asset_error or "Course asset/reference scan could not be verified")[:240]
-            cleanup["skipped_asset_ids"] = list(candidate_asset_ids)
-            cleanup["steps"].extend({"asset_id": asset_id, "status": "skipped", "reason": "incomplete_course_scan"} for asset_id in candidate_asset_ids)
+            for asset_id in candidate_asset_ids:
+                asset_step = next((step for step in cleanup["steps"] if step.get("asset_id") == asset_id), None)
+                if not asset_step:
+                    asset_step = {"asset_id": asset_id}
+                    cleanup["steps"].append(asset_step)
+                if asset_step.get("status") not in {"deleted", "retained", "not_found"}:
+                    asset_step.update({"status": "skipped", "reason": "incomplete_course_scan"})
+                    if asset_id not in cleanup["skipped_asset_ids"]:
+                        cleanup["skipped_asset_ids"].append(asset_id)
             store()
         else:
+            cleanup["skipped_asset_ids"] = []
             for asset_id in candidate_asset_ids:
-                asset_step: dict[str, Any] = {"asset_id": asset_id, "status": "pending"}
-                cleanup["steps"].append(asset_step)
+                asset_step = next((step for step in cleanup["steps"] if step.get("asset_id") == asset_id), None)
+                if not asset_step:
+                    asset_step = {"asset_id": asset_id, "status": "pending"}
+                    cleanup["steps"].append(asset_step)
+                if asset_step.get("status") in {"deleted", "retained", "not_found"}:
+                    continue
                 if asset_id not in assets:
-                    asset_step.update({"status": "not_found", "reason": "asset_not_in_complete_course_listing"})
+                    was_deleting = asset_step.get("status") == "started"
+                    asset_step.update({
+                        "status": "deleted" if was_deleting else "not_found",
+                        "reason": "delete_confirmed_by_asset_listing" if was_deleting else "asset_not_in_complete_course_listing",
+                    })
+                    if was_deleting and asset_id not in cleanup["deleted_asset_ids"]:
+                        cleanup["deleted_asset_ids"].append(asset_id)
                     store()
                     continue
                 referenced_by = sorted(set(references.get(asset_id, [])))
                 if referenced_by:
                     asset_step.update({"status": "retained", "reason": "currently_referenced", "referenced_by": referenced_by})
-                    cleanup["retained_asset_ids"].append(asset_id)
+                    if asset_id not in cleanup["retained_asset_ids"]:
+                        cleanup["retained_asset_ids"].append(asset_id)
                     store()
                     continue
 
@@ -614,13 +682,15 @@ def repair_gallery(
                 if fresh_references is None:
                     asset_step.update({"status": "skipped", "reason": "pre_delete_reference_scan_incomplete", "error_summary": fresh_error[:240]})
                     cleanup["status"] = "incomplete"
-                    cleanup["skipped_asset_ids"].append(asset_id)
+                    if asset_id not in cleanup["skipped_asset_ids"]:
+                        cleanup["skipped_asset_ids"].append(asset_id)
                     store()
                     continue
                 referenced_by = sorted(set(fresh_references.get(asset_id, [])))
                 if referenced_by:
                     asset_step.update({"status": "retained", "reason": "referenced_before_delete", "referenced_by": referenced_by})
-                    cleanup["retained_asset_ids"].append(asset_id)
+                    if asset_id not in cleanup["retained_asset_ids"]:
+                        cleanup["retained_asset_ids"].append(asset_id)
                     store()
                     continue
                 asset_step["status"] = "started"
@@ -637,7 +707,8 @@ def repair_gallery(
                     if retries:
                         asset_step["auth_retry_attempts"] = len(retries)
                         asset_step["auth_retry_events"] = retries
-                    cleanup["deleted_asset_ids"].append(asset_id)
+                    if asset_id not in cleanup["deleted_asset_ids"]:
+                        cleanup["deleted_asset_ids"].append(asset_id)
                 except Exception as exc:
                     asset_step.update({"status": "failed", "error_summary": safe_error(exc, "delete_course_asset")})
                     status = safe_http_status(exc)
@@ -646,19 +717,22 @@ def repair_gallery(
                     cleanup["status"] = "incomplete"
                 store()
 
-    entry["publish"] = {
-        "gallery_key": entry["gallery_key"],
-        "status": "in_progress",
-        "completed_stage": "block_created",
-        "active_step": "",
-        "failed_step": "",
-        "asset_ids": [],
-        "images": [],
-        "steps": [],
-        "images_started": False,
-        "reconciliation_count": 0,
-    }
     attempt["prior_asset_ids"] = list(prior_publish.get("asset_ids", []))
+    checkpoint = safe_publish_state(entry.get("publish"))
+    if not attempt.get("publish_started") and not attempt.get("publish") and checkpoint.get("status") == "completed" and checkpoint.get("completed_stage") == "saved":
+        entry["publish"] = {
+            "gallery_key": entry["gallery_key"],
+            "status": "in_progress",
+            "completed_stage": "block_created",
+            "active_step": "",
+            "failed_step": "",
+            "asset_ids": [],
+            "images": [],
+            "steps": [],
+            "images_started": False,
+            "reconciliation_count": 0,
+        }
+    attempt["publish_started"] = True
     store()
     publish_args = argparse.Namespace(
         studio_url=args.studio_url,
@@ -680,8 +754,12 @@ def repair_gallery(
         gallery_key=entry["gallery_key"],
     )
     try:
-        publish_result = publisher.run_single_publish(publish_args)
-        refresh_publish_checkpoint(entry, Path(args.operation_file).expanduser().resolve())
+        checkpoint = safe_publish_state(entry.get("publish"))
+        if checkpoint.get("status") == "completed" and checkpoint.get("completed_stage") == "saved":
+            publish_result = checkpoint
+        else:
+            publish_result = publisher.run_single_publish(publish_args)
+            refresh_publish_checkpoint(entry, Path(args.operation_file).expanduser().resolve())
         attempt["publish"] = {
             "status": "completed",
             "completed_stage": publish_result.get("completed_stage", "saved"),
@@ -700,28 +778,30 @@ def repair_gallery(
         return attempt
     store()
 
-    vertical_publish = {"step": "publish_vertical", "status": "started"}
-    attempt["vertical_publish"] = vertical_publish
-    store()
-    try:
-        context = {
-            "studio_base": client.studio_base,
-            "vertical_block_id": entry["vertical_locator"],
-            "block_url": publisher.build_container_block_url(client.studio_base, entry["vertical_locator"]),
-            "csrftoken": client.csrftoken,
-        }
-        record, retries = client.request_template("publish_vertical", adapter["publish_vertical"], context)
-        vertical_publish.update({"status": "completed", "http_status": record.get("http_status")})
-        if retries:
-            vertical_publish["auth_retry_attempts"] = len(retries)
-            vertical_publish["auth_retry_events"] = retries
-    except Exception as exc:
-        vertical_publish.update({"status": "failed", "error_summary": safe_error(exc, "publish_vertical")})
-        if safe_http_status(exc) is not None:
-            vertical_publish["http_status"] = safe_http_status(exc)
-    attempt["finished_at"] = utc_now()
-    attempt["status"] = "completed" if vertical_publish["status"] == "completed" else "failed"
-    store()
+    vertical_publish = attempt.get("vertical_publish")
+    if not isinstance(vertical_publish, dict) or vertical_publish.get("status") != "completed":
+        vertical_publish = {"step": "publish_vertical", "status": "started"}
+        attempt["vertical_publish"] = vertical_publish
+        store()
+        try:
+            context = {
+                "studio_base": client.studio_base,
+                "vertical_block_id": entry["vertical_locator"],
+                "block_url": publisher.build_container_block_url(client.studio_base, entry["vertical_locator"]),
+                "csrftoken": client.csrftoken,
+            }
+            record, retries = client.request_template("publish_vertical", adapter["publish_vertical"], context)
+            vertical_publish.update({"status": "completed", "http_status": record.get("http_status")})
+            if retries:
+                vertical_publish["auth_retry_attempts"] = len(retries)
+                vertical_publish["auth_retry_events"] = retries
+        except Exception as exc:
+            vertical_publish.update({"status": "failed", "error_summary": safe_error(exc, "publish_vertical")})
+            if safe_http_status(exc) is not None:
+                vertical_publish["http_status"] = safe_http_status(exc)
+        attempt["finished_at"] = utc_now()
+        attempt["status"] = "completed" if vertical_publish["status"] == "completed" else "failed"
+        store()
 
     final_validation = validate_gallery(client, entry, manifest)
     entry["validation"] = final_validation
@@ -736,6 +816,20 @@ def repair_gallery(
         attempt["status"] = "mismatch"
     attempt["finished_at"] = utc_now()
     store()
+    return attempt
+
+
+def resumable_repair_attempt(entry: dict[str, Any]) -> dict[str, Any] | None:
+    if entry.get("repair_attempts") != 1:
+        return None
+    history = entry.get("repair_history")
+    if not isinstance(history, list) or len(history) != 1:
+        return None
+    attempt = history[0]
+    if not isinstance(attempt, dict) or attempt.get("attempt") != 1:
+        return None
+    if attempt.get("status") not in {"running", "failed"} or "final_validation" in attempt:
+        return None
     return attempt
 
 
@@ -888,15 +982,18 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
 
         entry["validation"] = validate_gallery(client, entry, manifest)
         store()
-        if entry["validation"]["status"] != "mismatch":
-            continue
         attempts = entry.get("repair_attempts", 0)
-        if attempts >= 1:
+        resume_attempt = resumable_repair_attempt(entry) if attempts >= 1 else None
+        if resume_attempt is not None and entry["validation"]["status"] == "unverified":
+            continue
+        if resume_attempt is None and entry["validation"]["status"] != "mismatch":
+            continue
+        if attempts >= 1 and resume_attempt is None:
             entry["validation"]["repair_limit_reached"] = True
             store()
             continue
         try:
-            repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store)
+            repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store, attempt=resume_attempt)
         except Exception as exc:
             history = entry.setdefault("repair_history", [])
             attempt = history[-1] if history and isinstance(history[-1], dict) else {"attempt": 1, "steps": []}

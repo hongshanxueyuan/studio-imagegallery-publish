@@ -1831,19 +1831,20 @@ def manifest_image_name(item: dict[str, Any]) -> str:
     return Path(str(item.get("image", "")).replace("\\", "/")).name
 
 
-def reconcile_gallery_images(
+def request_gallery_files(
     session: requests.Session,
     *,
     studio_base: str,
     gallery_locator: str,
     block_url: str,
     context: dict[str, Any],
-    manifest_items: list[dict[str, Any]],
     timeout: int,
+    step: str,
+    invalid_json_summary: str,
     refresh_auth_fn: Any = None,
     auth_retry_max_retries: int = DEFAULT_AUTH_RETRY_MAX_RETRIES,
     auth_retry_delay_seconds: float = DEFAULT_AUTH_RETRY_DELAY_SECONDS,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[Any, int, list[dict[str, Any]]]:
     url = f"{studio_base.rstrip('/')}/preview/xblock/{gallery_locator}/handler/get_files"
 
     def get_files() -> tuple[Any, int]:
@@ -1862,10 +1863,10 @@ def reconcile_gallery_images(
         )
         payload, parse_warning = decode_response_payload(response)
         if response.status_code >= 400:
-            raise TemplateCallError("get_files_reconciliation", response.status_code, payload)
+            raise TemplateCallError(step, response.status_code, payload)
         if parse_warning:
-            error = PublishFailure("get_files_reconciliation", "Studio returned invalid get_files JSON", payload=payload)
-            error.safe_summary = "Studio get_files response could not be read"
+            error = PublishFailure(step, "Studio returned invalid get_files JSON", payload=payload)
+            error.safe_summary = invalid_json_summary
             raise error
         return payload, int(response.status_code)
 
@@ -1874,6 +1875,35 @@ def reconcile_gallery_images(
         refresh_auth_fn,
         max_retries=auth_retry_max_retries,
         delay_seconds=auth_retry_delay_seconds,
+    )
+    return payload, status_code, retry_events
+
+
+def reconcile_gallery_images(
+    session: requests.Session,
+    *,
+    studio_base: str,
+    gallery_locator: str,
+    block_url: str,
+    context: dict[str, Any],
+    manifest_items: list[dict[str, Any]],
+    timeout: int,
+    refresh_auth_fn: Any = None,
+    auth_retry_max_retries: int = DEFAULT_AUTH_RETRY_MAX_RETRIES,
+    auth_retry_delay_seconds: float = DEFAULT_AUTH_RETRY_DELAY_SECONDS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    payload, status_code, retry_events = request_gallery_files(
+        session,
+        studio_base=studio_base,
+        gallery_locator=gallery_locator,
+        block_url=block_url,
+        context=context,
+        timeout=timeout,
+        step="get_files_reconciliation",
+        invalid_json_summary="Studio get_files response could not be read",
+        refresh_auth_fn=refresh_auth_fn,
+        auth_retry_max_retries=auth_retry_max_retries,
+        auth_retry_delay_seconds=auth_retry_delay_seconds,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
         error = PublishFailure("get_files_reconciliation", "Studio returned an invalid get_files shape", payload=payload)
@@ -1934,36 +1964,18 @@ def read_gallery_asset_order(
     auth_retry_max_retries: int = DEFAULT_AUTH_RETRY_MAX_RETRIES,
     auth_retry_delay_seconds: float = DEFAULT_AUTH_RETRY_DELAY_SECONDS,
 ) -> tuple[list[str], dict[str, Any]]:
-    url = f"{studio_base.rstrip('/')}/preview/xblock/{gallery_locator}/handler/get_files"
-
-    def get_files() -> tuple[Any, int]:
-        response = session.request(
-            method="POST",
-            url=url,
-            headers={
-                "Accept": "application/json, text/plain, */*",
-                "Content-Type": "application/json",
-                "X-CSRFToken": str(context.get("csrftoken", "")),
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": block_url,
-            },
-            json={"current_page": 0, "page_size": 100},
-            timeout=timeout,
-        )
-        payload, parse_warning = decode_response_payload(response)
-        if response.status_code >= 400:
-            raise TemplateCallError("change_files_order_reconciliation", response.status_code, payload)
-        if parse_warning:
-            error = PublishFailure("change_files_order_reconciliation", "Studio returned invalid get_files JSON", payload=payload)
-            error.safe_summary = "Studio get_files response could not be read before retrying image ordering"
-            raise error
-        return payload, int(response.status_code)
-
-    (payload, status_code), retry_events = call_with_auth_retry(
-        get_files,
-        refresh_auth_fn,
-        max_retries=auth_retry_max_retries,
-        delay_seconds=auth_retry_delay_seconds,
+    payload, status_code, retry_events = request_gallery_files(
+        session,
+        studio_base=studio_base,
+        gallery_locator=gallery_locator,
+        block_url=block_url,
+        context=context,
+        timeout=timeout,
+        step="change_files_order_reconciliation",
+        invalid_json_summary="Studio get_files response could not be read before retrying image ordering",
+        refresh_auth_fn=refresh_auth_fn,
+        auth_retry_max_retries=auth_retry_max_retries,
+        auth_retry_delay_seconds=auth_retry_delay_seconds,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
         error = PublishFailure("change_files_order_reconciliation", "Studio returned an invalid get_files shape", payload=payload)
