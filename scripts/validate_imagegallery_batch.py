@@ -76,17 +76,11 @@ def safe_publish_state(value: Any) -> dict[str, Any]:
         "active_step": publisher.safe_step_name(raw.get("active_step")) if raw.get("active_step") else "",
         "failed_step": publisher.safe_step_name(raw.get("failed_step")) if raw.get("failed_step") else "",
         "asset_ids": [item for item in raw.get("asset_ids", []) if isinstance(item, str) and item] if isinstance(raw.get("asset_ids"), list) else [],
-        "images": [],
+        "images": publisher.safe_image_checkpoint_records(raw.get("images")),
         "steps": [],
         "images_started": bool(raw.get("images_started", False)),
         "reconciliation_count": raw.get("reconciliation_count", 0) if isinstance(raw.get("reconciliation_count", 0), int) else 0,
     }
-    for item in raw.get("images", []) if isinstance(raw.get("images"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        page, image, asset_id = item.get("page"), item.get("image"), item.get("asset_id")
-        if isinstance(page, int) and isinstance(image, str) and isinstance(asset_id, str) and asset_id:
-            state["images"].append({"page": page, "image": Path(image.replace("\\", "/")).name, "asset_id": asset_id})
     state["steps"] = [
         publisher.safe_step_record(item)
         for item in raw.get("steps", [])
@@ -230,11 +224,7 @@ class StudioClient:
             delay_seconds=max(0.0, float(self.args.auth_retry_delay_seconds)),
         )
         payload, status, parse_warning = result
-        safe_retries = [
-            {"retry_index": event.get("retry_index"), "reason": "auth_error", "step": publisher.safe_step_name(event.get("step")), "http_status": event.get("status_code")}
-            for event in retry_events
-            if isinstance(event, dict)
-        ]
+        safe_retries = publisher.safe_auth_retry_events(retry_events)
         return payload, status, parse_warning, safe_retries
 
     def request_template(self, step: str, template: dict[str, Any], context: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -248,11 +238,7 @@ class StudioClient:
             max_retries=publisher.normalize_auth_retry_max_retries(self.args.auth_retry_max_retries),
             delay_seconds=max(0.0, float(self.args.auth_retry_delay_seconds)),
         )
-        return publisher.safe_step_record(result), [
-            {"retry_index": event.get("retry_index"), "reason": "auth_error", "step": publisher.safe_step_name(event.get("step")), "http_status": event.get("status_code")}
-            for event in retries
-            if isinstance(event, dict)
-        ]
+        return publisher.safe_step_record(result), publisher.safe_auth_retry_events(retries)
 
 
 def read_json_call(client: StudioClient, step: str, method: str, url: str, *, params=None, body=None, referer="") -> tuple[Any, dict[str, Any] | None]:

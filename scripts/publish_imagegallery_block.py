@@ -1488,6 +1488,36 @@ def safe_error_summary(exc: Exception, *, step_name: str = "") -> str:
     return f"Publishing failed during {step}"
 
 
+def safe_auth_retry_events(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        {
+            "retry_index": event.get("retry_index"),
+            "reason": "auth_error",
+            "step": safe_step_name(event.get("step")),
+            "http_status": event.get("status_code", event.get("http_status")),
+        }
+        for event in value
+        if isinstance(event, dict)
+    ]
+
+
+def safe_image_checkpoint_records(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    images = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        page = item.get("page")
+        image = item.get("image")
+        asset_id = item.get("asset_id")
+        if isinstance(page, int) and isinstance(image, str) and isinstance(asset_id, str) and asset_id:
+            images.append({"page": page, "image": Path(image.replace("\\", "/")).name, "asset_id": asset_id})
+    return images
+
+
 def safe_step_record(record: dict[str, Any], *, page_image: str = "") -> dict[str, Any]:
     safe: dict[str, Any] = {
         "step": safe_step_name(record.get("step")),
@@ -1507,16 +1537,7 @@ def safe_step_record(record: dict[str, Any], *, page_image: str = "") -> dict[st
         safe["auth_retry_attempts"] = retry_attempts
     retry_events = record.get("auth_retry_events")
     if isinstance(retry_events, list):
-        safe["auth_retry_events"] = [
-            {
-                "retry_index": event.get("retry_index"),
-                "reason": "auth_error",
-                "step": safe_step_name(event.get("step")),
-                "http_status": event.get("status_code"),
-            }
-            for event in retry_events
-            if isinstance(event, dict)
-        ]
+        safe["auth_retry_events"] = safe_auth_retry_events(retry_events)
     return safe
 
 
@@ -1658,7 +1679,7 @@ class PublishCheckpoint:
             "active_step": safe_step_name(previous.get("active_step")) if previous.get("active_step") else "",
             "failed_step": safe_step_name(previous.get("failed_step")) if previous.get("failed_step") else "",
             "asset_ids": [str(value) for value in previous.get("asset_ids", []) if isinstance(value, str) and value],
-            "images": self._safe_images(previous.get("images")),
+            "images": safe_image_checkpoint_records(previous.get("images")),
             "steps": self._safe_steps(previous.get("steps")),
             "images_started": bool(previous.get("images_started", False)),
             "reconciliation_count": reconciliation_count,
@@ -1674,21 +1695,6 @@ class PublishCheckpoint:
             self.state["audio_document_id"] = audio_document_id
         self.gallery_locator = str(self.gallery.get("gallery_locator") or previous.get("gallery_locator") or "").strip()
         self.resume = bool(self.state["completed_stage"] or self.state["active_step"] or self.state["status"] in {"in_progress", "failed"})
-
-    @staticmethod
-    def _safe_images(value: Any) -> list[dict[str, Any]]:
-        if not isinstance(value, list):
-            return []
-        images = []
-        for item in value:
-            if not isinstance(item, dict):
-                continue
-            page = item.get("page")
-            image = item.get("image")
-            asset_id = item.get("asset_id")
-            if isinstance(page, int) and isinstance(image, str) and isinstance(asset_id, str) and asset_id:
-                images.append({"page": page, "image": Path(image.replace("\\", "/")).name, "asset_id": asset_id})
-        return images
 
     @staticmethod
     def _safe_steps(value: Any) -> list[dict[str, Any]]:
@@ -1707,16 +1713,7 @@ class PublishCheckpoint:
                     record[key] = item[key]
             retry_events = item.get("auth_retry_events")
             if isinstance(retry_events, list):
-                record["auth_retry_events"] = [
-                    {
-                        "retry_index": event.get("retry_index"),
-                        "reason": "auth_error",
-                        "step": safe_step_name(event.get("step")),
-                        "http_status": event.get("http_status"),
-                    }
-                    for event in retry_events
-                    if isinstance(event, dict)
-                ]
+                record["auth_retry_events"] = safe_auth_retry_events(retry_events)
             steps.append(record)
         return steps
 
@@ -1781,7 +1778,7 @@ class PublishCheckpoint:
         if safe.get("block_locator"):
             self.gallery_locator = safe["block_locator"]
         if images is not None:
-            self.state["images"] = self._safe_images(images)
+            self.state["images"] = safe_image_checkpoint_records(images)
             self.state["asset_ids"] = [item["asset_id"] for item in self.state["images"]]
         if audio_document_id and re.fullmatch(r"[0-9a-fA-F-]{36}", audio_document_id):
             self.state["audio_document_id"] = audio_document_id
@@ -1917,6 +1914,86 @@ def reconcile_gallery_images(
         matches.append({"page": int(manifest_item["page"]), "image": expected_name, "asset_id": asset_id})
     return matches, {
         "step": "get_files_reconciliation",
+        "status": "ok",
+        "response_status": status_code,
+        "auth_retry_attempts": len(retry_events),
+        "auth_retry_events": retry_events,
+    }
+
+
+def read_gallery_asset_order(
+    session: requests.Session,
+    *,
+    studio_base: str,
+    gallery_locator: str,
+    block_url: str,
+    context: dict[str, Any],
+    expected_count: int,
+    timeout: int,
+    refresh_auth_fn: Any = None,
+    auth_retry_max_retries: int = DEFAULT_AUTH_RETRY_MAX_RETRIES,
+    auth_retry_delay_seconds: float = DEFAULT_AUTH_RETRY_DELAY_SECONDS,
+) -> tuple[list[str], dict[str, Any]]:
+    url = f"{studio_base.rstrip('/')}/preview/xblock/{gallery_locator}/handler/get_files"
+
+    def get_files() -> tuple[Any, int]:
+        response = session.request(
+            method="POST",
+            url=url,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "X-CSRFToken": str(context.get("csrftoken", "")),
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": block_url,
+            },
+            json={"current_page": 0, "page_size": 100},
+            timeout=timeout,
+        )
+        payload, parse_warning = decode_response_payload(response)
+        if response.status_code >= 400:
+            raise TemplateCallError("change_files_order_reconciliation", response.status_code, payload)
+        if parse_warning:
+            error = PublishFailure("change_files_order_reconciliation", "Studio returned invalid get_files JSON", payload=payload)
+            error.safe_summary = "Studio get_files response could not be read before retrying image ordering"
+            raise error
+        return payload, int(response.status_code)
+
+    (payload, status_code), retry_events = call_with_auth_retry(
+        get_files,
+        refresh_auth_fn,
+        max_retries=auth_retry_max_retries,
+        delay_seconds=auth_retry_delay_seconds,
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        error = PublishFailure("change_files_order_reconciliation", "Studio returned an invalid get_files shape", payload=payload)
+        error.safe_summary = "Studio get_files response did not contain a valid files list before retrying image ordering"
+        raise error
+    files = payload["files"]
+    total_count = payload.get("total_count")
+    if (
+        not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or total_count != len(files)
+        or len(files) != expected_count
+    ):
+        error = PublishFailure("change_files_order_reconciliation", "Studio get_files count did not match saved images")
+        error.safe_summary = f"Studio get_files returned {len(files)} file records for {expected_count} saved images"
+        raise error
+
+    asset_ids: list[str] = []
+    seen_asset_ids: set[str] = set()
+    for file_record in files:
+        if not isinstance(file_record, dict):
+            raise PublishFailure("change_files_order_reconciliation", "Studio get_files contained an invalid file record")
+        asset_id = str(file_record.get("id") or file_record.get("asset_key") or "").strip()
+        if not asset_id or asset_id in seen_asset_ids:
+            raise PublishFailure("change_files_order_reconciliation", "Studio get_files contained duplicate or unidentified assets")
+        seen_asset_ids.add(asset_id)
+        asset_ids.append(asset_id)
+
+    return asset_ids, {
+        "step": "change_files_order_reconciliation",
         "status": "ok",
         "response_status": status_code,
         "auth_retry_attempts": len(retry_events),
@@ -2527,13 +2604,20 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
             saved.append({"page": int(item["page"]), "image": manifest_image_name(item), "asset_id": asset_id})
         return saved
 
+    interrupted_order = bool(
+        checkpoint
+        and (
+            checkpoint.state.get("active_step") == "change_files_order"
+            or checkpoint.state.get("failed_step") == "change_files_order"
+        )
+    )
     checkpoint_images = valid_saved_images(checkpoint.state.get("images")) if checkpoint else None
     image_started = bool(checkpoint and (checkpoint.state["images_started"] or checkpoint.state["images"]))
     images = checkpoint_images or []
     if checkpoint and image_started and checkpoint_images is None:
         images = run_reconciliation("resume_image_reconciliation")
         if checkpoint:
-            checkpoint.set_stage("images_uploaded")
+            checkpoint.set_stage("images_ordered" if interrupted_order else "images_uploaded")
     elif checkpoint and checkpoint_images and completed_rank() < stage_order["images_uploaded"]:
         checkpoint.set_stage("images_uploaded")
 
@@ -2582,8 +2666,51 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
     ctx["uploaded_asset_ids"] = [image["asset_id"] for image in images]
     if not checkpoint or completed_rank() < stage_order["images_ordered"]:
         if "change_files_order" in adapter:
-            order_step = start_and_call("change_files_order", adapter["change_files_order"])
-            accept_step(order_step, stage="images_ordered")
+            if interrupted_order and execute:
+                try:
+                    remote_asset_ids, reconciliation_step = read_gallery_asset_order(
+                        session,
+                        studio_base=studio_base,
+                        gallery_locator=str(ctx.get("block_locator", "")),
+                        block_url=canonical_block_url,
+                        context=ctx,
+                        expected_count=len(images),
+                        timeout=args.timeout,
+                        refresh_auth_fn=refresh_auth_session if can_refresh_auth else None,
+                        auth_retry_max_retries=normalize_auth_retry_max_retries(
+                            getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)
+                        ),
+                        auth_retry_delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
+                    )
+                    saved_asset_ids = [image["asset_id"] for image in images]
+                    if set(remote_asset_ids) != set(saved_asset_ids):
+                        error = PublishFailure(
+                            "change_files_order_reconciliation",
+                            "Studio get_files assets did not match the saved image IDs",
+                        )
+                        error.safe_summary = "Studio get_files did not confirm the saved Gallery images; image ordering was not retried"
+                        raise error
+                except Exception as exc:
+                    logs.append(
+                        {
+                            "step": "change_files_order_reconciliation",
+                            "status": "failed",
+                            "http_status": exc.status_code if isinstance(exc, TemplateCallError) else None,
+                        }
+                    )
+                    mark_failure(exc, "change_files_order")
+                    if isinstance(exc, Exception):
+                        exc.step_name = "change_files_order"
+                    raise
+
+                if remote_asset_ids == saved_asset_ids:
+                    accept_step(reconciliation_step, stage="images_ordered")
+                else:
+                    order_step = start_and_call("change_files_order", adapter["change_files_order"])
+                    accept_step(order_step, stage="images_ordered")
+            else:
+                order_step = start_and_call("change_files_order", adapter["change_files_order"])
+                accept_step(order_step, stage="images_ordered")
         elif checkpoint:
             checkpoint.set_stage("images_ordered")
 
