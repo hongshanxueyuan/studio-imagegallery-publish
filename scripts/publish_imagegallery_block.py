@@ -174,29 +174,31 @@ def summary_block_name(block: dict[str, Any]) -> str:
 
 
 def is_summary_html_block(block: dict[str, Any]) -> bool:
-    name = first_visible_line(summary_block_name(block))
-    if name == HTML_SUMMARY_HEADING:
-        return True
-    for key in ("html", "text", "body", "content"):
-        value = block.get(key)
-        if isinstance(value, str) and first_visible_line(value).startswith(HTML_SUMMARY_HEADING):
-            return True
     metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-    return any(
-        isinstance(metadata.get(key), str)
-        and first_visible_line(metadata[key]).startswith(HTML_SUMMARY_HEADING)
-        for key in ("html", "text", "body", "content")
-    )
+    for source in (block, metadata):
+        for key in ("name", "display_name", "title"):
+            value = source.get(key)
+            if isinstance(value, str) and first_visible_line(value) == HTML_SUMMARY_HEADING:
+                return True
+        for key in ("html", "text", "body", "content", "definition"):
+            value = source.get(key)
+            if not isinstance(value, str):
+                continue
+            visible_prefix = re.sub(r"\s+", " ", visible_text(value)).strip()[:20]
+            if HTML_SUMMARY_HEADING in visible_prefix:
+                return True
+    return False
 
 
-def terminal_summary_blocks(vertical: dict[str, Any]) -> list[dict[str, Any]]:
-    matches: list[dict[str, Any]] = []
-    for block in reversed(vertical.get("blocks", [])):
-        if not isinstance(block, dict) or block_category(block) != "html":
-            break
-        if block_locator(block) and is_summary_html_block(block):
-            matches.append(block)
-    return list(reversed(matches))
+def summary_html_blocks(vertical: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        block
+        for block in vertical.get("blocks", [])
+        if isinstance(block, dict)
+        and block_category(block) == "html"
+        and block_locator(block)
+        and is_summary_html_block(block)
+    ]
 
 
 def plan_summary_cleanup_only(
@@ -225,7 +227,7 @@ def plan_summary_cleanup_only(
         and block_locator(block)
         and gallery_summary_heading_from_block(block) == HTML_SUMMARY_HEADING
     ]
-    summary_blocks = terminal_summary_blocks(vertical)
+    summary_blocks = summary_html_blocks(vertical)
     working_vertical_id = remap_block_locator_course(
         str(vertical.get("block_location", "")).strip(),
         source_id,
@@ -791,7 +793,7 @@ def plan_publish_replacement(
         excluded_block_locators=excluded,
     )
     target_record = lookup_record
-    summary_matches = terminal_summary_blocks(target_record["vertical"]) if summary_detection_requested else []
+    summary_matches = summary_html_blocks(target_record["vertical"]) if summary_detection_requested else []
     summary_match_locators = {
         block_locator(block)
         for block in summary_matches
@@ -1788,9 +1790,9 @@ def process_cleanup_only_target(
             "requires_manual_followup": True,
             "note": {
                 "ambiguous_gallery": "multiple existing galleries end with 本节要点; choose the correct gallery manually",
-                "ambiguous_summary": "multiple terminal HTML summary components match; choose the correct component manually",
+                "ambiguous_summary": "multiple HTML summary components match; choose the correct component manually",
                 "gallery_summary_missing": "no existing gallery in this vertical ends with 本节要点; no cleanup was performed",
-                "summary_target_missing": "no terminal HTML summary component was found; no cleanup was performed",
+                "summary_target_missing": "no HTML component matched the 本节要点 title or first 20 visible content characters; no cleanup was performed",
             }.get(str(plan.get("cleanup_only_status")), "cleanup-only preflight could not identify a safe target"),
             "summary_cleanup": {
                 "status": str(plan.get("cleanup_only_status", "failed")),
@@ -2169,7 +2171,7 @@ def apply_in_place_publish_actions(
     if replacement_plan.get("summary_cleanup_required") and replacement_plan.get("summary_cleanup_status") == "ambiguous":
         exc = PublishFailure(
             "summary_match",
-            "multiple terminal HTML summary components match; vertical publish stopped for manual follow-up",
+            "multiple HTML summary components match; vertical publish stopped for manual follow-up",
         )
         exc.steps = steps.copy()
         raise exc
@@ -2291,7 +2293,7 @@ def apply_in_place_publish_actions(
         "candidates": list(replacement_plan.get("summary_cleanup_candidates", [])),
     }
     if summary_cleanup["status"] == "not_found":
-        summary_cleanup["reason"] = "gallery has a final summary page but no terminal HTML summary component was found"
+        summary_cleanup["reason"] = "gallery has a final summary page but no HTML component matched the 本节要点 title or first 20 visible content characters"
     if cleanup_only:
         summary_cleanup["gallery_locator"] = str(replacement_plan.get("existing_gallery_block_locator", ""))
         summary_cleanup["gallery_url"] = build_container_block_url(studio_base, summary_cleanup["gallery_locator"])
@@ -2315,7 +2317,7 @@ def apply_in_place_publish_actions(
         "matched_summary_component_name": summary_cleanup["component_name"],
         "summary_cleanup": summary_cleanup,
         "note": (
-            "removed the duplicate terminal HTML summary from the existing gallery vertical"
+            "removed the duplicate HTML summary from the existing gallery vertical"
             if cleanup_only else
             "replaced existing source block in place" if replacement_plan.get("result_type") == "replaced" else
             "inserted new imagesgallery at the top of the target vertical"
@@ -2422,7 +2424,7 @@ def process_publish_target(
             "status": "manual_followup",
             "gallery_heading": final_heading,
             "source_block_type": source_metadata["block_type"],
-            "reason": "main-body replacement resolves to a different vertical than the terminal summary",
+            "reason": "main-body replacement resolves to a different vertical than the HTML summary component",
         }
         replacement_plan["summary_cleanup_required"] = False
     replacement_plan["summary_cleanup_info"] = summary_cleanup_info
@@ -2467,7 +2469,7 @@ def process_publish_target(
                 "status": "manual_followup",
                 "gallery_heading": final_heading,
                 "source_block_type": source_metadata["block_type"],
-                "reason": "live main-body replacement resolves to a different vertical than the terminal summary",
+                "reason": "live main-body replacement resolves to a different vertical than the HTML summary component",
             }
             replacement_plan["summary_cleanup_info"] = summary_cleanup_info
 
@@ -2506,7 +2508,7 @@ def process_publish_target(
             "failed_step": "summary_match",
             "failure_bucket": "manual_followup",
             "requires_manual_followup": True,
-            "note": "multiple terminal HTML summary components match; no gallery was created and the vertical was not published",
+            "note": "multiple HTML summary components match; no gallery was created and the vertical was not published",
             "summary_cleanup": {
                 **summary_cleanup_info,
                 "status": "ambiguous",

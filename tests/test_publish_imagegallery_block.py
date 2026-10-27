@@ -709,7 +709,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             result["matched_source_block_url"],
         )
 
-    def test_html_origin_publish_deletes_the_unique_terminal_summary_after_saving_gallery(self) -> None:
+    def test_html_origin_publish_deletes_the_unique_summary_after_saving_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_path = self._write_manifest_bundle(tmp_path)
@@ -1178,10 +1178,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                     self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
                 elif scenario == "html_no_match":
                     self.assertEqual("not_found", result["summary_cleanup"]["status"])
-                    self.assertIn("no terminal HTML summary component", result["summary_cleanup"]["reason"])
+                    self.assertIn("no HTML component matched", result["summary_cleanup"]["reason"])
                 elif scenario == "html_nonterminal_summary":
-                    self.assertEqual("not_found", result["summary_cleanup"]["status"])
-                    self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
+                    self.assertEqual("planned", result["summary_cleanup"]["status"])
+                    self.assertTrue(any(url.endswith("block@terminal-summary") for url in delete_urls))
                 else:
                     self.assertEqual("not_required", result["summary_cleanup"]["status"])
                     self.assertTrue(any(url.endswith("block@legacygallery") for url in delete_urls))
