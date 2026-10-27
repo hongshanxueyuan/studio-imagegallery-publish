@@ -200,6 +200,27 @@ operation 文件包含 `galleries[]`。发布器要求恰有一个 `gallery_key`
 
 每个远程步骤开始前和确认完成后都会原子更新检查点。图片上传没有返回可用 ID 时，发布器停止后续上传和排序，只对 `get_files` 做一次恢复读取；仅当文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时才继续。状态不完整或有歧义时，保留现场并停止，不盲目重传。恢复时若图片与排序已确认，发布器从音频阶段继续。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
 
+## 批量发布后的验证与修复
+
+外部批量工作流负责创建 `batch-operation.json`，按顺序发布所有目标 Gallery 和 vertical，并在初始发布全部结束后调用一次验证器。它继续负责本地素材准备；验证器只读取这些 manifest 与 Studio 状态。
+
+每个 `galleries[]` 条目至少包含 `gallery_key`、`manifest`、`vertical_locator`、`gallery_locator`、Ticket 01 的 `publish` 检查点，以及 `initial_vertical_publish: {"status":"completed"}`。验证器只检查 `publish.status == "completed"` 且 `publish.completed_stage == "saved"` 的 Gallery；初始 vertical 发布缺失或失败时仍会采集 Studio 诊断，但批次结果保持未通过。发布器保留调用方字段。验证器原子更新同一文件中的 `validation`、`repair_attempts`、`repair_history` 和 `batch_result`；修复后的 vertical 发布结果记录在对应的 `repair_history[].vertical_publish` 中。
+
+所有初始 vertical 发布完成后执行：
+
+```bash
+python scripts/validate_imagegallery_batch.py \
+  --studio-url "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --operation-file "/path/to/batch-operation.json" \
+  --execute
+```
+
+真实执行使用现有 Studio 认证输入：`--account` / `--password`、环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`，或 `--cookie`。验证器在正常路径只读取一次 Studio `format=concise` 课程结构，再通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容。图片只比较有效文件记录数、`total_count` 和 manifest 页数；配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不比较图片名、顺序或内容，也不检查 learner-side LMS 或远端音频播放。
+
+有效计数不符会记为 `mismatch`，最多触发一次完整修复；请求失败或响应结构无效会记为 `unverified`，不修改该 Gallery，并继续检查其他目标。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时停止，不开始第二次完整修复。
+
+`all_sections_verified` 只有在每个目标最终为 `verified` 且初始 vertical 发布成功（修复过的 Gallery 还须修复后 vertical 发布成功）时才为 true。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
+
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
 
@@ -221,6 +242,7 @@ Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用
 ## 资源
 
 - `scripts/publish_imagegallery_block.py`：端到端发布脚本
+- `scripts/validate_imagegallery_batch.py`：批量发布后的 Studio 校验与单次安全修复
 - `references/adapter.template.json`：默认通用 adapter
 
 ## 说明
