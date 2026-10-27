@@ -70,7 +70,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 - 新生成的 `imagesgallery.json` 应携带顶层 `block_type`、`section_id` 和 `section_title`。
 - 发布器优先读取 manifest 的 `block_type`。旧 manifest 缺少该字段时，使用 `section-list.json`：先按 `section_id` 精确匹配；只有 ID 不可用时才允许按唯一小节标题匹配。
 - 来源标记缺失、冲突或匹配不唯一时，正常发布仍可替换正文，但不会自动删除 HTML；结果会标记人工跟进并在可识别时附上目标 block 链接。
-- 仅当来源为 HTML、图库最后一页标题是“本节要点”，且目标 vertical 末尾有唯一匹配的 HTML 组件时，正常发布才会额外删除该组件。图库完成保存后才删除正文和旧摘要；任一删除失败都会停止发布，不会回滚已完成的 Studio 操作。
+- 仅当来源为 HTML、图库最后一页标题是“本节要点”，且目标 vertical 中恰有一个 HTML 组件满足以下任一条件时，正常发布才会额外删除该组件：组件标题为“本节要点”；或去除 HTML 标记后的可见内容前 20 个字符包含“本节要点”。组件位置不影响匹配；匹配到多个组件时停止自动删除并要求人工确认。图库完成保存后才删除正文和旧摘要；任一删除失败都会停止发布，不会回滚已完成的 Studio 操作。
 - 已完成课程可使用 cleanup-only。先运行 dry-run 检查 vertical、图库末页摘要证据和唯一 HTML 删除目标，再使用相同参数运行 `--execute`。cleanup-only 不创建或上传新 gallery：
 
 ```bash
@@ -89,7 +89,7 @@ python scripts/publish_imagegallery_block.py \
   --execute
 ```
 
-执行前会重新读取 Studio 课程结构，并要求同一 vertical 中存在末页标题为“本节要点”的 gallery 和唯一末尾 HTML 摘要组件。
+执行前会重新读取 Studio 课程结构，并要求同一 vertical 中存在末页标题为“本节要点”的 gallery 和唯一匹配的 HTML 摘要组件；摘要组件可位于 vertical 的任意位置。
 
 ## 批量推送安全规则
 
@@ -173,7 +173,7 @@ python scripts/publish_imagegallery_block.py \
 - `--section-title`：仅当小节 ID 不可用时，用于唯一标题回退
 - `--block-type`：来源 block 类型元数据；与 manifest 或 `section-list.json` 冲突时会禁止自动摘要清理
 - `--section-list-json`：显式指定来源元数据回查文件；未指定时只检查 manifest 同目录中的 `section-list.json`。如果文件位于其他目录，请显式传入路径，避免误用其他课程的来源信息。
-- `--cleanup-only`：只预览或删除已验证 gallery 对应的末尾 HTML“本节要点”，不上传新 gallery
+- `--cleanup-only`：只预览或删除已验证 gallery 对应的唯一匹配 HTML“本节要点”组件，不上传新 gallery
 - `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
 - `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`cleaned`、`manual_followup_failed`
 
