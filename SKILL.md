@@ -219,6 +219,8 @@ python scripts/validate_imagegallery_batch.py \
 
 有效计数不符会记为 `mismatch`，最多触发一次完整修复；请求失败或响应结构无效会记为 `unverified`，不修改该 Gallery，并继续检查其他目标。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时停止，不开始第二次完整修复。
 
+若进程在修复记录完成最终校验前中断，可用同一 operation 文件重跑验证器：Gallery 状态仍可读时续跑现有修复尝试并复用各阶段检查点；已确认完成的步骤不会重复执行，完整修复次数仍为一次。读取状态为 `unverified` 时不继续修改，待读取恢复后再重跑。
+
 `all_sections_verified` 只有在每个目标最终为 `verified` 且初始 vertical 发布成功（修复过的 Gallery 还须修复后 vertical 发布成功）时才为 true。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
 
 ## Adapter 概念
