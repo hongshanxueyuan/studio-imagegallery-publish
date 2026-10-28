@@ -1111,8 +1111,6 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 course_structure,
                 source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
                 target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
-                summary_detection_requested=True,
-                summary_cleanup_required=True,
             )
             args = self._in_place_args(manifest_path, course_path, execute=True)
             calls: list[tuple[str, str]] = []
@@ -1380,8 +1378,6 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         current_structure,
                         source_vertical_block_id=kwargs["source_vertical_block_id"],
                         target_vertical_block_id=kwargs["target_vertical_block_id"],
-                        summary_detection_requested=kwargs.get("summary_detection_requested", False),
-                        summary_cleanup_required=kwargs.get("summary_cleanup_required", False),
                         excluded_block_locators=kwargs.get("excluded_block_locators", []),
                     ),
                     {"step": "load_live_target_structure", "status": "ok"},
@@ -1493,8 +1489,6 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                     structure,
                     source_vertical_block_id=target["source_vertical_block_location"],
                     target_vertical_block_id=target["target_vertical_block_location"],
-                    summary_detection_requested=True,
-                    summary_cleanup_required=True,
                 )
                 created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@batch-gallery"
 
