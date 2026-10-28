@@ -880,7 +880,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             result["matched_source_block_url"],
         )
 
-    def test_html_origin_publish_deletes_the_unique_summary_after_saving_gallery(self) -> None:
+    def test_html_origin_publish_preserves_summary_components_after_saving_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_path = self._write_manifest_bundle(tmp_path)
@@ -904,6 +904,15 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             }
             target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
             target_vertical["blocks"].append(terminal_summary)
+            target_vertical["blocks"].insert(
+                0,
+                {
+                    "name": "本节要点",
+                    "category": "html",
+                    "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@early-summary",
+                    "html": "<h2>本节要点</h2><p>另一份回顾</p>",
+                },
+            )
 
             course_path = tmp_path / "course.json"
             course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
@@ -932,22 +941,21 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             result = module.run_in_place_publish(args)
 
         self.assertEqual("replaced", result["status"])
-        self.assertEqual("要点小结", result["matched_summary_component_name"])
-        self.assertEqual(
-            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary",
-            result["matched_summary_block_url"],
-        )
+        self.assertEqual("preserved", result["summary_cleanup"]["status"])
+        self.assertEqual("", result["matched_summary_component_name"])
+        self.assertEqual("", result["matched_summary_block_url"])
         steps = result["steps"]
         save_index = max(index for index, step in enumerate(steps) if step["step"] == "save_block")
         delete_indexes = [index for index, step in enumerate(steps) if step["step"] == "delete_block"]
         publish_index = next(index for index, step in enumerate(steps) if step["step"] == "publish_vertical")
-        self.assertEqual(2, len(delete_indexes))
+        self.assertEqual(1, len(delete_indexes))
         self.assertLess(save_index, min(delete_indexes))
         self.assertLess(max(delete_indexes), publish_index)
         deleted_urls = [steps[index]["url"] for index in delete_indexes]
-        self.assertTrue(any(url.endswith("block@terminal-summary") for url in deleted_urls))
+        self.assertTrue(any(url.endswith("block@targethtml") for url in deleted_urls))
+        self.assertFalse(any("summary" in url for url in deleted_urls))
 
-    def test_cleanup_only_dry_run_previews_existing_gallery_and_exact_html_target_without_upload(self) -> None:
+    def test_cleanup_only_dry_run_is_unsupported_without_studio_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             course_structure = self._make_course_structure(
@@ -1003,18 +1011,13 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
             result = module.run_in_place_publish(args)
 
-        self.assertEqual("cleanup_planned", result["status"])
-        self.assertEqual("本节要点", result["summary_cleanup"]["evidence"].split("heading is ")[-1])
-        self.assertTrue(result["existing_gallery_block_url"].endswith("block@legacygallery"))
-        self.assertTrue(result["matched_summary_block_url"].endswith("block@cleanup-summary"))
-        self.assertEqual(
-            ["delete_block", "publish_vertical"],
-            [step["step"] for step in result["steps"]],
-        )
-        self.assertEqual("dry-run", result["steps"][0]["status"])
-        self.assertEqual("", result["created_block_locator"])
+        self.assertEqual("unsupported", result["status"])
+        self.assertEqual("cleanup_only_unsupported", result["failed_step"])
+        self.assertEqual("preserved", result["summary_cleanup"]["status"])
+        self.assertIn("cleanup-only is unsupported", result["note"])
+        self.assertEqual([], result["steps"])
 
-    def test_cleanup_only_execute_uses_fresh_fake_adapter_and_never_uploads_a_gallery(self) -> None:
+    def test_cleanup_only_execute_is_unsupported_before_studio_access(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             course_structure = self._make_course_structure(
@@ -1035,11 +1038,6 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             )
             course_path = tmp_path / "course.json"
             course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
-            live_plan = module.plan_summary_cleanup_only(
-                course_structure,
-                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
-                target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
-            )
             args = self._in_place_args(Path(""), course_path, execute=True, cleanup_only=True)
             calls: list[tuple[str, str]] = []
 
@@ -1047,24 +1045,30 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 calls.append((name, str(ctx.get("delete_block_locator", ""))))
                 return {"step": name, "status": "ok"}
 
-            with patch.object(module, "maybe_fetch_live_cleanup_plan", return_value=(live_plan, {"step": "load_live_target_structure", "status": "ok"})):
-                with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
+            with patch.object(module, "fetch_live_course_structure", side_effect=AssertionError("must not read Studio")) as live_fetch:
+                with patch.object(module, "build_studio_session_from_args", side_effect=AssertionError("must not authenticate")) as session_builder:
                     with patch.object(module, "call_template", side_effect=fake_adapter):
                         result = module.run_in_place_publish(args)
+            live_fetch.assert_not_called()
+            session_builder.assert_not_called()
 
-        self.assertEqual("cleaned", result["status"])
-        self.assertEqual(
-            [
-                ("delete_block", "block-v1:FIRAx+1040045+20260807+type@html+block@execute-cleanup-summary"),
-                ("publish_vertical", "block-v1:FIRAx+1040045+20260807+type@html+block@execute-cleanup-summary"),
-            ],
-            calls,
-        )
-        self.assertEqual("", result["created_imagegallery_block_url"])
-        self.assertTrue(result["existing_gallery_block_url"].endswith("block@legacygallery"))
-        self.assertEqual("deleted", result["summary_cleanup"]["status"])
+        self.assertEqual("unsupported", result["status"])
+        self.assertEqual("cleanup_only_unsupported", result["failed_step"])
+        self.assertEqual("preserved", result["summary_cleanup"]["status"])
+        self.assertEqual([], calls)
+        self.assertEqual([], result["steps"])
 
-    def test_cleanup_only_refuses_to_delete_without_a_summary_gallery_in_the_same_vertical(self) -> None:
+        cli_stdout = StringIO()
+        with patch("sys.argv", ["publish_imagegallery_block.py", "--cleanup-only", "--execute"]):
+            with patch.object(module, "build_studio_session_from_args", side_effect=AssertionError("must not authenticate")):
+                with patch.object(module, "fetch_live_course_structure", side_effect=AssertionError("must not read Studio")):
+                    with patch.object(module, "call_template", side_effect=AssertionError("must not write Studio")):
+                        with redirect_stdout(cli_stdout):
+                            exit_code = module.main()
+        self.assertEqual(2, exit_code, cli_stdout.getvalue())
+        self.assertEqual("unsupported", json.loads(cli_stdout.getvalue())["status"])
+
+    def test_cleanup_only_is_unsupported_even_without_a_summary_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             course_structure = self._make_course_structure(
@@ -1085,13 +1089,12 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 self._in_place_args(Path(""), course_path, cleanup_only=True)
             )
 
-        self.assertEqual("failed", result["status"])
-        self.assertEqual("cleanup_preflight", result["failed_step"])
-        self.assertEqual("gallery_summary_missing", result["summary_cleanup"]["status"])
-        self.assertIn("no existing gallery", result["note"])
+        self.assertEqual("unsupported", result["status"])
+        self.assertEqual("cleanup_only_unsupported", result["failed_step"])
+        self.assertEqual("preserved", result["summary_cleanup"]["status"])
         self.assertEqual([], result["steps"])
 
-    def test_summary_delete_failure_keeps_gallery_and_skips_publish_without_rollback(self) -> None:
+    def test_summary_components_are_untouched_while_body_replacement_completes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_path = self._write_manifest_bundle(tmp_path)
@@ -1146,20 +1149,19 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                                 self.adapter,
                             )
 
-        self.assertEqual("failed", result["status"])
-        self.assertEqual("delete_block", result["failed_step"])
+        self.assertEqual("replaced", result["status"])
         self.assertTrue(result["created_imagegallery_block_url"].endswith("block@newgallery"))
         self.assertTrue(result["target_vertical_url"].endswith("block@targetvertical"))
-        self.assertTrue(result["matched_summary_block_url"].endswith("block@terminal-summary"))
-        self.assertEqual("failed", result["summary_cleanup"]["status"])
+        self.assertEqual("", result["matched_summary_block_url"])
+        self.assertEqual("preserved", result["summary_cleanup"]["status"])
         self.assertIn(("delete_block", plan["matched_source_block_locator"]), calls)
-        self.assertIn(("delete_block", summary["block_location"]), calls)
-        self.assertNotIn("publish_vertical", [name for name, _locator in calls])
+        self.assertNotIn(("delete_block", summary["block_location"]), calls)
+        self.assertIn("publish_vertical", [name for name, _locator in calls])
         self.assertNotIn("rollback", [name for name, _locator in calls])
         self.assertIn("save_block", result["completed_steps"])
-        self.assertIn("delete_block", result["failed_steps"])
+        self.assertNotIn("delete_block", result["failed_steps"])
 
-    def test_section_list_source_fallback_prefers_section_id_and_uses_unique_title_only_without_id(self) -> None:
+    def test_summary_preservation_does_not_depend_on_section_list_source_fallback(self) -> None:
         for use_section_id in (True, False):
             with self.subTest(use_section_id=use_section_id), tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
@@ -1199,10 +1201,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
                 result = module.run_in_place_publish(args)
 
-                self.assertEqual("planned", result["summary_cleanup"]["status"])
-                self.assertEqual("本节要点", result["summary_cleanup"]["gallery_heading"])
+                self.assertEqual("preserved", result["summary_cleanup"]["status"])
 
-    def test_parent_section_list_is_not_used_implicitly_for_manifest_source_fallback(self) -> None:
+    def test_summary_preservation_does_not_depend_on_section_list_location(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_dir = tmp_path / "another-course" / "gallery"
@@ -1245,12 +1246,12 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             )
 
         self.assertEqual("replaced", result["status"])
-        self.assertEqual("manual_followup", result["summary_cleanup"]["status"])
+        self.assertEqual("preserved", result["summary_cleanup"]["status"])
         delete_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
         self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
-        self.assertEqual("planned", explicit_path_result["summary_cleanup"]["status"])
+        self.assertEqual("preserved", explicit_path_result["summary_cleanup"]["status"])
 
-    def test_missing_ambiguous_and_conflicting_source_metadata_never_triggers_summary_deletion(self) -> None:
+    def test_summary_preservation_ignores_missing_ambiguous_and_conflicting_source_metadata(self) -> None:
         scenarios = ("missing", "ambiguous", "conflicting")
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
@@ -1299,13 +1300,13 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 result = module.process_publish_target(target, course_structure, args, self.adapter)
 
                 self.assertEqual("replaced", result["status"])
-                self.assertTrue(result["requires_manual_followup"])
-                self.assertEqual("manual_followup", result["summary_cleanup"]["status"])
+                self.assertFalse(result["requires_manual_followup"])
+                self.assertEqual("preserved", result["summary_cleanup"]["status"])
                 deleted_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
                 self.assertTrue(deleted_urls)
                 self.assertFalse(any(url.endswith("block@terminal-summary") for url in deleted_urls))
 
-    def test_no_summary_gallery_origin_zero_matches_and_ambiguous_matches_have_distinct_outcomes(self) -> None:
+    def test_summary_preservation_is_independent_of_gallery_heading_and_match_count(self) -> None:
         for scenario in ("gallery_without_summary", "html_no_match", "html_nonterminal_summary", "imagegallery_origin", "ambiguous_summary"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
@@ -1339,30 +1340,14 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
                 result = module.run_in_place_publish(self._in_place_args(manifest_path, course_path))
 
-                if scenario == "ambiguous_summary":
-                    self.assertEqual("failed", result["status"])
-                    self.assertEqual("summary_match", result["failed_step"])
-                    self.assertEqual("ambiguous", result["summary_cleanup"]["status"])
-                    self.assertEqual(2, len(result["summary_cleanup"]["candidates"]))
-                    self.assertEqual([], result["steps"])
-                    continue
                 self.assertEqual("replaced", result["status"])
+                self.assertEqual("preserved", result["summary_cleanup"]["status"])
                 delete_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
-                if scenario == "gallery_without_summary":
-                    self.assertEqual("not_required", result["summary_cleanup"]["status"])
-                    self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
-                elif scenario == "html_no_match":
-                    self.assertEqual("not_found", result["summary_cleanup"]["status"])
-                    self.assertIn("no HTML component matched", result["summary_cleanup"]["reason"])
-                elif scenario == "html_nonterminal_summary":
-                    self.assertEqual("planned", result["summary_cleanup"]["status"])
-                    self.assertTrue(any(url.endswith("block@terminal-summary") for url in delete_urls))
-                else:
-                    self.assertEqual("not_required", result["summary_cleanup"]["status"])
+                self.assertFalse(any("summary" in url for url in delete_urls))
+                if scenario == "imagegallery_origin":
                     self.assertTrue(any(url.endswith("block@legacygallery") for url in delete_urls))
-                    self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
 
-    def test_publish_only_retry_reuses_saved_gallery_and_does_not_repeat_deletions(self) -> None:
+    def test_publish_only_retry_preserves_summary_without_repeating_body_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_path = self._write_manifest_bundle(tmp_path)
@@ -1423,15 +1408,12 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                             first_result = module.process_publish_target(target, initial_structure, args, self.adapter)
                             self.assertEqual("failed", first_result["status"])
                             self.assertEqual("publish_vertical", first_result["failed_step"])
-                            self.assertEqual("deleted", first_result["summary_cleanup"]["status"])
+                            self.assertEqual("preserved", first_result["summary_cleanup"]["status"])
 
                             target_vertical = current_structure["chapters"][0]["sections"][0]["verticals"][0]
                             target_vertical["blocks"] = [
                                 block for block in target_vertical["blocks"]
-                                if block.get("block_location") not in {
-                                    "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml",
-                                    "block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary",
-                                }
+                                if block.get("block_location") != "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml"
                             ]
                             target_vertical["blocks"].append(
                                 {
@@ -1452,10 +1434,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertEqual("replaced", second_result["status"])
         self.assertTrue(second_result["resumed_from_previous_run"])
         self.assertEqual(["publish_vertical"], calls[start_retry_calls:])
-        self.assertEqual("deleted", second_result["summary_cleanup"]["status"])
+        self.assertEqual("preserved", second_result["summary_cleanup"]["status"])
         self.assertEqual(created_locator, second_result["created_block_locator"])
 
-    def test_batch_continues_after_summary_cleanup_failure_and_completes_later_vertical(self) -> None:
+    def test_batch_preserves_html_summary_components_for_each_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_path = self._write_manifest_bundle(tmp_path)
@@ -1478,7 +1460,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         "course_structure_json": str(course_path),
                         "targets": [
                             {
-                                "name": "1.1 cleanup failure",
+                                "name": "1.1 summary is preserved",
                                 "manifest": str(manifest_path),
                                 "target_vertical_block_location": target_vertical_id,
                                 "source_vertical_block_location": target_vertical_id,
@@ -1538,12 +1520,83 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
             result = module.run_batch_publish(args, publish_target_fn=fake_runner)
 
-        self.assertEqual(["1.1 cleanup failure", "1.2 later success"], calls)
-        self.assertEqual(1, result["summary"]["failed_count"])
-        self.assertEqual(1, result["summary"]["replaced_count"])
-        self.assertEqual("delete_block", result["failed"][0]["failed_step"])
-        self.assertTrue(result["failed"][0]["matched_summary_block_url"].endswith("block@terminal-summary"))
-        self.assertEqual("1.2 later success", result["replaced"][0]["name"])
+        self.assertEqual(["1.1 summary is preserved", "1.2 later success"], calls)
+        self.assertEqual(0, result["summary"]["failed_count"])
+        self.assertEqual(2, result["summary"]["replaced_count"])
+        self.assertEqual("preserved", result["replaced"][0]["summary_cleanup"]["status"])
+        self.assertEqual("1.2 later success", result["replaced"][1]["name"])
+
+    def test_batch_cleanup_only_target_is_unsupported_before_studio_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = self._write_manifest_bundle(tmp_path)
+            course_structure = self._make_course_structure(
+                include_gallery=True,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            course_path = tmp_path / "course.json"
+            course_path.write_text(json.dumps(course_structure, ensure_ascii=False), encoding="utf-8")
+            targets_path = tmp_path / "targets.json"
+            report_path = tmp_path / "report.json"
+            target_vertical_id = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+            targets_path.write_text(
+                json.dumps(
+                    {
+                        "course_structure_json": str(course_path),
+                        "targets": [
+                            {
+                                "name": "legacy cleanup target",
+                                "manifest": str(manifest_path),
+                                "cleanup_only": True,
+                                "target_vertical_block_location": target_vertical_id,
+                                "source_vertical_block_location": target_vertical_id,
+                                "studio_vertical_url": f"https://studio.example.com/container/{target_vertical_id}",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = self._in_place_args(manifest_path, course_path, execute=True)
+            args.targets_file = str(targets_path)
+            args.report_file = str(report_path)
+
+            with patch.object(module, "fetch_live_course_structure", side_effect=AssertionError("must not read Studio")) as live_fetch:
+                with patch.object(module, "build_studio_session_from_args", side_effect=AssertionError("must not authenticate")) as session_builder:
+                    with patch.object(module, "call_template", side_effect=AssertionError("must not write Studio")) as adapter_call:
+                        result = module.run_batch_publish(args)
+
+            live_fetch.assert_not_called()
+            session_builder.assert_not_called()
+            adapter_call.assert_not_called()
+            self.assertEqual("unsupported", result["results"][0]["status"])
+            self.assertEqual("preserved", result["results"][0]["summary_cleanup"]["status"])
+            self.assertEqual(1, result["summary"]["unsupported_count"])
+            self.assertEqual("unsupported", result["unsupported"][0]["status"])
+            self.assertNotIn("cleaned", result)
+            self.assertNotIn("cleanup_planned", result)
+            self.assertNotIn("cleaned_count", result["summary"])
+            self.assertNotIn("cleanup_planned_count", result["summary"])
+
+            cli_stdout = StringIO()
+            cli_args = [
+                "publish_imagegallery_block.py",
+                "--targets-file",
+                str(targets_path),
+                "--report-file",
+                str(report_path),
+                "--execute",
+            ]
+            with patch("sys.argv", cli_args):
+                with patch.object(module, "build_studio_session_from_args", side_effect=AssertionError("must not authenticate")):
+                    with patch.object(module, "fetch_live_course_structure", side_effect=AssertionError("must not read Studio")):
+                        with patch.object(module, "call_template", side_effect=AssertionError("must not write Studio")):
+                            with redirect_stdout(cli_stdout):
+                                exit_code = module.main()
+            self.assertEqual(2, exit_code, cli_stdout.getvalue())
+            self.assertEqual("unsupported", json.loads(cli_stdout.getvalue())["results"][0]["status"])
 
     def test_apply_in_place_publish_actions_supports_dry_run_without_created_locator(self) -> None:
         result = module.apply_in_place_publish_actions(
@@ -2259,10 +2312,11 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("最多重试 **4** 次", skill_doc)
         self.assertIn("目标 vertical URL", skill_doc)
         self.assertIn("新建的 `imagesgallery` block URL", skill_doc)
-        self.assertIn("--cleanup-only", skill_doc)
+        self.assertIn("cleanup-only", skill_doc)
+        self.assertIn("返回 `unsupported`", skill_doc)
         self.assertIn("--section-list-json", skill_doc)
-        self.assertIn("只检查 manifest 同目录", skill_doc)
-        self.assertIn("摘要清理状态", skill_doc)
+        self.assertIn("不会影响 HTML 摘要保留行为", skill_doc)
+        self.assertIn("保留独立的 HTML 摘要组件", skill_doc)
         self.assertIn("失败步骤", skill_doc)
 
 
