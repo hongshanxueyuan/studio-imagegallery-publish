@@ -625,8 +625,6 @@ def plan_publish_replacement(
     source_vertical_block_id: str,
     target_vertical_block_id: str,
     excluded_block_locators: list[str] | None = None,
-    summary_detection_requested: bool = False,
-    summary_cleanup_required: bool = False,
 ) -> dict[str, Any]:
     source_vertical_block_id = str(source_vertical_block_id or "").strip()
     target_vertical_block_id = str(target_vertical_block_id or source_vertical_block_id).strip()
@@ -732,8 +730,6 @@ def plan_publish_replacement(
         "current_children": current_children,
         "matched_source_block_locator": matched_source_block_locator,
         "matched_source_block_category": matched_source_block_category,
-        "summary_detection_requested": True,
-        "summary_cleanup_required": False,
         "summary_cleanup_status": "preserved" if summary_matches else "not_present",
         "all_structure_block_ids": [
             remap_block_locator_course(block_id, source_vertical_block_id, target_vertical_block_id)
@@ -1130,8 +1126,6 @@ def maybe_fetch_live_replacement_plan(
     source_vertical_block_id: str,
     target_vertical_block_id: str,
     excluded_block_locators: list[str] | None = None,
-    summary_detection_requested: bool = False,
-    summary_cleanup_required: bool = False,
     args: argparse.Namespace,
     timeout: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -1165,8 +1159,6 @@ def maybe_fetch_live_replacement_plan(
                 source_vertical_block_id=source_vertical_block_id,
                 target_vertical_block_id=target_vertical_block_id,
                 excluded_block_locators=excluded_block_locators,
-                summary_detection_requested=summary_detection_requested,
-                summary_cleanup_required=summary_cleanup_required,
             ),
             "live_target",
         )
@@ -2498,11 +2490,7 @@ def apply_in_place_publish_actions(
     timeout: int,
     args: argparse.Namespace,
     publish_only: bool = False,
-    cleanup_only: bool = False,
 ) -> dict[str, Any]:
-    if cleanup_only:
-        raise PublishFailure("cleanup_only_unsupported", "cleanup-only is unsupported; HTML summary components are preserved")
-
     studio_base = str(single_publish_result.get("studio_base", "")).strip()
     if not studio_base:
         raise PublishFailure("studio_base", "missing studio_base for in-place publish actions")
@@ -2511,34 +2499,31 @@ def apply_in_place_publish_actions(
     replacement_plan = dict(replacement_plan)
     created_block_locator = str(single_publish_result.get("block_locator", "") or single_publish_result.get("created_block_locator", "")).strip()
 
-    if not publish_only and not cleanup_only and not created_block_locator:
+    if not publish_only and not created_block_locator:
         if execute:
             raise PublishFailure("create_block", "missing created imagesgallery block locator")
         created_block_locator = "__dry_run_created_imagesgallery__"
 
     requested_vertical_url = build_container_block_url(studio_base, str(replacement_plan.get("target_vertical_block_id", ""))) or studio_url
-    if not cleanup_only:
-        live_plan, live_step = maybe_fetch_live_replacement_plan(
-            studio_url=requested_vertical_url,
-            source_vertical_block_id=str(replacement_plan.get("source_vertical_block_id", "")),
-            target_vertical_block_id=str(replacement_plan.get("target_vertical_block_id", "")),
-            excluded_block_locators=[created_block_locator] if created_block_locator else [],
-            summary_detection_requested=bool(replacement_plan.get("summary_detection_requested", False)),
-            summary_cleanup_required=bool(replacement_plan.get("summary_cleanup_required", False)),
-            args=args,
-            timeout=timeout,
+    live_plan, live_step = maybe_fetch_live_replacement_plan(
+        studio_url=requested_vertical_url,
+        source_vertical_block_id=str(replacement_plan.get("source_vertical_block_id", "")),
+        target_vertical_block_id=str(replacement_plan.get("target_vertical_block_id", "")),
+        excluded_block_locators=[created_block_locator] if created_block_locator else [],
+        args=args,
+        timeout=timeout,
+    )
+    if live_step:
+        steps.append(live_step)
+    if execute and not publish_only and live_plan is None:
+        raise PublishFailure(
+            "load_live_target_structure",
+            str((live_step or {}).get("note") or "execute mode requires a fresh live target structure before in-place replacement"),
         )
-        if live_step:
-            steps.append(live_step)
-        if execute and not publish_only and live_plan is None:
-            raise PublishFailure(
-                "load_live_target_structure",
-                str((live_step or {}).get("note") or "execute mode requires a fresh live target structure before in-place replacement"),
-            )
-        if live_plan is not None:
-            if publish_only:
-                live_plan["result_type"] = replacement_plan.get("result_type", live_plan.get("result_type", "replaced"))
-            replacement_plan = live_plan
+    if live_plan is not None:
+        if publish_only:
+            live_plan["result_type"] = replacement_plan.get("result_type", live_plan.get("result_type", "replaced"))
+        replacement_plan = live_plan
 
     working_vertical_block_id = str(replacement_plan.get("working_vertical_block_id", "")).strip()
     matched_source_block_locator = str(replacement_plan.get("matched_source_block_locator", "")).strip()
@@ -2569,7 +2554,7 @@ def apply_in_place_publish_actions(
     )
     if publish_only:
         desired_children = current_children
-    elif not cleanup_only:
+    else:
         desired_children = build_vertical_children(
             [*current_children, created_block_locator],
             new_block_locator=created_block_locator,
@@ -2616,10 +2601,10 @@ def apply_in_place_publish_actions(
             failure.steps = steps.copy()
             raise failure from exc
 
-    if not publish_only and not cleanup_only and desired_children != [*current_children, created_block_locator]:
+    if not publish_only and desired_children != [*current_children, created_block_locator]:
         call_optional_step("reorder_children")
 
-    if not publish_only and not cleanup_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
+    if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
         call_optional_step("delete_block", delete_locator=matched_source_block_locator)
 
     call_optional_step("publish_vertical")
@@ -2692,8 +2677,6 @@ def process_publish_target(
             course_structure,
             source_vertical_block_id=source_vertical_block_id,
             target_vertical_block_id=target_vertical_block_id,
-            summary_detection_requested=True,
-            summary_cleanup_required=False,
         ),
         "course_structure_json",
     )
@@ -2701,8 +2684,6 @@ def process_publish_target(
         studio_url=studio_vertical_url,
         source_vertical_block_id=source_vertical_block_id,
         target_vertical_block_id=target_vertical_block_id,
-        summary_detection_requested=True,
-        summary_cleanup_required=False,
         args=args,
         timeout=int(getattr(args, "timeout", 30)),
     )
@@ -2823,10 +2804,6 @@ def process_publish_target(
                     or (previous_result or {}).get("status")
                     or replacement_plan.get("result_type", "replaced")
                 ),
-                "summary_cleanup_required": False,
-                "summary_detection_requested": False,
-                "summary_cleanup_status": "not_requested",
-                "matched_summary_block_locator": "",
             },
             studio_url=studio_vertical_url,
             execute=bool(getattr(args, "execute", False)),
@@ -2910,7 +2887,6 @@ def run_in_place_publish(args: argparse.Namespace) -> dict[str, Any]:
         "section_title": str(getattr(args, "section_title", "") or ""),
         "block_type": str(getattr(args, "block_type", "") or ""),
         "section_list_json": str(getattr(args, "section_list_json", "") or ""),
-        "cleanup_only": bool(getattr(args, "cleanup_only", False)),
         "source_vertical_block_location": str(args.source_vertical_block_id or target_vertical_block_id),
         "target_vertical_block_location": target_vertical_block_id,
         "studio_vertical_url": normalize_block_url(args.studio_url),
@@ -3080,7 +3056,7 @@ def main() -> int:
         if args.targets_file:
             out = run_batch_publish(args)
         elif args.course_structure_json:
-            if not args.manifest and not args.cleanup_only:
+            if not args.manifest:
                 raise SystemExit("--manifest is required when --course-structure-json is set")
             if not args.studio_url:
                 raise SystemExit("--studio-url is required when --course-structure-json is set")
