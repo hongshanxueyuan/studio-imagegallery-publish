@@ -41,12 +41,14 @@ class FakeCookies:
 
 
 class FakeStudio:
-    def __init__(self, galleries, *, keep_mismatch_after_repair=False, fail_get_files=None, payload_overrides=None, extra_assets=None, fail_vertical_publish=False):
+    def __init__(self, galleries, *, keep_mismatch_after_repair=False, fail_get_files=None, payload_overrides=None, extra_assets=None, fail_vertical_publish=False, vertical_overrides=None, fail_course_reads=None):
         self.galleries = galleries
         self.keep_mismatch_after_repair = keep_mismatch_after_repair
         self.fail_get_files = fail_get_files or {}
         self.payload_overrides = payload_overrides or {}
         self.fail_vertical_publish = fail_vertical_publish
+        self.vertical_overrides = vertical_overrides or {}
+        self.fail_course_reads = set(fail_course_reads or [])
         self.calls = []
         self.path_counts = {}
         self.get_files_counts = {}
@@ -75,7 +77,9 @@ class FakeStudio:
     def _response(self, method, path, kwargs):
         if method == "GET" and path == f"/course/{COURSE_KEY}":
             self.course_reads += 1
-            return FakeResponse(make_course_structure(self.galleries))
+            if self.course_reads in self.fail_course_reads:
+                return FakeResponse({"detail": "structure unavailable"}, 503)
+            return FakeResponse(make_course_structure(self.galleries, self.vertical_overrides))
         if method == "GET" and path == f"/assets/{COURSE_KEY}/":
             page = int((kwargs.get("params") or {}).get("page", 0))
             return FakeResponse({"assets": self.assets if page == 0 else [], "totalCount": len(self.assets), "page": page, "pageSize": 50})
@@ -171,21 +175,26 @@ class FakeStudio:
         return self._response(method.upper(), path, kwargs)
 
 
-def make_course_structure(galleries):
+def make_course_structure(galleries, vertical_overrides=None):
     blocks_by_vertical = {VERTICAL_1: [], VERTICAL_2: []}
     for locator in galleries:
         vertical = VERTICAL_1 if locator == GALLERY_1 else VERTICAL_2
         blocks_by_vertical[vertical].append({"id": locator, "category": "imagesgallery", "display_name": "有声幻灯片"})
-    vertical_nodes = [
-        {
+    vertical_overrides = vertical_overrides or {}
+    vertical_nodes = []
+    for locator in dict.fromkeys([*blocks_by_vertical, *vertical_overrides]):
+        override = vertical_overrides.get(locator, {})
+        blocks = override.get("blocks", blocks_by_vertical.get(locator, []))
+        node = {
             "id": locator,
             "category": "vertical",
             "display_name": "小节",
             "child_info": {"children": blocks},
         }
-        for locator, blocks in blocks_by_vertical.items()
-        if blocks
-    ]
+        if not override.get("omit_published"):
+            node["published"] = override.get("published", True)
+        if blocks or override.get("include_empty"):
+            vertical_nodes.append(node)
     section = {"id": "block-v1:ORG+COURSE+RUN+type@sequential+block@section", "category": "sequential", "child_info": {"children": vertical_nodes}}
     chapter = {"id": "block-v1:ORG+COURSE+RUN+type@chapter+block@chapter", "category": "chapter", "child_info": {"children": [section]}}
     return {"id": COURSE_KEY, "category": "course", "display_name": "Test Course", "child_info": {"children": [chapter]}}
@@ -224,6 +233,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     "steps": [],
                 },
                 "initial_vertical_publish": {"status": initial_vertical_status},
+                "vertical_integrity": {
+                    "expected": {
+                        "direct_child_count": 1,
+                        "children": [{"locator": locator, "type": "imagesgallery", "order": 1}],
+                    }
+                },
             })
         return {"operation_id": "operation-1", "galleries": entries}
 
@@ -257,7 +272,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
             operation_path = root / "batch-operation.json"
-            self._write_operation_file(operation_path, self._operation(manifest))
+            operation = self._operation(manifest)
+            operation["skill_provenance"] = {"commit": "fixture-commit", "installation_path": "fixture-skill"}
+            self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a", "display_name": "renamed-a.png"}, {"id": "asset-b", "display_name": "renamed-b.png"}],
                 "time_config": [{"page": 1}, {"page": 2}],
@@ -268,9 +285,11 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
             self.assertEqual("", stderr)
-            self.assertEqual(1, studio.course_reads)
+            self.assertEqual(2, studio.course_reads)
             self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
             state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual(operation["skill_provenance"], state["skill_provenance"])
+            self.assertEqual(operation["skill_provenance"], state["batch_result"]["skill_provenance"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
             gallery = state["galleries"][0]
             self.assertEqual("verified", gallery["validation"]["status"])
@@ -279,6 +298,105 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             for secret in ("success-sts-secret", "success-cookie-secret", "success-csrf-secret", "success-auth-secret", "success-token-secret", "session-secret", "csrf-secret"):
                 self.assertNotIn(secret, all_output)
             self.assertNotIn("raw_response", all_output)
+
+    def test_final_course_check_includes_unpublished_untargeted_vertical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }}, vertical_overrides={VERTICAL_2: {
+                "blocks": [{"id": "block-v1:ORG+COURSE+RUN+type@html+block@untargeted", "category": "html"}],
+                "published": False,
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            course_check = state["course_structure_verification"]
+            untargeted = next(item for item in course_check["subsections"] if item["vertical_locator"] == VERTICAL_2)
+            self.assertEqual("issue", untargeted["status"])
+            self.assertEqual(False, untargeted["published"])
+            self.assertIn("published_false", untargeted["issues"])
+            self.assertEqual(1, course_check["issue_count"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+
+    def test_final_course_check_marks_missing_published_state_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }}, vertical_overrides={VERTICAL_2: {
+                "blocks": [{"id": "block-v1:ORG+COURSE+RUN+type@html+block@untargeted", "category": "html"}],
+                "omit_published": True,
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            course_check = state["course_structure_verification"]
+            untargeted = next(item for item in course_check["subsections"] if item["vertical_locator"] == VERTICAL_2)
+            self.assertEqual("unverified", untargeted["status"])
+            self.assertIsNone(untargeted["published"])
+            self.assertIn("published_state_missing", untargeted["unverified_reasons"])
+            self.assertGreaterEqual(course_check["unverified_count"], 1)
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+
+    def test_final_course_read_failure_is_unverified_after_gallery_validation_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }}, fail_course_reads={2})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            self.assertEqual(2, studio.course_reads)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("unverified", state["course_structure_verification"]["status"])
+            self.assertEqual(1, state["course_structure_verification"]["unverified_count"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+
+    def test_final_course_check_compares_targeted_vertical_with_publisher_expectation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation = self._operation(manifest)
+            operation["galleries"][0]["vertical_integrity"]["expected"]["children"][0]["type"] = "html"
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            target = next(item for item in state["course_structure_verification"]["subsections"] if item["vertical_locator"] == VERTICAL_1)
+            self.assertEqual("issue", target["structure_status"])
+            self.assertIn("structure_mismatch", target["issues"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
 
     def test_cli_continues_after_one_gallery_is_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,7 +412,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
 
             self.assertEqual(1, exit_code, stdout + stderr)
-            self.assertEqual(1, studio.course_reads)
+            self.assertEqual(2, studio.course_reads)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
             self.assertEqual("verified", state["galleries"][1]["validation"]["status"])
@@ -347,7 +465,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertLess(remove_index, min(delete_indexes))
             self.assertLess(max(delete_indexes), min(upload_indexes))
             self.assertLess(max(upload_indexes), publish_index)
-            self.assertEqual(4, studio.course_reads)
+            self.assertEqual(5, studio.course_reads)
             self.assertEqual({
                 f"/assets/{COURSE_KEY}/asset-old",
                 f"/assets/{COURSE_KEY}/asset-checkpoint-orphan",
