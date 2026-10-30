@@ -838,10 +838,230 @@ def initial_vertical_published(entry: dict[str, Any]) -> bool:
     return isinstance(record, dict) and record.get("status") == "completed"
 
 
+def normalize_child_snapshot(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    children = value.get("children")
+    count = value.get("direct_child_count")
+    if not isinstance(children, list) or not isinstance(count, int) or isinstance(count, bool) or count != len(children):
+        return None
+    normalized = []
+    for child in children:
+        if not isinstance(child, dict):
+            return None
+        locator = safe_locator(child.get("locator"))
+        block_type = child.get("type")
+        order = child.get("order")
+        if (
+            not locator
+            or not isinstance(block_type, str)
+            or not block_type.strip()
+            or not isinstance(order, int)
+            or isinstance(order, bool)
+        ):
+            return None
+        normalized.append({"locator": locator, "type": block_type.strip().lower(), "order": order})
+    if len({child["locator"] for child in normalized}) != len(normalized):
+        return None
+    return {"direct_child_count": count, "children": normalized}
+
+
+def observed_child_snapshot(vertical: dict[str, Any]) -> dict[str, Any] | None:
+    blocks = vertical.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+    children = []
+    for index, block in enumerate(blocks, start=1):
+        if not isinstance(block, dict):
+            return None
+        locator = safe_locator(block.get("block_location"))
+        block_type = publisher.block_category(block)
+        if not locator or not block_type:
+            return None
+        children.append({"locator": locator, "type": block_type, "order": index})
+    if len({child["locator"] for child in children}) != len(children):
+        return None
+    return {"direct_child_count": len(children), "children": children}
+
+
+def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str], set[str]]:
+    expected: dict[str, dict[str, Any]] = {}
+    missing: set[str] = set()
+    ambiguous: set[str] = set()
+    for entry in operation.get("galleries", []):
+        if not isinstance(entry, dict):
+            continue
+        locator = safe_locator(entry.get("vertical_locator"))
+        if not locator:
+            continue
+        integrity = entry.get("vertical_integrity") if isinstance(entry.get("vertical_integrity"), dict) else {}
+        snapshot_value = integrity.get("expected") if "expected" in integrity else integrity.get("after")
+        snapshot = normalize_child_snapshot(snapshot_value)
+        if snapshot is None:
+            missing.add(locator)
+            continue
+        if locator in expected and expected[locator] != snapshot:
+            ambiguous.add(locator)
+        else:
+            expected[locator] = snapshot
+    return expected, missing, ambiguous
+
+
+def verify_final_course_structure(
+    client: StudioClient,
+    *,
+    studio_base: str,
+    course_key: str,
+    studio_url: str,
+    operation: dict[str, Any],
+) -> dict[str, Any]:
+    payload, diagnostic = read_json_call(
+        client,
+        "verify_final_course_structure",
+        "GET",
+        f"{studio_base}/course/{course_key}",
+        params={"format": "concise"},
+        referer=studio_url,
+    )
+    if diagnostic and diagnostic.get("status") != "ok":
+        summary = safe_summary_text(diagnostic.get("error_summary") or "Final Studio course structure could not be read")
+        result = {
+            "status": "unverified",
+            "issue_count": 0,
+            "unverified_count": 1,
+            "subsection_count": 0,
+            "verified_count": 0,
+            "subsections": [],
+            "failed_step": "verify_final_course_structure",
+            "error_summary": summary,
+        }
+        if isinstance(diagnostic.get("http_status"), int):
+            result["http_status"] = diagnostic["http_status"]
+        return result
+
+    try:
+        structure = publisher.normalize_course_structure_payload(payload)
+        records = publisher.iter_section_vertical_records(structure) if isinstance(structure.get("chapters"), list) else []
+    except Exception:
+        records = []
+    if not records:
+        return {
+            "status": "unverified",
+            "issue_count": 0,
+            "unverified_count": 1,
+            "subsection_count": 0,
+            "verified_count": 0,
+            "subsections": [],
+            "failed_step": "verify_final_course_structure",
+            "error_summary": "Final Studio course structure contained no verifiable subsections",
+        }
+
+    expected_by_vertical, missing_expectations, ambiguous_expectations = expected_vertical_snapshots(operation)
+    subsection_results = []
+    issue_count = 0
+    unverified_count = 0
+    observed_verticals = set()
+    for record in records:
+        section = record.get("section") if isinstance(record.get("section"), dict) else {}
+        vertical = record.get("vertical") if isinstance(record.get("vertical"), dict) else {}
+        locator = safe_locator(vertical.get("block_location"))
+        if locator:
+            observed_verticals.add(locator)
+        observed = observed_child_snapshot(vertical)
+        issues = []
+        unverified_reasons = []
+        expected = expected_by_vertical.get(locator)
+
+        if not locator:
+            unverified_reasons.append("vertical_locator_missing")
+        if observed is None:
+            structure_status = "unverified"
+            unverified_reasons.append("observed_structure_invalid")
+        elif locator in ambiguous_expectations:
+            structure_status = "unverified"
+            unverified_reasons.append("expected_structure_ambiguous")
+        elif locator in missing_expectations:
+            structure_status = "unverified"
+            unverified_reasons.append("expected_structure_missing")
+        elif expected is not None and observed != expected:
+            structure_status = "issue"
+            issues.append("structure_mismatch")
+        elif expected is not None:
+            structure_status = "verified"
+        else:
+            structure_status = "observed"
+
+        published_value = vertical.get("published")
+        published = published_value if isinstance(published_value, bool) else None
+        if published is False:
+            issues.append("published_false")
+        elif published is None:
+            unverified_reasons.append("published_state_missing")
+
+        if issues:
+            status = "issue"
+        elif unverified_reasons:
+            status = "unverified"
+        else:
+            status = "verified"
+        issue_count += len(issues)
+        unverified_count += len(unverified_reasons)
+        subsection = {
+            "section_title": str(section.get("name", "")),
+            "section_locator": safe_locator(section.get("block_location")),
+            "vertical_title": str(vertical.get("name", "")),
+            "vertical_locator": locator,
+            "studio_url": publisher.build_container_block_url(studio_base, locator) if locator else "",
+            "status": status,
+            "structure_status": structure_status,
+            "expected": expected,
+            "observed": observed,
+            "published": published,
+            "issues": issues,
+            "unverified_reasons": unverified_reasons,
+        }
+        subsection_results.append(subsection)
+
+    for locator in sorted((set(expected_by_vertical) | missing_expectations | ambiguous_expectations) - observed_verticals):
+        subsection_results.append({
+            "section_title": "",
+            "section_locator": "",
+            "vertical_title": "",
+            "vertical_locator": locator,
+            "studio_url": publisher.build_container_block_url(studio_base, locator),
+            "status": "issue",
+            "structure_status": "issue",
+            "expected": expected_by_vertical.get(locator),
+            "observed": None,
+            "published": None,
+            "issues": ["target_vertical_missing"],
+            "unverified_reasons": [],
+        })
+        issue_count += 1
+
+    verified_count = sum(item["status"] == "verified" for item in subsection_results)
+    if issue_count:
+        status = "incomplete"
+    elif unverified_count:
+        status = "unverified"
+    else:
+        status = "verified"
+    return {
+        "status": status,
+        "issue_count": issue_count,
+        "unverified_count": unverified_count,
+        "subsection_count": len(subsection_results),
+        "verified_count": verified_count,
+        "subsections": subsection_results,
+    }
+
+
 def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
     entries = operation["galleries"]
     all_verified = bool(entries)
     results = []
+    gallery_issue_count = 0
+    gallery_unverified_count = 0
     for entry in entries:
         validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
         vertical_ok = initial_vertical_published(entry)
@@ -852,6 +1072,10 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
             vertical_ok = vertical_ok and repair_attempts == 1 and isinstance(vertical, dict) and vertical.get("status") == "completed"
         gallery_ok = validation.get("status") == "verified" and vertical_ok
         all_verified = all_verified and gallery_ok
+        if validation.get("status") in {"mismatch", "failed"} or (validation.get("status") == "verified" and not vertical_ok):
+            gallery_issue_count += 1
+        elif validation.get("status") != "verified":
+            gallery_unverified_count += 1
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
         item = {
             "gallery_key": entry.get("gallery_key", ""),
@@ -896,16 +1120,44 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
                 item["http_status"] = latest_repair["http_status"]
             if "error_summary" not in item and isinstance(latest_repair.get("error_summary"), str):
                 item["error_summary"] = latest_repair["error_summary"]
+        integrity = entry.get("vertical_integrity") if isinstance(entry.get("vertical_integrity"), dict) else {}
+        if integrity:
+            vertical = next((
+                subsection for subsection in (operation.get("course_structure_verification") or {}).get("subsections", [])
+                if isinstance(subsection, dict) and subsection.get("vertical_locator") == safe_locator(entry.get("vertical_locator"))
+            ), None)
+            item["vertical_integrity"] = {
+                "status": vertical.get("structure_status", "unverified") if isinstance(vertical, dict) else "unverified",
+                "published": vertical.get("published") if isinstance(vertical, dict) else None,
+                "before": integrity.get("before"),
+                "expected": integrity.get("expected"),
+                "observed": vertical.get("observed") if isinstance(vertical, dict) else None,
+            }
         item["asset_ids"] = [value for value in (entry.get("publish") or {}).get("asset_ids", []) if isinstance(value, str)] if isinstance(entry.get("publish"), dict) else []
         results.append(item)
-    return {
+
+    course_check = operation.get("course_structure_verification")
+    if not isinstance(course_check, dict):
+        course_check = {"status": "unverified", "issue_count": 0, "unverified_count": 1, "subsection_count": 0, "verified_count": 0, "subsections": []}
+    course_issues = course_check.get("issue_count", 0) if isinstance(course_check.get("issue_count"), int) else 0
+    course_unverified = course_check.get("unverified_count", 0) if isinstance(course_check.get("unverified_count"), int) else 1
+    all_verified = all_verified and course_check.get("status") == "verified" and course_issues == 0 and course_unverified == 0
+    result = {
         "status": "verified" if all_verified else "incomplete",
         "all_sections_verified": all_verified,
         "gallery_count": len(results),
         "verified_count": sum(item["status"] == "verified" for item in results),
+        "issue_count": gallery_issue_count + course_issues,
+        "unverified_count": gallery_unverified_count + course_unverified,
+        "course_structure_verification": course_check,
         "galleries": results,
         "completed_at": utc_now(),
     }
+    existing_result = operation.get("batch_result") if isinstance(operation.get("batch_result"), dict) else {}
+    skill_provenance = operation.get("skill_provenance", existing_result.get("skill_provenance"))
+    if isinstance(skill_provenance, dict):
+        result["skill_provenance"] = copy.deepcopy(skill_provenance)
+    return result
 
 
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
@@ -1007,6 +1259,14 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 entry["validation"]["repair_status"] = "failed"
             store()
 
+    operation["course_structure_verification"] = verify_final_course_structure(
+        client,
+        studio_base=studio_base,
+        course_key=course_key,
+        studio_url=args.studio_url,
+        operation=operation,
+    )
+    store()
     operation["batch_result"] = summarize_batch(operation)
     store()
     return operation["batch_result"]
