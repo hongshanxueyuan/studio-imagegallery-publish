@@ -884,10 +884,11 @@ def observed_child_snapshot(vertical: dict[str, Any]) -> dict[str, Any] | None:
     return {"direct_child_count": len(children), "children": children}
 
 
-def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str], set[str]]:
+def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str], set[str], set[str]]:
     expected: dict[str, dict[str, Any]] = {}
     missing: set[str] = set()
     ambiguous: set[str] = set()
+    unresolved: set[str] = set()
     for entry in operation.get("galleries", []):
         if not isinstance(entry, dict):
             continue
@@ -895,6 +896,8 @@ def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, di
         if not locator:
             continue
         integrity = entry.get("vertical_integrity") if isinstance(entry.get("vertical_integrity"), dict) else {}
+        if integrity.get("status") in {"unresolved", "failed", "blocked"}:
+            unresolved.add(locator)
         snapshot_value = integrity.get("expected") if "expected" in integrity else integrity.get("after")
         snapshot = normalize_child_snapshot(snapshot_value)
         if snapshot is None:
@@ -904,7 +907,7 @@ def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, di
             ambiguous.add(locator)
         else:
             expected[locator] = snapshot
-    return expected, missing, ambiguous
+    return expected, missing, ambiguous, unresolved
 
 
 def verify_final_course_structure(
@@ -956,7 +959,7 @@ def verify_final_course_structure(
             "error_summary": "Final Studio course structure contained no verifiable subsections",
         }
 
-    expected_by_vertical, missing_expectations, ambiguous_expectations = expected_vertical_snapshots(operation)
+    expected_by_vertical, missing_expectations, ambiguous_expectations, unresolved_operations = expected_vertical_snapshots(operation)
     subsection_results = []
     issue_count = 0
     unverified_count = 0
@@ -972,6 +975,8 @@ def verify_final_course_structure(
         unverified_reasons = []
         expected = expected_by_vertical.get(locator)
 
+        if locator in unresolved_operations:
+            issues.append("publisher_vertical_integrity_unresolved")
         if not locator:
             unverified_reasons.append("vertical_locator_missing")
         if observed is None:
@@ -1022,7 +1027,10 @@ def verify_final_course_structure(
         }
         subsection_results.append(subsection)
 
-    for locator in sorted((set(expected_by_vertical) | missing_expectations | ambiguous_expectations) - observed_verticals):
+    for locator in sorted((set(expected_by_vertical) | missing_expectations | ambiguous_expectations | unresolved_operations) - observed_verticals):
+        issues = ["target_vertical_missing"]
+        if locator in unresolved_operations:
+            issues.append("publisher_vertical_integrity_unresolved")
         subsection_results.append({
             "section_title": "",
             "section_locator": "",
@@ -1034,10 +1042,10 @@ def verify_final_course_structure(
             "expected": expected_by_vertical.get(locator),
             "observed": None,
             "published": None,
-            "issues": ["target_vertical_missing"],
+            "issues": issues,
             "unverified_reasons": [],
         })
-        issue_count += 1
+        issue_count += len(issues)
 
     verified_count = sum(item["status"] == "verified" for item in subsection_results)
     if issue_count:
