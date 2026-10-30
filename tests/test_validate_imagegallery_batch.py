@@ -274,6 +274,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             operation_path = root / "batch-operation.json"
             operation = self._operation(manifest)
             operation["skill_provenance"] = {"commit": "fixture-commit", "installation_path": "fixture-skill"}
+            operation["provenance"] = {"repository_commit": "fallback-commit"}
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a", "display_name": "renamed-a.png"}, {"id": "asset-b", "display_name": "renamed-b.png"}],
@@ -290,6 +291,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual(operation["skill_provenance"], state["skill_provenance"])
             self.assertEqual(operation["skill_provenance"], state["batch_result"]["skill_provenance"])
+            self.assertEqual(operation["provenance"], state["batch_result"]["provenance"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
             gallery = state["galleries"][0]
             self.assertEqual("verified", gallery["validation"]["status"])

@@ -1157,6 +1157,9 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
     skill_provenance = operation.get("skill_provenance", existing_result.get("skill_provenance"))
     if isinstance(skill_provenance, dict):
         result["skill_provenance"] = copy.deepcopy(skill_provenance)
+    provenance = operation.get("provenance", existing_result.get("provenance"))
+    if isinstance(provenance, dict):
+        result["provenance"] = copy.deepcopy(provenance)
     return result
 
 
