@@ -256,6 +256,9 @@ def skill_provenance(*, input_paths: list[str] | None = None, output_path: str =
         except (OSError, subprocess.SubprocessError):
             pass
     content_files = [skill_path / "SKILL.md", script_path]
+    validator_path = script_path.parent / "validate_imagegallery_batch.py"
+    if validator_path.is_file():
+        content_files.append(validator_path)
     try:
         relevant_paths = [str(path.relative_to(skill_path)) for path in content_files]
         status = subprocess.run(
@@ -363,6 +366,21 @@ def summarize_steps(steps: list[dict[str, Any]]) -> dict[str, list[str]]:
             if step.get("status") == "skipped"
         ],
     }
+
+
+def failed_target_steps(steps: Any, *, failed_step: str = "", reason: str = "") -> list[dict[str, Any]]:
+    records = [step for step in steps if isinstance(step, dict)] if isinstance(steps, list) else []
+    safe_failure_step = safe_step_name(failed_step) if failed_step else "target_preflight"
+    if not any(safe_step_name(step.get("step")) == safe_failure_step for step in records):
+        records.append({"step": safe_failure_step, "status": "failed", "reason": reason})
+    if not any(safe_step_name(step.get("step")) == "publish_vertical" for step in records):
+        publish_status = "failed" if safe_failure_step == "publish_vertical" else "skipped"
+        records.append({
+            "step": "publish_vertical",
+            "status": publish_status,
+            "reason": reason or "target failed before vertical publication",
+        })
+    return records
 
 
 def resolve_source_block_type(
@@ -3404,7 +3422,7 @@ def apply_in_place_publish_actions(
     return result
 
 
-def process_publish_target(
+def _process_publish_target_impl(
     target: dict[str, Any],
     course_structure: dict[str, Any],
     args: argparse.Namespace,
@@ -3933,6 +3951,40 @@ def process_publish_target(
         return failed
 
 
+def process_publish_target(
+    target: dict[str, Any],
+    course_structure: dict[str, Any],
+    args: argparse.Namespace,
+    adapter: dict[str, Any],
+    *,
+    previous_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        result = _process_publish_target_impl(
+            target,
+            course_structure,
+            args,
+            adapter,
+            previous_result=previous_result,
+        )
+    except Exception as exc:
+        failed_step = safe_step_name(getattr(exc, "step_name", getattr(exc, "step", "target_preflight")))
+        exc.steps = failed_target_steps(
+            getattr(exc, "steps", []),
+            failed_step=failed_step,
+            reason=safe_error_summary(exc),
+        )
+        raise
+    if result.get("status") == "failed":
+        result["steps"] = failed_target_steps(
+            result.get("steps", []),
+            failed_step=str(result.get("failed_step", "target_preflight")),
+            reason=str(result.get("note", "") or "target failed before vertical publication"),
+        )
+        result.update(summarize_steps(result["steps"]))
+    return result
+
+
 def run_in_place_publish(args: argparse.Namespace) -> dict[str, Any]:
     if bool(getattr(args, "cleanup_only", False)):
         return unsupported_cleanup_only_result(
@@ -4133,6 +4185,11 @@ def run_batch_publish(
         try:
             result = run_target(target, course_structure, args, adapter, previous_result=previous_result)
         except PublishFailure as exc:
+            failure_steps = failed_target_steps(
+                getattr(exc, "steps", []),
+                failed_step=exc.step_name,
+                reason=safe_error_summary(exc),
+            )
             result = {
                 "status": "failed",
                 "failed_step": exc.step_name,
@@ -4140,15 +4197,25 @@ def run_batch_publish(
                 "requires_manual_followup": True,
                 "note": safe_error_summary(exc),
                 "target_vertical_url": str(target.get("studio_vertical_url", "")),
+                "steps": failure_steps,
+                **summarize_steps(failure_steps),
             }
         except Exception as exc:
+            failed_step = safe_step_name(getattr(exc, "step_name", "unexpected_error"))
+            failure_steps = failed_target_steps(
+                getattr(exc, "steps", []),
+                failed_step=failed_step,
+                reason=safe_error_summary(exc),
+            )
             result = {
                 "status": "failed",
-                "failed_step": getattr(exc, "step_name", "unexpected_error"),
+                "failed_step": failed_step,
                 "failure_bucket": "manual_followup",
                 "requires_manual_followup": True,
                 "note": safe_error_summary(exc),
                 "target_vertical_url": str(target.get("studio_vertical_url", "")),
+                "steps": failure_steps,
+                **summarize_steps(failure_steps),
             }
 
         result.setdefault("status", "failed")

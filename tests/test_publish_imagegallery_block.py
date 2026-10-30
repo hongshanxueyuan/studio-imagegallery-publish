@@ -726,6 +726,40 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertNotEqual(clean_provenance["content_sha256"], dirty_provenance["content_sha256"])
         self.assertEqual(section_list_hash, dirty_provenance["inputs"][0]["sha256"])
 
+    def test_skill_provenance_includes_dirty_validator_in_digest_and_commit_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_root = Path(tmp) / "publisher-skill"
+            script_path = skill_root / "scripts" / "publish_imagegallery_block.py"
+            validator_path = skill_root / "scripts" / "validate_imagegallery_batch.py"
+            script_path.parent.mkdir(parents=True)
+            script_path.write_text("# active publisher", encoding="utf-8")
+            validator_path.write_text("# active validator", encoding="utf-8")
+            (skill_root / "SKILL.md").write_text("name: publisher-skill", encoding="utf-8")
+            subprocess.run(["git", "-C", str(skill_root), "init"], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(skill_root), "config", "user.name", "Publisher Test"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "config", "user.email", "publisher-test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "add", "SKILL.md", "scripts/publish_imagegallery_block.py", "scripts/validate_imagegallery_batch.py"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "commit", "-m", "fixture"], check=True, capture_output=True, text=True)
+            head = subprocess.run(
+                ["git", "-C", str(skill_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            with patch.object(module, "__file__", str(script_path)):
+                clean_provenance = module.skill_provenance()
+                validator_path.write_text("# modified validator", encoding="utf-8")
+                dirty_provenance = module.skill_provenance()
+
+        self.assertEqual("clean", clean_provenance["working_tree_state"])
+        self.assertEqual(head, clean_provenance["commit"])
+        self.assertEqual(head, clean_provenance["base_commit"])
+        self.assertEqual("dirty", dirty_provenance["working_tree_state"])
+        self.assertEqual("unknown", dirty_provenance["commit"])
+        self.assertEqual(head, dirty_provenance["base_commit"])
+        self.assertNotEqual(clean_provenance["content_sha256"], dirty_provenance["content_sha256"])
+
     def test_skill_provenance_marks_copied_skill_metadata_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             skill_root = Path(tmp) / "installed-skill"
@@ -1021,6 +1055,114 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
         self.assertEqual("failed", result["status"])
         self.assertEqual("resolve_source_block_type", result["failed_step"])
+
+    def test_batch_report_marks_preflight_failures_as_skipped_publish_vertical(self) -> None:
+        cases = {
+            "missing_type": "resolve_source_block_type",
+            "conflicting_type": "resolve_source_block_type",
+            "missing_gallery": "resolve_replacement_target",
+            "ambiguous_gallery": "resolve_replacement_target",
+            "live_read_unavailable": "load_live_target_structure",
+            "missing_target_vertical": "target_vertical",
+            "missing_studio_url": "target_vertical",
+            "missing_manifest": "resolve_source_block_type",
+        }
+        target_vertical = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+        for scenario, expected_failure in cases.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest_path = self._write_manifest_bundle(root)
+                if scenario == "missing_type":
+                    source_type = None
+                    target_type = ""
+                    include_gallery = False
+                    include_target_html = True
+                    execute = False
+                elif scenario == "conflicting_type":
+                    source_type = "html"
+                    target_type = "imagesgallery"
+                    include_gallery = False
+                    include_target_html = True
+                    execute = False
+                elif scenario in {"missing_gallery", "ambiguous_gallery"}:
+                    source_type = "imagesgallery"
+                    target_type = "imagesgallery"
+                    include_gallery = scenario == "ambiguous_gallery"
+                    include_target_html = False
+                    execute = False
+                else:
+                    source_type = "html"
+                    target_type = "html"
+                    include_gallery = False
+                    include_target_html = True
+                    execute = True
+                if scenario != "missing_manifest":
+                    self._mark_manifest_source(manifest_path, block_type=source_type)
+                course = self._make_course_structure(
+                    include_gallery=include_gallery,
+                    include_target_html=include_target_html,
+                    include_section_html=False,
+                )
+                if scenario == "ambiguous_gallery":
+                    course["chapters"][0]["sections"][0]["verticals"][0]["blocks"].append({
+                        "name": "第二个 Gallery",
+                        "category": "imagesgallery",
+                        "block_location": "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@secondgallery",
+                    })
+                course_path = root / "course.json"
+                course_path.write_text(json.dumps(course, ensure_ascii=False), encoding="utf-8")
+                targets_path = root / "targets.json"
+                target_manifest = root / "missing-manifest.json" if scenario == "missing_manifest" else manifest_path
+                target_vertical_id = "" if scenario == "missing_target_vertical" else target_vertical
+                target_vertical_url = (
+                    "" if scenario == "missing_studio_url"
+                    else f"https://studio.example.com/container/{target_vertical}"
+                )
+                targets_path.write_text(json.dumps({
+                    "course_structure_json": str(course_path),
+                    "targets": [{
+                        "name": "1.1",
+                        "manifest": str(target_manifest),
+                        "block_type": target_type,
+                        "target_vertical_block_location": target_vertical_id,
+                        "source_vertical_block_location": target_vertical,
+                        "studio_vertical_url": target_vertical_url,
+                    }],
+                }, ensure_ascii=False), encoding="utf-8")
+                report_path = root / "report.json"
+                args = argparse.Namespace(
+                    targets_file=str(targets_path),
+                    report_file=str(report_path),
+                    course_structure_json="",
+                    section_list_json="",
+                    adapter=str(ADAPTER_PATH),
+                    execute=execute,
+                    cleanup_only=False,
+                    timeout=30,
+                    cookie="csrftoken=fake",
+                    csrf_token="",
+                    account="",
+                    password="",
+                    courses_base="",
+                )
+                if scenario == "live_read_unavailable":
+                    live_failure = {
+                        "step": "load_live_target_structure",
+                        "status": "warning",
+                        "note": "live target unavailable",
+                    }
+                    with patch.object(module, "maybe_fetch_live_replacement_plan", return_value=(None, live_failure)):
+                        module.run_batch_publish(args)
+                else:
+                    module.run_batch_publish(args)
+
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                result = report["results"][0]
+                self.assertEqual(expected_failure, result["failed_step"])
+                publish_step = next(
+                    step for step in result["steps"] if step.get("step") == "publish_vertical"
+                )
+                self.assertEqual("skipped", publish_step["status"])
 
     def test_process_target_with_standalone_summary_page_stops_before_gallery_create(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

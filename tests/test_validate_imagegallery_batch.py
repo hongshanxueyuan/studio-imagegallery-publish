@@ -267,6 +267,18 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
     def _write_operation_file(self, path, operation):
         path.write_text(json.dumps(operation, ensure_ascii=False), encoding="utf-8")
 
+    def test_observed_child_snapshot_rejects_missing_malformed_and_duplicate_children(self):
+        locator = "block-v1:ORG+COURSE+RUN+type@html+block@body"
+        self.assertIsNone(module.observed_child_snapshot({}))
+        self.assertIsNone(module.observed_child_snapshot({"blocks": [{"category": "html"}]}))
+        self.assertIsNone(module.observed_child_snapshot({"blocks": [{"block_location": locator}]}))
+        self.assertIsNone(module.observed_child_snapshot({
+            "blocks": [
+                {"block_location": locator, "category": "html"},
+                {"block_location": locator, "category": "html"},
+            ],
+        }))
+
     def test_cli_verifies_counts_without_comparing_server_file_names_or_scanning_course_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -326,6 +338,38 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(False, untargeted["published"])
             self.assertIn("published_false", untargeted["issues"])
             self.assertEqual(1, course_check["issue_count"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+
+    def test_final_course_check_marks_published_untargeted_structure_unverified_without_expectation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }}, vertical_overrides={VERTICAL_2: {
+                "blocks": [{
+                    "id": "block-v1:ORG+COURSE+RUN+type@html+block@untargeted",
+                    "category": "html",
+                }],
+                "published": True,
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            untargeted = next(
+                item
+                for item in state["course_structure_verification"]["subsections"]
+                if item["vertical_locator"] == VERTICAL_2
+            )
+            self.assertEqual("unverified", untargeted["status"])
+            self.assertEqual("unverified", untargeted["structure_status"])
+            self.assertIn("expected_structure_missing", untargeted["unverified_reasons"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
 
     def test_final_course_check_marks_missing_published_state_unverified(self):
@@ -600,13 +644,16 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
-            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(1, exit_code, stdout + stderr)
             deleted_paths = [call["path"] for call in studio.calls if call["method"] == "DELETE"]
             self.assertEqual([f"/assets/{COURSE_KEY}/asset-orphan"], deleted_paths)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             cleanup = state["galleries"][0]["repair_history"][0]["asset_cleanup"]
             self.assertIn("asset-shared", cleanup["retained_asset_ids"])
             self.assertIn("asset-orphan", cleanup["deleted_asset_ids"])
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("unverified", state["course_structure_verification"]["status"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
             delete_index = next(i for i, call in enumerate(studio.calls) if call["method"] == "DELETE")
             peer_reference_index = max(i for i, call in enumerate(studio.calls[:delete_index]) if call["path"].endswith(f"/preview/xblock/{GALLERY_2}/handler/get_files"))
             self.assertLess(peer_reference_index, delete_index)
