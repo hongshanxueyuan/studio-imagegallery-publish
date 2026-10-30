@@ -1698,7 +1698,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
                 os.replace(temp_path, path)
                 break
             except PermissionError:
-                if os.name != "nt" or attempt >= ATOMIC_WRITE_REPLACE_RETRIES:
+                if attempt >= ATOMIC_WRITE_REPLACE_RETRIES:
                     raise
                 time.sleep(ATOMIC_WRITE_REPLACE_RETRY_DELAY_SECONDS)
     finally:
