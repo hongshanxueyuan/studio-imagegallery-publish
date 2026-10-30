@@ -870,18 +870,14 @@ def observed_child_snapshot(vertical: dict[str, Any]) -> dict[str, Any] | None:
     blocks = vertical.get("blocks")
     if not isinstance(blocks, list):
         return None
-    children = []
-    for index, block in enumerate(blocks, start=1):
-        if not isinstance(block, dict):
-            return None
-        locator = safe_locator(block.get("block_location"))
-        block_type = publisher.block_category(block)
-        if not locator or not block_type:
-            return None
-        children.append({"locator": locator, "type": block_type, "order": index})
-    if len({child["locator"] for child in children}) != len(children):
+    if any(
+        not isinstance(block, dict)
+        or not safe_locator(publisher.block_locator(block))
+        or not publisher.block_category(block)
+        for block in blocks
+    ):
         return None
-    return {"direct_child_count": len(children), "children": children}
+    return normalize_child_snapshot(publisher.vertical_child_snapshot(vertical))
 
 
 def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str], set[str], set[str]]:
@@ -994,7 +990,8 @@ def verify_final_course_structure(
         elif expected is not None:
             structure_status = "verified"
         else:
-            structure_status = "observed"
+            structure_status = "unverified"
+            unverified_reasons.append("expected_structure_missing")
 
         published_value = vertical.get("published")
         published = published_value if isinstance(published_value, bool) else None
