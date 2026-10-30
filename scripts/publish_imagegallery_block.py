@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import mimetypes
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from json import JSONDecodeError
 from html.parser import HTMLParser
 from pathlib import Path
@@ -117,6 +119,26 @@ def is_summary_html_block(block: dict[str, Any]) -> bool:
     return False
 
 
+def manifest_summary_leaks(manifest: dict[str, Any]) -> list[int]:
+    leaked_pages: list[int] = []
+    items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        page = item.get("page", index)
+        try:
+            page_number = int(page)
+        except (TypeError, ValueError):
+            page_number = index
+        if any(
+            isinstance(item.get(field), str)
+            and first_visible_line(item[field]) == HTML_SUMMARY_HEADING
+            for field in ("subtitle", "speech", "text", "content")
+        ):
+            leaked_pages.append(page_number)
+    return leaked_pages
+
+
 def summary_html_blocks(vertical: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         block
@@ -185,6 +207,114 @@ def course_key_from_vertical_block_id(vertical_block_id: str) -> str:
     return f"course-v1:{org}+{parts[1]}+{parts[2]}"
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def skill_provenance(*, input_paths: list[str] | None = None, output_path: str = "") -> dict[str, Any]:
+    script_path = Path(__file__).resolve()
+    skill_path = script_path.parent.parent
+    provenance: dict[str, Any] = {
+        "active_skill_path": str(skill_path),
+        "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "installed_at": "unknown",
+        "repository": "unknown",
+        "ref": "unknown",
+        "commit": "unknown",
+        "base_commit": "unknown",
+        "working_tree_state": "unknown",
+        "content_sha256": "unknown",
+        "inputs": [],
+        "output": {"path": output_path or "unknown", "identity": Path(output_path).name if output_path else "unknown"},
+    }
+    for git_args, field in ((["rev-parse", "--show-toplevel"], "repository_root"), (["rev-parse", "--verify", "HEAD"], "base_commit"), (["branch", "--show-current"], "ref"), (["config", "--get", "remote.origin.url"], "repository")):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(skill_path), *git_args],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            value = result.stdout.strip()
+            if result.returncode == 0 and value:
+                if field == "repository":
+                    parsed = urlsplit(value)
+                    if parsed.scheme in {"http", "https", "ssh"} and parsed.hostname and not parsed.password:
+                        value = urlunsplit((parsed.scheme, parsed.hostname + (f":{parsed.port}" if parsed.port else ""), parsed.path, "", ""))
+                    elif value.startswith("git@") and " " not in value:
+                        value = value
+                    else:
+                        value = "unknown"
+                provenance[field] = value
+        except (OSError, subprocess.SubprocessError):
+            pass
+    content_files = [skill_path / "SKILL.md", script_path]
+    try:
+        relevant_paths = [str(path.relative_to(skill_path)) for path in content_files]
+        status = subprocess.run(
+            ["git", "-C", str(skill_path), "status", "--short", "--untracked-files=all", "--", *relevant_paths],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if status.returncode == 0:
+            source_is_dirty = bool(status.stdout.strip())
+            provenance["working_tree_state"] = "dirty" if source_is_dirty else "clean"
+            provenance["commit"] = "unknown" if source_is_dirty else provenance["base_commit"]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    content_digest = hashlib.sha256()
+    found_content = False
+    for path in content_files:
+        if path.is_file():
+            found_content = True
+            content_digest.update(path.name.encode("utf-8"))
+            content_digest.update(path.read_bytes())
+    if found_content:
+        provenance["content_sha256"] = content_digest.hexdigest()
+    inputs = []
+    for raw_path in input_paths or []:
+        path = Path(raw_path).expanduser()
+        identity: dict[str, str] = {"path": str(path), "name": path.name or "unknown", "sha256": "unknown"}
+        if path.is_file():
+            try:
+                identity["sha256"] = file_sha256(path)
+            except OSError:
+                pass
+        inputs.append(identity)
+    provenance["inputs"] = inputs
+    return provenance
+
+
+def section_list_provenance_input(manifest_path: str, explicit_path: str = "") -> str:
+    if explicit_path:
+        return str(Path(explicit_path).expanduser().resolve())
+    if not manifest_path:
+        return ""
+    candidate = Path(manifest_path).expanduser().resolve().parent / "section-list.json"
+    return str(candidate) if candidate.is_file() else ""
+
+
+def unique_provenance_inputs(paths: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in paths:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        resolved = str(Path(raw).expanduser().resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -220,11 +350,15 @@ def summarize_steps(steps: list[dict[str, Any]]) -> dict[str, list[str]]:
     return {
         "completed_steps": [
             step.get("step", "") for step in steps
-            if step.get("status") not in {"failed", "warning"}
+            if step.get("status") in {"ok", "completed", "reconciled", "retried", "deleted", "already_missing"}
         ],
         "failed_steps": [
             step.get("step", "") for step in steps
-            if step.get("status") == "failed"
+            if step.get("status") in {"failed", "blocked"}
+        ],
+        "skipped_steps": [
+            step.get("step", "") for step in steps
+            if step.get("status") == "skipped"
         ],
     }
 
@@ -247,51 +381,56 @@ def resolve_source_block_type(
         return {"status": "conflict", "block_type": "", "reason": "manifest and publish target have conflicting section_id values"}
     if manifest_title and target_title and manifest_title != target_title:
         return {"status": "conflict", "block_type": "", "reason": "manifest and publish target have conflicting section titles"}
-    if manifest_type and target_type and manifest_type != target_type:
-        return {"status": "conflict", "block_type": "", "reason": "manifest and publish target have conflicting block_type values"}
-
-    if manifest_type:
-        return {"status": "resolved", "block_type": manifest_type, "reason": "source type read from gallery manifest"}
+    local_types = [
+        ("gallery manifest", manifest_type),
+        ("publish target", target_type),
+    ]
+    provided_types = [(source, block_type) for source, block_type in local_types if block_type]
+    if len({block_type for _source, block_type in provided_types}) > 1:
+        return {"status": "conflict", "block_type": "", "reason": "local sources have conflicting block_type values"}
 
     section_path = find_section_list_path(manifest_path, section_list_json)
-    if section_path is None:
-        if target_type:
-            return {"status": "resolved", "block_type": target_type, "reason": "source type read from publish target"}
-        return {"status": "missing", "block_type": "", "reason": "no section-list.json source metadata was found"}
-    try:
-        records = section_list_records(section_path)
-    except Exception as exc:
-        return {"status": "missing", "block_type": "", "reason": f"could not read section-list.json: {exc}"}
+    if section_path is not None:
+        try:
+            records = section_list_records(section_path)
+        except Exception:
+            return {"status": "missing", "block_type": "", "reason": "section-list.json could not be read"}
 
-    section_id = manifest_id or target_id
-    section_title = manifest_title or target_title
-    if section_id:
-        matches = [record for record in records if str(record.get("section_id", "") or "").strip() == section_id]
-        if not matches:
-            return {"status": "missing", "block_type": "", "reason": f"section-list.json has no section_id {section_id}"}
-        if len(matches) != 1:
-            return {"status": "ambiguous", "block_type": "", "reason": f"section-list.json has multiple records for section_id {section_id}"}
-    elif section_title:
-        matches = [
-            record for record in records
-            if any(
-                str(record.get(key, "") or "").strip() == section_title
-                for key in ("section_title", "title", "resource_title")
-            )
-        ]
-        if not matches:
-            return {"status": "missing", "block_type": "", "reason": f"section-list.json has no section titled {section_title}"}
-        if len(matches) != 1:
-            return {"status": "ambiguous", "block_type": "", "reason": f"section-list.json has multiple records titled {section_title}"}
-    else:
-        return {"status": "missing", "block_type": "", "reason": "section metadata has neither section_id nor title"}
+        section_id = manifest_id or target_id
+        section_title = manifest_title or target_title
+        if section_id:
+            matches = [record for record in records if str(record.get("section_id", "") or "").strip() == section_id]
+            if not matches:
+                return {"status": "missing", "block_type": "", "reason": f"section-list.json has no section_id {section_id}"}
+            if len(matches) != 1:
+                return {"status": "ambiguous", "block_type": "", "reason": f"section-list.json has multiple records for section_id {section_id}"}
+        elif section_title:
+            matches = [
+                record for record in records
+                if any(
+                    str(record.get(key, "") or "").strip() == section_title
+                    for key in ("section_title", "title", "resource_title")
+                )
+            ]
+            if not matches:
+                return {"status": "missing", "block_type": "", "reason": f"section-list.json has no section titled {section_title}"}
+            if len(matches) != 1:
+                return {"status": "ambiguous", "block_type": "", "reason": f"section-list.json has multiple records titled {section_title}"}
+        else:
+            return {"status": "missing", "block_type": "", "reason": "section metadata has neither section_id nor title"}
 
-    source_type = str(matches[0].get("block_type", "") or "").strip().lower()
-    if not source_type:
-        return {"status": "missing", "block_type": "", "reason": "matched section-list.json record has no block_type"}
-    if target_type and target_type != source_type:
-        return {"status": "conflict", "block_type": "", "reason": "publish target and section-list.json have conflicting block_type values"}
-    return {"status": "resolved", "block_type": source_type, "reason": f"source type read from {section_path.name}"}
+        section_type = str(matches[0].get("block_type", "") or "").strip().lower()
+        if section_type:
+            provided_types.append(("section-list.json", section_type))
+
+    if len({block_type for _source, block_type in provided_types}) > 1:
+        return {"status": "conflict", "block_type": "", "reason": "local sources have conflicting block_type values"}
+    if not provided_types:
+        return {"status": "missing", "block_type": "", "reason": "no local block_type value is available"}
+    resolved_type = provided_types[0][1]
+    if resolved_type not in {"html", "imagesgallery"}:
+        return {"status": "unsupported", "block_type": "", "reason": f"unsupported local block_type: {resolved_type}"}
+    return {"status": "resolved", "block_type": resolved_type, "reason": f"local block_type sources agree ({len(provided_types)} source(s))"}
 
 
 def read_json_with_diagnostics(path: Path, *, step_name: str) -> Any:
@@ -596,13 +735,156 @@ def pick_existing_gallery(
     ]
     if not galleries:
         return None
-    return max(
-        galleries,
-        key=lambda block: (
-            1 if "有声幻灯片" in str(block.get("name", "")) else 0,
-            len(str(block.get("name", ""))),
+    return galleries[0] if len(galleries) == 1 else None
+
+
+def pick_lesson_html_candidate(
+    vertical: dict[str, Any],
+    *,
+    excluded_block_locators: set[str] | None = None,
+) -> dict[str, Any] | None:
+    excluded = excluded_block_locators or set()
+    return next(
+        (
+            block for block in vertical.get("blocks", [])
+            if isinstance(block, dict)
+            and block_category(block) == "html"
+            and block_locator(block)
+            and block_locator(block) not in excluded
+            and str(block.get("name", "")).strip() == "文字讲解"
         ),
+        None,
     )
+
+
+def vertical_child_snapshot(
+    vertical: dict[str, Any],
+    *,
+    source_vertical_block_id: str = "",
+    target_vertical_block_id: str = "",
+) -> dict[str, Any]:
+    children = []
+    for index, block in enumerate(vertical.get("blocks", []), start=1):
+        if not isinstance(block, dict):
+            continue
+        locator = block_locator(block)
+        if source_vertical_block_id and target_vertical_block_id:
+            locator = remap_block_locator_course(locator, source_vertical_block_id, target_vertical_block_id)
+        children.append({"locator": locator, "type": block_category(block), "order": index})
+    return {"direct_child_count": len(children), "children": children}
+
+
+def vertical_snapshot_for_course(
+    course_structure: dict[str, Any],
+    vertical_locator: str,
+) -> tuple[dict[str, Any], Any]:
+    matches = [
+        record["vertical"] for record in iter_section_vertical_records(course_structure)
+        if str(record["vertical"].get("block_location", "")).strip() == vertical_locator
+    ]
+    if len(matches) != 1:
+        raise PublishFailure("verify_vertical_structure", "target vertical is missing or ambiguous in Studio course structure")
+    vertical = matches[0]
+    return vertical_child_snapshot(vertical), vertical.get("published")
+
+
+def reconcile_created_gallery_snapshot(
+    before: dict[str, Any],
+    observed: dict[str, Any],
+) -> dict[str, Any]:
+    before_children = before.get("children") if isinstance(before.get("children"), list) else []
+    observed_children = observed.get("children") if isinstance(observed.get("children"), list) else []
+    if (
+        before.get("direct_child_count") != len(before_children)
+        or observed.get("direct_child_count") != len(observed_children)
+        or any(not isinstance(child, dict) or not child.get("locator") for child in [*before_children, *observed_children])
+    ):
+        return {"status": "unverified", "reason": "vertical snapshot is incomplete"}
+
+    before_locators = [str(child["locator"]) for child in before_children]
+    observed_locators = [str(child["locator"]) for child in observed_children]
+    if len(set(before_locators)) != len(before_locators) or len(set(observed_locators)) != len(observed_locators):
+        return {"status": "ambiguous", "reason": "vertical snapshot contains duplicate component locators"}
+    if observed == before:
+        return {"status": "not_applied", "observed_snapshot": observed}
+
+    added = [child for child in observed_children if str(child["locator"]) not in set(before_locators)]
+    preserved = [child for child in observed_children if str(child["locator"]) in set(before_locators)]
+    before_identity_order = [(str(child["locator"]), str(child.get("type", "")).lower()) for child in before_children]
+    preserved_identity_order = [(str(child["locator"]), str(child.get("type", "")).lower()) for child in preserved]
+    if (
+        observed.get("direct_child_count") == before.get("direct_child_count", 0) + 1
+        and len(added) == 1
+        and str(added[0].get("type", "")).lower() == "imagesgallery"
+        and preserved_identity_order == before_identity_order
+    ):
+        return {
+            "status": "applied",
+            "block_locator": str(added[0]["locator"]),
+            "observed_snapshot": observed,
+        }
+    return {
+        "status": "ambiguous",
+        "reason": "Studio structure is not the original vertical plus exactly one Gallery",
+        "observed_snapshot": observed,
+    }
+
+
+def fetch_vertical_state(
+    session: requests.Session,
+    *,
+    studio_base: str,
+    vertical_locator: str,
+    timeout: int,
+) -> tuple[dict[str, Any], Any]:
+    course_key = course_key_from_vertical_block_id(vertical_locator)
+    if not course_key:
+        raise PublishFailure("verify_vertical_structure", "target vertical locator does not identify a course")
+    structure = fetch_live_course_structure(
+        session,
+        studio_base=studio_base,
+        course_key=course_key,
+        timeout=timeout,
+    )
+    return vertical_snapshot_for_course(structure, vertical_locator)
+
+
+def replace_snapshot_child(
+    snapshot: dict[str, Any],
+    *,
+    old_locator: str,
+    new_locator: str,
+) -> dict[str, Any]:
+    children = [dict(child) for child in snapshot.get("children", [])]
+    old_index = next((index for index, child in enumerate(children) if child.get("locator") == old_locator), None)
+    if old_index is None:
+        raise PublishFailure("replacement_validation", "replacement target is absent from the original vertical snapshot")
+    new_child = next((dict(child) for child in children if child.get("locator") == new_locator), None)
+    if new_child is None:
+        new_child = {"locator": new_locator, "type": "imagesgallery", "order": old_index + 1}
+    children = [child for child in children if child.get("locator") != new_locator]
+    old_index = next(index for index, child in enumerate(children) if child.get("locator") == old_locator)
+    children.insert(old_index, new_child)
+    for index, child in enumerate(children, start=1):
+        child["order"] = index
+    return {"direct_child_count": len(children), "children": children}
+
+
+def replacement_after_delete_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    old_locator: str,
+    new_locator: str,
+) -> dict[str, Any]:
+    children = [
+        dict(child) for child in snapshot.get("children", [])
+        if child.get("locator") != old_locator
+    ]
+    if sum(child.get("locator") == new_locator for child in children) != 1:
+        raise PublishFailure("replacement_validation", "new Gallery is missing or ambiguous after replacement")
+    for index, child in enumerate(children, start=1):
+        child["order"] = index
+    return {"direct_child_count": len(children), "children": children}
 
 
 def build_vertical_children(
@@ -624,6 +906,7 @@ def plan_publish_replacement(
     *,
     source_vertical_block_id: str,
     target_vertical_block_id: str,
+    block_type: str = "",
     excluded_block_locators: list[str] | None = None,
 ) -> dict[str, Any]:
     source_vertical_block_id = str(source_vertical_block_id or "").strip()
@@ -639,9 +922,11 @@ def plan_publish_replacement(
     if lookup_record is None:
         raise PublishFailure("course_structure_lookup", f"source vertical not found in course structure: {source_vertical_block_id or target_vertical_block_id}")
 
-    course_kind = classify_replacement_kind(
-        lookup_record,
-        excluded_block_locators=excluded,
+    source_type = str(block_type or "").strip().lower()
+    course_kind = (
+        "html_based" if source_type == "html" else
+        "imagesgallery_based" if source_type == "imagesgallery" else
+        classify_replacement_kind(lookup_record, excluded_block_locators=excluded)
     )
     target_record = lookup_record
     summary_matches = [
@@ -660,23 +945,47 @@ def plan_publish_replacement(
     working_record = target_record
     match_scope = "fallback"
     result_type = "fallback_inserted"
+    planning_issue: dict[str, str] | None = None
 
     if course_kind == "imagesgallery_based":
-        matched_block = pick_existing_gallery(
-            target_record["vertical"],
-            excluded_block_locators=excluded,
-        )
-        if matched_block is not None:
+        galleries = [
+            block for block in target_record["vertical"].get("blocks", [])
+            if isinstance(block, dict)
+            and block_category(block) == "imagesgallery"
+            and block_locator(block)
+            and block_locator(block) not in excluded
+        ]
+        matched_block = galleries[0] if len(galleries) == 1 else None
+        if source_type == "imagesgallery" and len(galleries) != 1:
+            planning_issue = {
+                "code": "ambiguous_gallery_replacement_target" if galleries else "missing_gallery_replacement_target",
+                "reason": "Gallery replacement requires exactly one existing Gallery in the target vertical",
+            }
+        elif matched_block is not None:
             match_scope = "target_vertical"
             result_type = "replaced"
+        elif not source_type:
+            matched_block = pick_existing_gallery(
+                target_record["vertical"],
+                excluded_block_locators=excluded,
+            )
+            if matched_block is not None:
+                match_scope = "target_vertical"
+                result_type = "replaced"
     else:
-        matched_block = pick_best_html_candidate(
-            target_record["vertical"],
-            excluded_block_locators=excluded_for_body,
+        matched_block = (
+            pick_lesson_html_candidate(target_record["vertical"], excluded_block_locators=excluded_for_body)
+            if source_type == "html"
+            else pick_best_html_candidate(target_record["vertical"], excluded_block_locators=excluded_for_body)
         )
         if matched_block is not None:
             match_scope = "target_vertical"
             result_type = "replaced"
+        elif source_type == "html":
+            planning_issue = {
+                "code": "missing_html_replacement_target",
+                "reason": "target vertical has no direct HTML child titled 文字讲解",
+            }
         else:
             best_section_match: tuple[tuple[int, int], dict[str, Any], dict[str, Any]] | None = None
             for vertical in target_record["section"].get("verticals", []):
@@ -728,6 +1037,13 @@ def plan_publish_replacement(
         ),
         "working_vertical_name": str(working_record["vertical"].get("name", "")),
         "current_children": current_children,
+        "initial_snapshot": vertical_child_snapshot(
+            working_record["vertical"],
+            source_vertical_block_id=source_vertical_block_id,
+            target_vertical_block_id=target_vertical_block_id,
+        ),
+        "resolved_block_type": source_type,
+        "planning_issue": planning_issue,
         "matched_source_block_locator": matched_source_block_locator,
         "matched_source_block_category": matched_source_block_category,
         "summary_cleanup_status": "preserved" if summary_matches else "not_present",
@@ -1125,6 +1441,7 @@ def maybe_fetch_live_replacement_plan(
     studio_url: str,
     source_vertical_block_id: str,
     target_vertical_block_id: str,
+    block_type: str = "",
     excluded_block_locators: list[str] | None = None,
     args: argparse.Namespace,
     timeout: int,
@@ -1158,6 +1475,7 @@ def maybe_fetch_live_replacement_plan(
                 live_structure,
                 source_vertical_block_id=source_vertical_block_id,
                 target_vertical_block_id=target_vertical_block_id,
+                block_type=block_type,
                 excluded_block_locators=excluded_block_locators,
             ),
             "live_target",
@@ -1315,6 +1633,16 @@ def safe_step_record(record: dict[str, Any], *, page_image: str = "") -> dict[st
     retry_events = record.get("auth_retry_events")
     if isinstance(retry_events, list):
         safe["auth_retry_events"] = safe_auth_retry_events(retry_events)
+    attempts = record.get("attempts")
+    if isinstance(attempts, list):
+        safe["attempts"] = [
+            {
+                key: event[key]
+                for key in ("attempt", "status", "http_status")
+                if isinstance(event, dict) and isinstance(event.get(key), (str, int))
+            }
+            for event in attempts if isinstance(event, dict)
+        ]
     return safe
 
 
@@ -1460,6 +1788,7 @@ class PublishCheckpoint:
             "steps": self._safe_steps(previous.get("steps")),
             "images_started": bool(previous.get("images_started", False)),
             "reconciliation_count": reconciliation_count,
+            "create_attempts": max(0, int(previous.get("create_attempts", 0))) if isinstance(previous.get("create_attempts", 0), int) and not isinstance(previous.get("create_attempts", 0), bool) else 0,
         }
         error_summary = previous.get("error_summary")
         if isinstance(error_summary, str) and error_summary:
@@ -1488,6 +1817,16 @@ class PublishCheckpoint:
             for key in ("http_status", "asset_id", "block_locator", "page_image", "auth_retry_attempts"):
                 if isinstance(item.get(key), (str, int)):
                     record[key] = item[key]
+            attempts = item.get("attempts")
+            if isinstance(attempts, list):
+                record["attempts"] = [
+                    {
+                        key: event[key]
+                        for key in ("attempt", "status", "http_status")
+                        if isinstance(event, dict) and isinstance(event.get(key), (str, int))
+                    }
+                    for event in attempts if isinstance(event, dict)
+                ]
             retry_events = item.get("auth_retry_events")
             if isinstance(retry_events, list):
                 record["auth_retry_events"] = safe_auth_retry_events(retry_events)
@@ -1529,6 +1868,8 @@ class PublishCheckpoint:
         self.state["active_step"] = safe_step_name(step)
         self.state.pop("error_summary", None)
         self.state["failed_step"] = ""
+        if safe_step_name(step) == "create_block":
+            self.state["create_attempts"] = int(self.state.get("create_attempts", 0)) + 1
         if page_image:
             self.state["active_page_image"] = Path(page_image.replace("\\", "/")).name
         if safe_step_name(step).startswith("upload_image["):
@@ -1971,6 +2312,8 @@ def build_publish_args_for_target(
         skip_oss_multipart=bool(getattr(base_args, "skip_oss_multipart", False)),
         auth_retry_max_retries=int(getattr(base_args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
         auth_retry_delay_seconds=float(getattr(base_args, "auth_retry_delay_seconds", DEFAULT_AUTH_RETRY_DELAY_SECONDS)),
+        operation_file=str(getattr(base_args, "operation_file", "") or ""),
+        gallery_key=str(getattr(base_args, "gallery_key", "") or ""),
     )
 
 
@@ -2103,15 +2446,10 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         ctx["audio_document_id"] = f"{ctx['edx_document_id']}.{ctx['audio_post_fix']}"
 
     logs = list(checkpoint.state["steps"]) if checkpoint else []
-    if checkpoint and checkpoint.state["active_step"] == "create_block" and not checkpoint.gallery_locator:
-        error = PublishFailure("create_block", "previous create_block result is ambiguous")
-        error.safe_summary = "The create_block result is incomplete; review Studio before retrying"
-        checkpoint.fail(error, "create_block")
-        raise error
-    if checkpoint and checkpoint.state["status"] == "failed" and checkpoint.state["failed_step"] == "create_block" and not checkpoint.gallery_locator:
-        error = PublishFailure("create_block", "previous create_block result is ambiguous")
-        error.safe_summary = "The create_block result is incomplete; review Studio before retrying"
-        raise error
+    gallery_create_attempts = max(
+        int(checkpoint.state.get("create_attempts", 0)) if checkpoint else 0,
+        int(getattr(args, "create_attempts", 0) or 0),
+    )
 
     can_refresh_auth = bool(execute and account and password and courses_base)
 
@@ -2137,6 +2475,8 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
                 delay_seconds=max(0.0, float(args.auth_retry_delay_seconds)),
             )
         except Exception as exc:
+            if not getattr(exc, "step_name", None):
+                setattr(exc, "step_name", name)
             mark_failure(exc, name, page_image=page_image)
             raise
         if execute and "status" not in record:
@@ -2168,6 +2508,11 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         diagnostics: dict[str, Any] = {
             "completed_stage": checkpoint.state["completed_stage"] if checkpoint else "",
             "asset_ids": list(ctx.get("uploaded_asset_ids", [])),
+            "created_block_locator": str(ctx.get("block_locator", "")),
+            "create_attempts": max(
+                gallery_create_attempts,
+                int(checkpoint.state.get("create_attempts", 0)) if checkpoint else 0,
+            ),
             "steps": [safe_step_record(record) for record in logs],
         }
         if page_image:
@@ -2222,7 +2567,73 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         if key not in adapter:
             raise ValueError(f"adapter missing step {key}")
 
-    if checkpoint and checkpoint.gallery_locator:
+    def query_create_reconciliation() -> dict[str, Any]:
+        callback = getattr(args, "reconcile_create_block", None)
+        if not callable(callback):
+            return {"status": "unverified", "reason": "no vertical snapshot reconciler is available"}
+        try:
+            result = callback()
+        except Exception:
+            return {"status": "unverified", "reason": "Studio vertical could not be reread after Gallery creation"}
+        return result if isinstance(result, dict) else {"status": "unverified", "reason": "Studio vertical reconciliation returned no evidence"}
+
+    def reconciled_create_record(evidence: dict[str, Any], attempts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        locator = str(evidence.get("block_locator", "") or "").strip()
+        if not locator:
+            raise PublishFailure("create_block", "Gallery create reconciliation did not identify one locator")
+        ctx["block_locator"] = locator
+        if checkpoint:
+            checkpoint.gallery_locator = locator
+            if (
+                checkpoint.state.get("active_step") == "create_block"
+                or checkpoint.state.get("failed_step") == "create_block"
+            ):
+                checkpoint.mark_started("create_block_reconciliation")
+        record = {
+            "step": "create_block",
+            "status": "reconciled",
+            "block_locator": locator,
+            "observed_snapshot": evidence.get("observed_snapshot"),
+            "attempts": attempts or [{"attempt": max(1, gallery_create_attempts), "status": "reconciled_after_reread"}],
+        }
+        accept_step(record, stage="block_created")
+        return record
+
+    seeded_locator = str(getattr(args, "reconciled_created_locator", "") or "").strip()
+    checkpoint_pending_create = bool(
+        checkpoint
+        and not checkpoint.gallery_locator
+        and (
+            checkpoint.state.get("active_step") == "create_block"
+            or checkpoint.state.get("failed_step") == "create_block"
+        )
+    )
+    if checkpoint_pending_create and not seeded_locator:
+        reconciliation = query_create_reconciliation()
+        if reconciliation.get("status") == "applied":
+            seeded_locator = str(reconciliation.get("block_locator", "") or "").strip()
+        elif reconciliation.get("status") != "not_applied" or gallery_create_attempts >= 2:
+            error = PublishFailure("create_block", str(reconciliation.get("reason") or "previous Gallery create is unresolved"))
+            error.safe_summary = "The previous Gallery create is unresolved; vertical publish is skipped"
+            error.create_reconciliation = reconciliation
+            error.safe_diagnostics = {
+                "completed_stage": checkpoint.state.get("completed_stage", ""),
+                "asset_ids": list(checkpoint.state.get("asset_ids", [])),
+                "created_block_locator": "",
+                "create_attempts": gallery_create_attempts,
+                "steps": list(checkpoint.state.get("steps", [])),
+            }
+            raise error
+
+    if seeded_locator:
+        ctx["block_locator"] = seeded_locator
+        if checkpoint:
+            checkpoint.gallery_locator = seeded_locator
+        reconciled_create_record(
+            {"block_locator": seeded_locator, "observed_snapshot": getattr(args, "reconciled_create_snapshot", None)},
+            attempts=getattr(args, "reconciled_create_attempts", None),
+        )
+    elif checkpoint and checkpoint.gallery_locator:
         ctx["block_locator"] = checkpoint.gallery_locator
     elif checkpoint and checkpoint.resume and checkpoint.state["completed_stage"]:
         error = PublishFailure("create_block", "checkpoint is missing its gallery locator")
@@ -2230,14 +2641,120 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint.fail(error, "create_block")
         raise error
     else:
-        create_step = start_and_call("create_block", adapter["create_block"])
-        locator = create_step.get("block_locator") or ctx.get("block_locator")
-        accept_step(create_step, stage="block_created")
-        if execute and (not isinstance(locator, str) or not locator.strip()):
-            error = PublishFailure("create_block", "Studio did not return a usable block locator")
-            error.safe_summary = "Studio created no usable Gallery locator"
+        def call_create_once() -> dict[str, Any]:
+            nonlocal gallery_create_attempts
+            # Do not let a locator from an earlier, unverified response make a
+            # later response look usable when it omitted its own locator.
+            ctx.pop("block_locator", None)
+            if checkpoint:
+                try:
+                    record = start_and_call("create_block", adapter["create_block"])
+                finally:
+                    gallery_create_attempts = max(gallery_create_attempts, int(checkpoint.state.get("create_attempts", 0)))
+            else:
+                gallery_create_attempts += 1
+                record = start_and_call("create_block", adapter["create_block"])
+            locator = record.get("block_locator") or ctx.get("block_locator")
+            if execute and (not isinstance(locator, str) or not locator.strip()):
+                error = PublishFailure("create_block", "Studio did not return a usable block locator")
+                error.safe_summary = "Studio did not return a usable Gallery locator"
+                mark_failure(error, "create_block")
+                raise error
+            return record
+
+        create_attempt_history: list[dict[str, Any]] = []
+        create_step: dict[str, Any] | None = None
+        create_reconciler_available = callable(getattr(args, "reconcile_create_block", None))
+        for attempt_number in range(1, 3):
+            if gallery_create_attempts >= 2:
+                error = PublishFailure("create_block", "Gallery create retry limit has already been reached")
+                error.create_attempt_history = create_attempt_history
+                mark_failure(error, "create_block")
+                raise error
+            try:
+                response_step = call_create_once()
+            except Exception as create_error:
+                reconciliation = query_create_reconciliation()
+                attempt = {"attempt": max(attempt_number, gallery_create_attempts), "status": "response_uncertain"}
+                if isinstance(create_error, TemplateCallError):
+                    attempt["http_status"] = create_error.status_code
+                create_error.create_reconciliation = reconciliation
+                if reconciliation.get("status") == "applied":
+                    attempt["status"] = "reconciled_after_reread"
+                    create_step = reconciled_create_record(reconciliation, [*create_attempt_history, attempt])
+                    break
+                if reconciliation.get("status") == "not_applied" and gallery_create_attempts < 2:
+                    attempt["status"] = "not_applied_after_reconciliation"
+                    create_attempt_history.append(attempt)
+                    continue
+                if reconciliation.get("status") == "not_applied":
+                    attempt["status"] = "not_applied_after_reconciliation"
+                else:
+                    attempt["status"] = "unresolved_after_reconciliation"
+                create_attempt_history.append(attempt)
+                create_error.create_attempt_history = create_attempt_history
+                raise create_error
+
+            if execute and create_reconciler_available:
+                reconciliation = query_create_reconciliation()
+                response_locator = str(response_step.get("block_locator") or ctx.get("block_locator") or "").strip()
+                attempt = {
+                    "attempt": gallery_create_attempts,
+                    "status": "response_ok",
+                    "postcondition_status": reconciliation.get("status", "unverified"),
+                }
+                if isinstance(reconciliation.get("observed_snapshot"), dict):
+                    attempt["observed_snapshot"] = reconciliation["observed_snapshot"]
+                if reconciliation.get("status") == "applied":
+                    observed_locator = str(reconciliation.get("block_locator", "") or "").strip()
+                    if not response_locator or response_locator != observed_locator:
+                        attempt["status"] = "locator_mismatch_after_reconciliation"
+                        create_attempt_history.append(attempt)
+                        error = PublishFailure(
+                            "create_block",
+                            "successful Gallery create response did not match the unique Gallery observed in the vertical",
+                        )
+                        error.create_reconciliation = reconciliation
+                        error.create_attempt_history = create_attempt_history
+                        mark_failure(error, "create_block")
+                        raise error
+                    create_attempt_history.append(attempt)
+                    response_step["block_locator"] = response_locator
+                    response_step["observed_snapshot"] = reconciliation.get("observed_snapshot")
+                    response_step["status"] = "completed" if gallery_create_attempts == 1 else "retried"
+                    response_step["attempts"] = create_attempt_history
+                    create_step = response_step
+                    break
+                if reconciliation.get("status") == "not_applied" and gallery_create_attempts < 2:
+                    attempt["status"] = "postcondition_missing_after_response"
+                    create_attempt_history.append(attempt)
+                    continue
+                attempt["status"] = "unresolved_after_reconciliation"
+                create_attempt_history.append(attempt)
+                error = PublishFailure(
+                    "create_block",
+                    str(reconciliation.get("reason") or "successful Gallery create response could not be verified in the vertical"),
+                )
+                error.create_reconciliation = reconciliation
+                error.create_attempt_history = create_attempt_history
+                mark_failure(error, "create_block")
+                raise error
+
+            if gallery_create_attempts > 1:
+                create_attempt_history.append({"attempt": max(attempt_number, gallery_create_attempts), "status": "response_ok"})
+                response_step["status"] = "retried"
+                response_step["attempts"] = create_attempt_history
+            create_step = response_step
+            break
+
+        if create_step is None:
+            error = PublishFailure("create_block", "Gallery create attempts ended without a verified result")
+            error.create_attempt_history = create_attempt_history
             mark_failure(error, "create_block")
             raise error
+        locator = create_step.get("block_locator") or ctx.get("block_locator")
+        if create_step.get("status") != "reconciled":
+            accept_step(create_step, stage="block_created")
         if isinstance(locator, str) and locator.strip():
             ctx["block_locator"] = locator.strip()
         elif not execute:
@@ -2466,6 +2983,7 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         "created_imagegallery_block_url": created_imagegallery_block_url,
         "created_block_url": created_imagegallery_block_url,
         "asset_ids": list(ctx.get("uploaded_asset_ids", [])),
+        "create_attempts": gallery_create_attempts,
         "auth_retry_policy": {
             "enabled": can_refresh_auth,
             "max_retries": normalize_auth_retry_max_retries(getattr(args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
@@ -2503,12 +3021,14 @@ def apply_in_place_publish_actions(
         if execute:
             raise PublishFailure("create_block", "missing created imagesgallery block locator")
         created_block_locator = "__dry_run_created_imagesgallery__"
+    original_snapshot = replacement_plan.get("initial_snapshot")
 
     requested_vertical_url = build_container_block_url(studio_base, str(replacement_plan.get("target_vertical_block_id", ""))) or studio_url
     live_plan, live_step = maybe_fetch_live_replacement_plan(
         studio_url=requested_vertical_url,
         source_vertical_block_id=str(replacement_plan.get("source_vertical_block_id", "")),
         target_vertical_block_id=str(replacement_plan.get("target_vertical_block_id", "")),
+        block_type=str(replacement_plan.get("resolved_block_type", "") or ""),
         excluded_block_locators=[created_block_locator] if created_block_locator else [],
         args=args,
         timeout=timeout,
@@ -2552,28 +3072,160 @@ def apply_in_place_publish_actions(
         created_block_locator=created_block_locator,
         publish_only=publish_only,
     )
+    baseline_snapshot = original_snapshot
+    if not isinstance(baseline_snapshot, dict) and not execute:
+        dry_run_children = [str(child).strip() for child in current_children if str(child).strip()]
+        baseline_snapshot = {
+            "direct_child_count": len(dry_run_children),
+            "children": [
+                {
+                    "locator": locator,
+                    "type": (re.search(r"\+type@([^+]+)\+block@", locator).group(1) if re.search(r"\+type@([^+]+)\+block@", locator) else "unknown"),
+                    "order": index,
+                }
+                for index, locator in enumerate(dry_run_children, start=1)
+            ],
+        }
+    if not isinstance(baseline_snapshot, dict):
+        raise PublishFailure("replacement_validation", "original vertical snapshot is missing; refusing to publish without a baseline")
+    baseline_children = [dict(child) for child in baseline_snapshot.get("children", []) if isinstance(child, dict)]
+    post_create_snapshot: dict[str, Any] = {}
+    move_snapshot: dict[str, Any] = {}
+    final_snapshot: dict[str, Any] = {}
+
+    def vertical_evidence() -> dict[str, Any]:
+        return {
+            "block_type": replacement_plan.get("resolved_block_type", ""),
+            "planned_result_type": replacement_plan.get("result_type", ""),
+            "vertical_snapshot_before": baseline_snapshot,
+            "vertical_snapshot_after_create": post_create_snapshot,
+            "expected_vertical_snapshot_after_move": move_snapshot,
+            "expected_vertical_snapshot_after_delete": final_snapshot,
+        }
+
     if publish_only:
-        desired_children = current_children
-    else:
-        desired_children = build_vertical_children(
-            [*current_children, created_block_locator],
-            new_block_locator=created_block_locator,
-            replace_block_locator=matched_source_block_locator,
+        post_create_snapshot = (
+            live_plan.get("initial_snapshot")
+            if isinstance(live_plan, dict)
+            else replacement_plan.get("vertical_snapshot_after_create")
         )
-        stale_children = [
-            child
-            for child in desired_children
-            if child != created_block_locator and child not in current_children
+        if not isinstance(post_create_snapshot, dict):
+            raise PublishFailure("replacement_validation", "saved vertical snapshot is missing for publish recovery")
+        desired_children = [str(child.get("locator", "")) for child in post_create_snapshot.get("children", [])]
+        move_snapshot = post_create_snapshot
+        final_snapshot = post_create_snapshot
+    elif execute:
+        expected_create_count = int(baseline_snapshot.get("direct_child_count", len(baseline_children))) + 1
+        post_create_snapshot = live_plan.get("initial_snapshot") if isinstance(live_plan, dict) else None
+        created_rows = [
+            child for child in (post_create_snapshot or {}).get("children", [])
+            if isinstance(child, dict) and child.get("locator") == created_block_locator
         ]
-        if stale_children:
-            raise PublishFailure(
-                "replacement_validation",
-                f"desired child order contains stale child locators that are not present in the live vertical children: {stale_children}",
+        unchanged_original_rows = [
+            dict(child) for child in (post_create_snapshot or {}).get("children", [])
+            if isinstance(child, dict) and child.get("locator") != created_block_locator
+        ]
+        baseline_identity_order = [
+            (str(child.get("locator", "")), str(child.get("type", "")).lower())
+            for child in baseline_children
+        ]
+        observed_identity_order = [
+            (str(child.get("locator", "")), str(child.get("type", "")).lower())
+            for child in unchanged_original_rows
+        ]
+        if (
+            not isinstance(post_create_snapshot, dict)
+            or post_create_snapshot.get("direct_child_count") != expected_create_count
+            or len(created_rows) != 1
+            or created_rows[0].get("type") != "imagesgallery"
+            or observed_identity_order != baseline_identity_order
+        ):
+            steps.append({
+                "step": "verify_vertical_after_create",
+                "status": "failed",
+                "expected_snapshot": baseline_snapshot,
+                "observed_snapshot": post_create_snapshot,
+            })
+            steps.append({"step": "publish_vertical", "status": "skipped", "reason": "create structure did not match the original snapshot plus one Gallery"})
+            failure = PublishFailure("verify_vertical_after_create", "Studio vertical structure did not match the original snapshot plus the created Gallery")
+            failure.steps = steps.copy()
+            failure.vertical_evidence = vertical_evidence()
+            raise failure
+        steps.append({
+            "step": "verify_vertical_after_create",
+            "status": "completed",
+            "expected_direct_child_count": expected_create_count,
+            "observed_snapshot": post_create_snapshot,
+        })
+        try:
+            move_snapshot = replace_snapshot_child(
+                baseline_snapshot,
+                old_locator=matched_source_block_locator,
+                new_locator=created_block_locator,
             )
+            final_snapshot = replacement_after_delete_snapshot(
+                move_snapshot,
+                old_locator=matched_source_block_locator,
+                new_locator=created_block_locator,
+            )
+        except PublishFailure as exc:
+            steps.append({"step": "verify_vertical_after_create", "status": "failed", "reason": safe_error_summary(exc)})
+            steps.append({"step": "publish_vertical", "status": "skipped", "reason": "replacement snapshot could not be planned"})
+            exc.steps = steps.copy()
+            exc.vertical_evidence = vertical_evidence()
+            raise
+        desired_children = [str(child.get("locator", "")) for child in move_snapshot["children"]]
+    else:
+        post_create_snapshot = {
+            "direct_child_count": len(baseline_children) + 1,
+            "children": [*baseline_children, {"locator": created_block_locator, "type": "imagesgallery", "order": len(baseline_children) + 1}],
+        }
+        move_snapshot = replace_snapshot_child(
+            baseline_snapshot,
+            old_locator=matched_source_block_locator,
+            new_locator=created_block_locator,
+        )
+        final_snapshot = replacement_after_delete_snapshot(
+            move_snapshot,
+            old_locator=matched_source_block_locator,
+            new_locator=created_block_locator,
+        )
+        desired_children = [str(child.get("locator", "")) for child in move_snapshot["children"]]
+
     ctx["vertical_children_obj"] = desired_children
     operator_vertical_url, requested_vertical_url = operator_vertical_urls(studio_base, replacement_plan, studio_url)
 
-    def call_optional_step(step_name: str, *, delete_locator: str = "") -> None:
+    def read_current_state() -> tuple[dict[str, Any], Any]:
+        try:
+            return fetch_vertical_state(
+                session,
+                studio_base=studio_base,
+                vertical_locator=working_vertical_block_id,
+                timeout=timeout,
+            )
+        except PublishFailure:
+            raise
+        except Exception as exc:
+            raise PublishFailure("verify_vertical_structure", "Studio vertical structure could not be reread") from exc
+
+    def read_before_mutation(step_name: str) -> tuple[dict[str, Any], Any]:
+        try:
+            return read_current_state()
+        except PublishFailure as exc:
+            steps.append({"step": step_name, "status": "failed", "reason": safe_error_summary(exc)})
+            steps.append({"step": "publish_vertical", "status": "skipped", "reason": "vertical structure could not be verified before publishing"})
+            exc.steps = steps.copy()
+            exc.vertical_evidence = vertical_evidence()
+            raise
+
+    def call_optional_step(
+        step_name: str,
+        *,
+        before_snapshot: dict[str, Any],
+        expected_snapshot: dict[str, Any],
+        delete_locator: str = "",
+        require_published: bool = False,
+    ) -> dict[str, Any]:
         tmpl = adapter.get(step_name)
         if not tmpl:
             exc = PublishFailure(step_name, f"adapter missing required step: {step_name}")
@@ -2581,33 +3233,125 @@ def apply_in_place_publish_actions(
             raise exc
         if delete_locator:
             ctx["delete_block_locator"] = delete_locator
-        try:
-            record = call_template(session, step_name, tmpl, ctx, execute, timeout)
-            if execute and "status" not in record:
+        attempts: list[dict[str, Any]] = []
+        current_expected = before_snapshot
+        for attempt_number in range(1, 3):
+            write_error: TemplateCallError | None = None
+            try:
+                record = call_template(session, step_name, tmpl, ctx, execute, timeout)
+            except TemplateCallError as exc:
+                write_error = exc
+                record = {"step": step_name, "reason": safe_error_summary(exc)}
+            if not execute:
                 record["status"] = "ok"
-            if delete_locator:
-                record.setdefault("block_locator", delete_locator)
-            steps.append(record)
-        except TemplateCallError as exc:
-            steps.append(
-                {
+                steps.append(record)
+                return expected_snapshot
+            try:
+                observed_snapshot, published_state = read_current_state()
+            except PublishFailure as exc:
+                action = {
                     "step": step_name,
-                    "status": "failed",
-                    "block_locator": delete_locator or None,
+                    "status": "blocked",
+                    "attempt": attempt_number,
                     "reason": safe_error_summary(exc),
+                    "expected_snapshot": expected_snapshot,
                 }
+                attempts.append(action)
+                break
+            postcondition = (
+                published_state is True
+                if require_published
+                else observed_snapshot == expected_snapshot
             )
-            failure = PublishFailure(step_name, safe_error_summary(exc), payload=exc.payload)
+            if postcondition:
+                status = "completed" if write_error is None and attempt_number == 1 else ("reconciled" if write_error is not None and attempt_number == 1 else "retried")
+                action = {
+                    "step": step_name,
+                    "status": status,
+                    "attempts": attempts + [{"attempt": attempt_number, "status": "response_uncertain" if write_error else "response_ok"}],
+                    "expected_snapshot": expected_snapshot,
+                    "observed_snapshot": observed_snapshot,
+                }
+                if require_published:
+                    action["published"] = published_state
+                if delete_locator:
+                    action["block_locator"] = delete_locator
+                steps.append(action)
+                return observed_snapshot
+            state_unchanged = observed_snapshot == current_expected
+            if state_unchanged and attempt_number == 1:
+                attempts.append({
+                    "attempt": attempt_number,
+                    "status": "not_applied_after_reconciliation" if write_error is not None else "postcondition_missing_after_response",
+                    "observed_snapshot": observed_snapshot,
+                })
+                current_expected = observed_snapshot
+                continue
+            status = "failed" if state_unchanged else "blocked"
+            action = {
+                "step": step_name,
+                "status": status,
+                "attempts": attempts + [{"attempt": attempt_number, "status": "response_uncertain" if write_error else "response_ok"}],
+                "reason": safe_error_summary(write_error) if write_error else "Studio structure did not match the planned postcondition",
+                "expected_snapshot": expected_snapshot,
+                "observed_snapshot": observed_snapshot,
+            }
+            if require_published:
+                action["published"] = published_state
+            if delete_locator:
+                action["block_locator"] = delete_locator
+            steps.append(action)
+            break
+        if step_name != "publish_vertical":
+            steps.append({"step": "publish_vertical", "status": "skipped", "reason": f"{step_name} did not reach its verified postcondition"})
+        failure = PublishFailure(step_name, f"{step_name} did not reach its verified postcondition")
+        failure.steps = steps.copy()
+        failure.vertical_evidence = vertical_evidence()
+        raise failure
+
+    if execute:
+        if not publish_only and [str(child.get("locator", "")) for child in post_create_snapshot["children"]] != desired_children:
+            current_snapshot, _published = read_before_mutation("verify_vertical_before_move")
+            call_optional_step(
+                "reorder_children",
+                before_snapshot=current_snapshot,
+                expected_snapshot=move_snapshot,
+            )
+            steps.append({"step": "verify_vertical_after_move", "status": "completed", "expected_snapshot": move_snapshot})
+        elif not publish_only:
+            steps.append({"step": "verify_vertical_after_move", "status": "completed", "expected_snapshot": move_snapshot})
+        if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
+            current_snapshot, _published = read_before_mutation("verify_vertical_before_delete")
+            call_optional_step(
+                "delete_block",
+                before_snapshot=current_snapshot,
+                expected_snapshot=final_snapshot,
+                delete_locator=matched_source_block_locator,
+            )
+            steps.append({"step": "verify_vertical_after_delete", "status": "completed", "expected_snapshot": final_snapshot})
+        current_snapshot, _published = read_before_mutation("verify_vertical_before_publish")
+        if current_snapshot != final_snapshot:
+            steps.append({"step": "verify_vertical_before_publish", "status": "failed", "expected_snapshot": final_snapshot, "observed_snapshot": current_snapshot})
+            steps.append({"step": "publish_vertical", "status": "skipped", "reason": "pre-publish vertical structure did not match the planned replacement"})
+            failure = PublishFailure("verify_vertical_before_publish", "pre-publish vertical structure did not match the planned replacement")
             failure.steps = steps.copy()
-            raise failure from exc
+            failure.vertical_evidence = vertical_evidence()
+            raise failure
+        steps.append({"step": "verify_vertical_before_publish", "status": "completed", "expected_snapshot": final_snapshot, "observed_snapshot": current_snapshot})
+        call_optional_step(
+            "publish_vertical",
+            before_snapshot=current_snapshot,
+            expected_snapshot=final_snapshot,
+            require_published=True,
+        )
+    else:
+        if not publish_only and desired_children != [*current_children, created_block_locator]:
+            call_optional_step("reorder_children", before_snapshot={}, expected_snapshot={})
 
-    if not publish_only and desired_children != [*current_children, created_block_locator]:
-        call_optional_step("reorder_children")
+        if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
+            call_optional_step("delete_block", before_snapshot={}, expected_snapshot={}, delete_locator=matched_source_block_locator)
 
-    if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
-        call_optional_step("delete_block", delete_locator=matched_source_block_locator)
-
-    call_optional_step("publish_vertical")
+        call_optional_step("publish_vertical", before_snapshot={}, expected_snapshot={})
 
     summary_cleanup = {"status": "preserved"}
 
@@ -2619,6 +3363,7 @@ def apply_in_place_publish_actions(
         "requested_target_vertical_url": requested_vertical_url,
         "working_vertical_url": working_vertical_url,
         "created_block_locator": created_block_locator,
+        "create_attempts": single_publish_result.get("create_attempts", 0),
         "created_imagegallery_block_url": build_container_block_url(studio_base, created_block_locator),
         "existing_gallery_block_locator": str(replacement_plan.get("existing_gallery_block_locator", "")),
         "existing_gallery_block_url": build_container_block_url(studio_base, str(replacement_plan.get("existing_gallery_block_locator", ""))),
@@ -2634,6 +3379,12 @@ def apply_in_place_publish_actions(
         ),
         "course_kind": replacement_plan.get("course_kind", ""),
         "match_scope": replacement_plan.get("match_scope", ""),
+        "block_type": replacement_plan.get("resolved_block_type", ""),
+        "vertical_snapshot_before": baseline_snapshot,
+        "vertical_snapshot_after_create": post_create_snapshot,
+        "expected_vertical_snapshot_after_move": move_snapshot,
+        "expected_vertical_snapshot_after_delete": final_snapshot,
+        "vertical_published": True if execute else None,
         "plan_source": replacement_plan.get("plan_source", ""),
         "requires_manual_followup": False,
         "steps": steps,
@@ -2671,12 +3422,111 @@ def process_publish_target(
         )
 
     summary_cleanup_info = {"status": "preserved"}
+    manifest_path = Path(str(target.get("manifest", ""))).expanduser().resolve()
+    try:
+        source_metadata = read_json(manifest_path)
+        if not isinstance(source_metadata, dict):
+            raise ValueError("gallery manifest must be an object")
+    except Exception:
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": studio_vertical_url,
+            "failed_step": "resolve_source_block_type",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": "Gallery manifest source metadata could not be read",
+            "steps": [{"step": "resolve_source_block_type", "status": "failed", "reason": "Gallery manifest source metadata could not be read"}],
+        }
+    leaking_summary_pages = manifest_summary_leaks(source_metadata)
+    if leaking_summary_pages:
+        reason = "Gallery page or speech input contains a standalone 本节要点 summary"
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": studio_vertical_url,
+            "failed_step": "stage_b_output_contract",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": reason,
+            "leaking_summary_pages": leaking_summary_pages,
+            "steps": [
+                {"step": "stage_b_output_contract", "status": "failed", "leaking_summary_pages": leaking_summary_pages, "reason": reason},
+                {"step": "publish_vertical", "status": "skipped", "reason": "summary content must be removed before publishing"},
+            ],
+            **summarize_steps([
+                {"step": "stage_b_output_contract", "status": "failed"},
+                {"step": "publish_vertical", "status": "skipped"},
+            ]),
+        }
+    type_resolution = resolve_source_block_type(
+        source_metadata,
+        target,
+        manifest_path=manifest_path,
+        section_list_json=str(target.get("section_list_json", "") or ""),
+    )
+    if type_resolution["status"] != "resolved":
+        step = {
+            "step": "resolve_source_block_type",
+            "status": "failed",
+            "source_type_status": type_resolution["status"],
+            "reason": type_resolution["reason"],
+        }
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": studio_vertical_url,
+            "failed_step": "resolve_source_block_type",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": type_resolution["reason"],
+            "block_type_resolution": {"status": type_resolution["status"]},
+            "steps": [step],
+        }
+    resolved_block_type = type_resolution["block_type"]
+    target["block_type"] = resolved_block_type
+    operation_record = operation_gallery_checkpoint(args)
+    operation_create_pending = pending_create_checkpoint(args)
+    previous_create_pending = bool(
+        isinstance(previous_result, dict)
+        and str(previous_result.get("failed_step", "")) == "create_block"
+        and not str(previous_result.get("created_block_locator", "") or "").strip()
+    )
+    create_is_pending = previous_create_pending or operation_create_pending is not None
+    saved_create_snapshot = (
+        (previous_result or {}).get("vertical_snapshot_before")
+        if previous_create_pending
+        else (operation_create_pending or {}).get("before")
+    )
+    saved_integrity_baseline: dict[str, Any] | None = None
+    saved_integrity_match = ""
+    if operation_record is not None:
+        _operation_path, _operation, operation_gallery = operation_record
+        saved_integrity = operation_gallery.get("vertical_integrity") if isinstance(operation_gallery.get("vertical_integrity"), dict) else {}
+        candidate_baseline = saved_integrity.get("before") or saved_integrity.get("vertical_snapshot_before")
+        if isinstance(candidate_baseline, dict) and saved_integrity.get("status") != "verified":
+            saved_integrity_baseline = candidate_baseline
+            saved_integrity_match = str(saved_integrity.get("matched_source_block_locator", "") or "").strip()
+    if not isinstance(saved_create_snapshot, dict) and saved_integrity_baseline is not None:
+        saved_create_snapshot = saved_integrity_baseline
+    create_attempts = 0
+    if previous_create_pending:
+        value = (previous_result or {}).get("create_attempts", 0)
+        create_attempts = value if isinstance(value, int) and not isinstance(value, bool) else 0
+    elif operation_create_pending is not None:
+        create_attempts = int(operation_create_pending.get("create_attempts", 0))
+    saved_matched_source = str(
+        (previous_result or {}).get("matched_source_block_locator", "")
+        or (operation_create_pending or {}).get("matched_source_block_locator", "")
+        or saved_integrity_match
+    ).strip()
 
     replacement_plan = mark_replacement_plan_source(
         plan_publish_replacement(
             course_structure,
             source_vertical_block_id=source_vertical_block_id,
             target_vertical_block_id=target_vertical_block_id,
+            block_type=resolved_block_type,
         ),
         "course_structure_json",
     )
@@ -2684,6 +3534,7 @@ def process_publish_target(
         studio_url=studio_vertical_url,
         source_vertical_block_id=source_vertical_block_id,
         target_vertical_block_id=target_vertical_block_id,
+        block_type=resolved_block_type,
         args=args,
         timeout=int(getattr(args, "timeout", 30)),
     )
@@ -2708,10 +3559,107 @@ def process_publish_target(
         }
     if live_plan is not None:
         replacement_plan = live_plan
+    replacement_plan["resolved_block_type"] = resolved_block_type
+    original_replacement_plan = dict(replacement_plan)
+    creation_baseline = (
+        saved_create_snapshot
+        if isinstance(saved_create_snapshot, dict) and (create_is_pending or saved_integrity_baseline is not None)
+        else replacement_plan.get("initial_snapshot")
+    )
+    reconciled_create_locator = ""
+    reconciled_create_snapshot: dict[str, Any] | None = None
+    if create_is_pending:
+        observed_snapshot = replacement_plan.get("initial_snapshot")
+        if not isinstance(creation_baseline, dict) or not isinstance(observed_snapshot, dict):
+            reconciliation = {"status": "unverified", "reason": "saved or observed pre-create vertical snapshot is unavailable"}
+        else:
+            reconciliation = reconcile_created_gallery_snapshot(creation_baseline, observed_snapshot)
+        if reconciliation["status"] == "applied":
+            reconciled_create_locator = str(reconciliation.get("block_locator", ""))
+            reconciled_create_snapshot = observed_snapshot
+            replacement_plan["initial_snapshot"] = creation_baseline
+            replacement_plan["planning_issue"] = None
+            replacement_plan["matched_source_block_locator"] = saved_matched_source or original_replacement_plan.get("matched_source_block_locator", "")
+            replacement_plan["matched_source_block_category"] = "imagesgallery" if resolved_block_type == "imagesgallery" else "html"
+            replacement_plan["result_type"] = str(
+                (previous_result or {}).get("planned_result_type")
+                or (
+                    (previous_result or {}).get("status")
+                    if (previous_result or {}).get("status") in {"replaced", "fallback_inserted"}
+                    else "replaced"
+                )
+                or "replaced"
+            )
+            replacement_plan["current_children"] = [
+                str(child.get("locator", "")) for child in observed_snapshot.get("children", [])
+            ]
+            create_attempts = max(1, create_attempts)
+        elif reconciliation["status"] == "not_applied" and create_attempts < 2:
+            replacement_plan["initial_snapshot"] = creation_baseline
+        else:
+            reason = reconciliation.get("reason") or "the uncertain Gallery create could not be reconciled safely"
+            blocked_steps = [
+                {
+                    "step": "create_block",
+                    "status": "blocked",
+                    "create_attempts": create_attempts,
+                    "reason": reason,
+                    "expected_snapshot": creation_baseline,
+                    "observed_snapshot": observed_snapshot,
+                },
+                {"step": "publish_vertical", "status": "skipped", "reason": "create outcome is unresolved"},
+            ]
+            return {
+                "status": "failed",
+                "target_vertical_block_id": target_vertical_block_id,
+                "target_vertical_url": studio_vertical_url,
+                "working_vertical_block_id": str(replacement_plan.get("working_vertical_block_id", "")),
+                "failed_step": "create_block",
+                "failure_bucket": "manual_followup",
+                "requires_manual_followup": True,
+                "note": reason,
+                "block_type": resolved_block_type,
+                "planned_result_type": str((previous_result or {}).get("planned_result_type") or "replaced"),
+                "matched_source_block_locator": saved_matched_source,
+                "vertical_snapshot_before": creation_baseline,
+                "vertical_snapshot_after_create": observed_snapshot,
+                "vertical_published": None,
+                "create_attempts": create_attempts,
+                "steps": blocked_steps,
+                **summarize_steps(blocked_steps),
+            }
+    else:
+        creation_baseline = replacement_plan.get("initial_snapshot")
     rerun_action = resolve_rerun_action(
         previous_result,
         current_structure_block_ids=list(replacement_plan.get("all_structure_block_ids", [])),
     )
+    if rerun_action["action"] == "resume_publish_only":
+        replacement_plan["planning_issue"] = None
+        replacement_plan["matched_source_block_locator"] = ""
+        replacement_plan["result_type"] = str((previous_result or {}).get("planned_result_type") or "replaced")
+        if isinstance((previous_result or {}).get("vertical_snapshot_before"), dict):
+            replacement_plan["initial_snapshot"] = previous_result["vertical_snapshot_before"]
+        replacement_plan["vertical_snapshot_after_create"] = (previous_result or {}).get("vertical_snapshot_after_create")
+    if replacement_plan.get("planning_issue") and rerun_action["action"] != "resume_publish_only":
+        issue = replacement_plan["planning_issue"]
+        step = {
+            "step": "resolve_replacement_target",
+            "status": "failed",
+            "block_type": resolved_block_type,
+            "reason": issue.get("reason", "replacement target could not be uniquely resolved"),
+        }
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": studio_vertical_url,
+            "failed_step": "resolve_replacement_target",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": step["reason"],
+            "block_type_resolution": {"status": "resolved", "block_type": resolved_block_type},
+            "steps": [step],
+        }
     preflight_steps: list[dict[str, Any]] = []
 
     if rerun_action["action"] == "skip":
@@ -2789,6 +3737,9 @@ def process_publish_target(
             }
 
     if rerun_action["action"] == "resume_publish_only":
+        saved_snapshot = (previous_result or {}).get("vertical_snapshot_before")
+        if isinstance(saved_snapshot, dict):
+            replacement_plan["initial_snapshot"] = saved_snapshot
         resume_result = {
             "studio_base": studio_base_from_url(studio_vertical_url),
             "block_locator": str((previous_result or {}).get("created_block_locator", "")),
@@ -2825,7 +3776,108 @@ def process_publish_target(
         studio_url=working_vertical_url,
         vertical_block_id=working_vertical_block_id,
     )
-    single_publish_result = run_single_publish(publish_args)
+    if not isinstance(creation_baseline, dict):
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "target_vertical_url": studio_vertical_url,
+            "failed_step": "create_block",
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": "original vertical snapshot is missing; Gallery creation is blocked",
+            "block_type": resolved_block_type,
+            "matched_source_block_locator": str(replacement_plan.get("matched_source_block_locator", "")),
+            "steps": [
+                {"step": "create_block", "status": "blocked", "reason": "original vertical snapshot is missing"},
+                {"step": "publish_vertical", "status": "skipped", "reason": "pre-create vertical baseline is unavailable"},
+            ],
+        }
+    persist_vertical_integrity_baseline(
+        args,
+        block_type=resolved_block_type,
+        snapshot=creation_baseline,
+        matched_source_block_locator=str(replacement_plan.get("matched_source_block_locator", "")),
+    )
+
+    def reconcile_create_block() -> dict[str, Any]:
+        observed_plan, _read_step = maybe_fetch_live_replacement_plan(
+            studio_url=studio_vertical_url,
+            source_vertical_block_id=source_vertical_block_id,
+            target_vertical_block_id=target_vertical_block_id,
+            block_type=resolved_block_type,
+            args=args,
+            timeout=int(getattr(args, "timeout", 30)),
+        )
+        if observed_plan is None or not isinstance(observed_plan.get("initial_snapshot"), dict):
+            return {"status": "unverified", "reason": "Studio vertical could not be reread after Gallery creation"}
+        return reconcile_created_gallery_snapshot(creation_baseline, observed_plan["initial_snapshot"])
+
+    publish_args.reconcile_create_block = reconcile_create_block
+    publish_args.create_attempts = create_attempts
+    publish_args.reconciled_created_locator = reconciled_create_locator
+    if reconciled_create_locator:
+        publish_args.reconciled_create_snapshot = reconciled_create_snapshot
+    try:
+        single_publish_result = run_single_publish(publish_args)
+    except Exception as exc:
+        diagnostics = getattr(exc, "safe_diagnostics", None)
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        reconciliation = getattr(exc, "create_reconciliation", None)
+        reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+        create_attempt_history = getattr(exc, "create_attempt_history", None)
+        create_attempt_history = create_attempt_history if isinstance(create_attempt_history, list) else []
+        failure_steps = list(diagnostics.get("steps", []))
+        failure_steps.append(
+            {
+                "step": str(getattr(exc, "step_name", "create_block")),
+                "status": "failed" if str(getattr(exc, "step_name", "create_block")) == "create_block" else "blocked",
+                "create_attempts": diagnostics.get("create_attempts", create_attempts),
+                "attempts": create_attempt_history,
+                "observed_snapshot": reconciliation.get("observed_snapshot"),
+                "reason": safe_error_summary(exc),
+            }
+        )
+        failure_snapshot = reconciliation.get("observed_snapshot")
+        created_locator = str(diagnostics.get("created_block_locator", "") or "")
+        if not isinstance(failure_snapshot, dict) and created_locator:
+            post_create_reconciliation = reconcile_create_block()
+            if post_create_reconciliation.get("status") == "applied" and post_create_reconciliation.get("block_locator") == created_locator:
+                failure_snapshot = post_create_reconciliation.get("observed_snapshot")
+                failure_steps.append({
+                    "step": "verify_vertical_after_create",
+                    "status": "completed",
+                    "observed_snapshot": failure_snapshot,
+                })
+            else:
+                failure_steps.append({
+                    "step": "verify_vertical_after_create",
+                    "status": "blocked",
+                    "observed_snapshot": post_create_reconciliation.get("observed_snapshot"),
+                    "reason": post_create_reconciliation.get("reason", "created Gallery could not be identified in the vertical"),
+                })
+        failure_steps.append({"step": "publish_vertical", "status": "skipped", "reason": "Gallery creation or content preparation did not complete"})
+        return {
+            "status": "failed",
+            "target_vertical_block_id": target_vertical_block_id,
+            "working_vertical_block_id": working_vertical_block_id,
+            "target_vertical_url": operator_vertical_url,
+            "requested_target_vertical_url": requested_vertical_url,
+            "created_block_locator": created_locator,
+            "planned_result_type": str(replacement_plan.get("result_type", "replaced")),
+            "matched_source_block_locator": str(replacement_plan.get("matched_source_block_locator", "")),
+            "failed_step": str(getattr(exc, "step_name", "create_block")),
+            "failure_bucket": "manual_followup",
+            "requires_manual_followup": True,
+            "note": safe_error_summary(exc),
+            "block_type": resolved_block_type,
+            "create_attempts": diagnostics.get("create_attempts", create_attempts),
+            "vertical_snapshot_before": creation_baseline,
+            "vertical_snapshot_after_create": failure_snapshot,
+            "expected_vertical_snapshot_after_delete": None,
+            "vertical_published": None,
+            "steps": failure_steps,
+            **summarize_steps(failure_steps),
+        }
     if preflight_steps:
         single_publish_result["steps"] = [*preflight_steps, *list(single_publish_result.get("steps", []))]
     try:
@@ -2867,6 +3919,7 @@ def process_publish_target(
             "match_scope": replacement_plan.get("match_scope", ""),
             "steps": failure_steps,
             **summarize_steps(failure_steps),
+            **(exc.vertical_evidence if isinstance(getattr(exc, "vertical_evidence", None), dict) else {}),
         }
         return failed
 
@@ -2891,7 +3944,135 @@ def run_in_place_publish(args: argparse.Namespace) -> dict[str, Any]:
         "target_vertical_block_location": target_vertical_block_id,
         "studio_vertical_url": normalize_block_url(args.studio_url),
     }
-    return process_publish_target(target, course_structure, args, adapter)
+    result = process_publish_target(target, course_structure, args, adapter)
+    result["provenance"] = skill_provenance(
+        input_paths=unique_provenance_inputs([
+            str(getattr(args, "manifest", "")),
+            str(getattr(args, "course_structure_json", "")),
+            section_list_provenance_input(
+                str(getattr(args, "manifest", "")),
+                str(getattr(args, "section_list_json", "")),
+            ),
+        ]),
+        output_path=str(getattr(args, "report_file", "") or getattr(args, "operation_file", "")),
+    )
+    persist_vertical_integrity_evidence(args, result)
+    return result
+
+
+def persist_vertical_integrity_evidence(args: argparse.Namespace, result: dict[str, Any]) -> None:
+    operation_file = str(getattr(args, "operation_file", "") or "").strip()
+    gallery_key = str(getattr(args, "gallery_key", "") or "").strip()
+    if not operation_file or not gallery_key or not bool(getattr(args, "execute", False)):
+        return
+    path = Path(operation_file).expanduser().resolve()
+    try:
+        operation = read_json(path)
+    except (OSError, JSONDecodeError):
+        return
+    galleries = operation.get("galleries") if isinstance(operation, dict) else None
+    if not isinstance(galleries, list):
+        return
+    matches = [entry for entry in galleries if isinstance(entry, dict) and entry.get("gallery_key") == gallery_key]
+    if len(matches) != 1:
+        return
+    provenance = result.get("provenance")
+    if isinstance(provenance, dict):
+        operation["skill_provenance"] = provenance
+    evidence = {
+        "status": "verified" if result.get("status") in {"replaced", "fallback_inserted"} and result.get("vertical_published") is True else "unresolved",
+        "block_type": result.get("block_type", "unknown"),
+        "matched_source_block_locator": result.get("matched_source_block_locator", ""),
+        "before": result.get("vertical_snapshot_before"),
+        "expected": result.get("expected_vertical_snapshot_after_delete"),
+        "published": result.get("vertical_published"),
+        "vertical_snapshot_before": result.get("vertical_snapshot_before"),
+        "vertical_snapshot_after_create": result.get("vertical_snapshot_after_create"),
+        "expected_vertical_snapshot_after_delete": result.get("expected_vertical_snapshot_after_delete"),
+        "vertical_published": result.get("vertical_published"),
+        "provenance": provenance if isinstance(provenance, dict) else {},
+        "steps": [
+            {
+                "step": safe_step_name(step.get("step")),
+                "status": safe_step_name(step.get("status")),
+                **({"attempts": step["attempts"]} if isinstance(step.get("attempts"), list) else {}),
+            }
+            for step in result.get("steps", []) if isinstance(step, dict)
+        ],
+    }
+    matches[0]["vertical_integrity"] = evidence
+    atomic_write_json(path, operation)
+
+
+def operation_gallery_checkpoint(args: argparse.Namespace) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
+    operation_file = str(getattr(args, "operation_file", "") or "").strip()
+    gallery_key = str(getattr(args, "gallery_key", "") or "").strip()
+    if not operation_file or not gallery_key:
+        return None
+    path = Path(operation_file).expanduser().resolve()
+    try:
+        operation = read_json(path)
+    except (OSError, JSONDecodeError):
+        return None
+    galleries = operation.get("galleries") if isinstance(operation, dict) else None
+    if not isinstance(galleries, list):
+        return None
+    matches = [entry for entry in galleries if isinstance(entry, dict) and entry.get("gallery_key") == gallery_key]
+    if len(matches) != 1:
+        return None
+    return path, operation, matches[0]
+
+
+def persist_vertical_integrity_baseline(
+    args: argparse.Namespace,
+    *,
+    block_type: str,
+    snapshot: dict[str, Any],
+    matched_source_block_locator: str = "",
+) -> None:
+    record = operation_gallery_checkpoint(args)
+    if record is None or not bool(getattr(args, "execute", False)):
+        return
+    path, operation, gallery = record
+    integrity = gallery.get("vertical_integrity") if isinstance(gallery.get("vertical_integrity"), dict) else {}
+    before = integrity.get("before") or integrity.get("vertical_snapshot_before")
+    if isinstance(before, dict):
+        return
+    gallery["vertical_integrity"] = {
+        "status": "in_progress",
+        "block_type": block_type,
+        "before": snapshot,
+        "expected": None,
+        "published": None,
+        "vertical_snapshot_before": snapshot,
+        "matched_source_block_locator": matched_source_block_locator,
+        "steps": [],
+    }
+    atomic_write_json(path, operation)
+
+
+def pending_create_checkpoint(args: argparse.Namespace) -> dict[str, Any] | None:
+    record = operation_gallery_checkpoint(args)
+    if record is None:
+        return None
+    _path, _operation, gallery = record
+    publish = gallery.get("publish") if isinstance(gallery.get("publish"), dict) else {}
+    gallery_locator = str(gallery.get("gallery_locator") or publish.get("gallery_locator") or "").strip()
+    active = str(publish.get("active_step", "") or "").strip()
+    failed = str(publish.get("failed_step", "") or "").strip()
+    if gallery_locator or active != "create_block" and failed != "create_block":
+        return None
+    integrity = gallery.get("vertical_integrity") if isinstance(gallery.get("vertical_integrity"), dict) else {}
+    before = integrity.get("before") or integrity.get("vertical_snapshot_before")
+    matched_source = str(integrity.get("matched_source_block_locator", "") or "").strip()
+    attempts = publish.get("create_attempts", 0)
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+        attempts = 0
+    return {
+        "before": before if isinstance(before, dict) else None,
+        "matched_source_block_locator": matched_source,
+        "create_attempts": attempts,
+    }
 
 
 def run_batch_publish(
@@ -2917,6 +4098,22 @@ def run_batch_publish(
     run_target = publish_target_fn or process_publish_target
     results: list[dict[str, Any]] = []
     targets = list(payload.get("targets") or [])
+    provenance_inputs = [str(targets_path), str(course_structure_path)]
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        manifest = str(target.get("manifest", "") or "")
+        provenance_inputs.append(manifest)
+        provenance_inputs.append(
+            section_list_provenance_input(
+                manifest,
+                str(target.get("section_list_json", "") or section_list_json),
+            )
+        )
+    provenance = skill_provenance(
+        input_paths=unique_provenance_inputs(provenance_inputs),
+        output_path=str(report_path),
+    )
     for raw_target in targets:
         target = dict(raw_target or {})
         if section_list_json:
@@ -2960,6 +4157,7 @@ def run_batch_publish(
             "report_file": str(report_path),
             "results": results,
             "summary": build_batch_summary(results),
+            "provenance": provenance,
         }
         write_batch_report(report_path, partial_payload)
 
@@ -2974,6 +4172,7 @@ def run_batch_publish(
         "manual_followup_failed": grouped["manual_followup_failed"],
         "failed": grouped["failed"],
         "summary": build_batch_summary(results),
+        "provenance": provenance,
     }
     write_batch_report(report_path, final_payload)
     return final_payload
