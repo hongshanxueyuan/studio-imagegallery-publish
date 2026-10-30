@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -250,7 +251,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             report_file="",
         )
 
-    def _mark_manifest_source(self, manifest_path: Path, *, block_type: str | None, section_id: str = "1.1", section_title: str = "1.1 示例课程", subtitle: str = "# 本节要点\n总结内容") -> None:
+    def _mark_manifest_source(self, manifest_path: Path, *, block_type: str | None, section_id: str = "1.1", section_title: str = "1.1 示例课程", subtitle: str = "## 正文\n课程内容") -> None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if block_type is not None:
             manifest["block_type"] = block_type
@@ -519,6 +520,641 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             plan["working_vertical_block_id"],
         )
 
+    def test_explicit_html_type_targets_文字讲解_even_when_vertical_contains_gallery(self) -> None:
+        course_structure = self._make_course_structure(
+            include_gallery=True,
+            include_target_html=True,
+            include_section_html=True,
+        )
+
+        plan = module.plan_publish_replacement(
+            course_structure,
+            source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            block_type="html",
+        )
+
+        self.assertEqual("html_based", plan["course_kind"])
+        self.assertEqual(
+            "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml",
+            plan["matched_source_block_locator"],
+        )
+        self.assertEqual(3, plan["initial_snapshot"]["direct_child_count"])
+        self.assertEqual("imagesgallery", plan["initial_snapshot"]["children"][1]["type"])
+
+    def test_explicit_html_type_does_not_guess_from_another_vertical(self) -> None:
+        course_structure = self._make_course_structure(
+            include_gallery=False,
+            include_target_html=False,
+            include_section_html=True,
+        )
+
+        plan = module.plan_publish_replacement(
+            course_structure,
+            source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            block_type="html",
+        )
+
+        self.assertEqual("missing_html_replacement_target", plan["planning_issue"]["code"])
+        self.assertEqual("", plan["matched_source_block_locator"])
+
+    def test_explicit_gallery_type_requires_a_unique_existing_gallery(self) -> None:
+        course_structure = self._make_course_structure(
+            include_gallery=True,
+            include_target_html=True,
+            include_section_html=False,
+        )
+        target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
+        target_vertical["blocks"].append(
+            {
+                "name": "旧版有声幻灯片",
+                "category": "imagesgallery",
+                "block_location": "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@secondgallery",
+            }
+        )
+
+        plan = module.plan_publish_replacement(
+            course_structure,
+            source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            block_type="imagesgallery",
+        )
+
+        self.assertEqual("ambiguous_gallery_replacement_target", plan["planning_issue"]["code"])
+        self.assertEqual("", plan["matched_source_block_locator"])
+
+    def test_resolve_source_block_type_detects_section_list_conflict_with_manifest_and_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "imagesgallery.json"
+            section_list_path = root / "section-list.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            section_list_path.write_text(
+                json.dumps({"sections": [{"section_id": "1.1", "section_title": "示例", "block_type": "html"}]}),
+                encoding="utf-8",
+            )
+
+            resolution = module.resolve_source_block_type(
+                {"section_id": "1.1", "section_title": "示例", "block_type": "imagesgallery"},
+                {"section_id": "1.1", "section_title": "示例", "block_type": "imagesgallery"},
+                manifest_path=manifest_path,
+            )
+
+        self.assertEqual("conflict", resolution["status"])
+
+    def test_operation_vertical_integrity_uses_validator_expected_snapshot_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            operation_path = Path(tmp) / "batch-operation.json"
+            operation_path.write_text(
+                json.dumps({"galleries": [{"gallery_key": "gallery-1"}]}),
+                encoding="utf-8",
+            )
+            before = {
+                "direct_child_count": 2,
+                "children": [
+                    {"locator": "block-v1:org+course+run+type@html+block@body", "type": "html", "order": 1},
+                    {"locator": "block-v1:org+course+run+type@html+block@summary", "type": "html", "order": 2},
+                ],
+            }
+            expected = {
+                "direct_child_count": 2,
+                "children": [
+                    {"locator": "block-v1:org+course+run+type@imagesgallery+block@new", "type": "imagesgallery", "order": 1},
+                    {"locator": "block-v1:org+course+run+type@html+block@summary", "type": "html", "order": 2},
+                ],
+            }
+
+            module.persist_vertical_integrity_evidence(
+                argparse.Namespace(
+                    operation_file=str(operation_path), gallery_key="gallery-1", execute=True,
+                ),
+                {
+                    "status": "replaced",
+                    "block_type": "html",
+                    "vertical_published": True,
+                    "vertical_snapshot_before": before,
+                    "expected_vertical_snapshot_after_delete": expected,
+                    "provenance": {"commit": "verified-commit", "inputs": []},
+                    "steps": [{"step": "publish_vertical", "status": "completed"}],
+                },
+            )
+            updated_operation = json.loads(operation_path.read_text(encoding="utf-8"))
+            entry = updated_operation["galleries"][0]
+
+        self.assertEqual("verified-commit", updated_operation["skill_provenance"]["commit"])
+        self.assertEqual("verified", entry["vertical_integrity"]["status"])
+        self.assertEqual("html", entry["vertical_integrity"]["block_type"])
+        self.assertEqual(before, entry["vertical_integrity"]["before"])
+        self.assertEqual(expected, entry["vertical_integrity"]["expected"])
+        self.assertTrue(entry["vertical_integrity"]["published"])
+        self.assertEqual("verified-commit", entry["vertical_integrity"]["provenance"]["commit"])
+
+    def test_skill_provenance_distinguishes_clean_and_dirty_checkouts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_root = Path(tmp) / "publisher-skill"
+            script_path = skill_root / "scripts" / "publish_imagegallery_block.py"
+            script_path.parent.mkdir(parents=True)
+            script_path.write_text("# active publisher", encoding="utf-8")
+            (skill_root / "SKILL.md").write_text("name: publisher-skill", encoding="utf-8")
+            subprocess.run(["git", "-C", str(skill_root), "init"], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(skill_root), "config", "user.name", "Publisher Test"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "config", "user.email", "publisher-test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "remote", "add", "origin", "https://example.invalid/publisher-skill.git"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "add", "SKILL.md", "scripts/publish_imagegallery_block.py"], check=True)
+            subprocess.run(["git", "-C", str(skill_root), "commit", "-m", "fixture"], check=True, capture_output=True, text=True)
+            head = subprocess.run(
+                ["git", "-C", str(skill_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            section_list = Path(tmp) / "section-list.json"
+            section_list.write_text('{"sections":[]}', encoding="utf-8")
+            section_list_hash = module.file_sha256(section_list)
+
+            with patch.object(module, "__file__", str(script_path)):
+                clean_provenance = module.skill_provenance(input_paths=[str(section_list)])
+                script_path.write_text("# modified publisher", encoding="utf-8")
+                dirty_provenance = module.skill_provenance(input_paths=[str(section_list)])
+
+        self.assertEqual("clean", clean_provenance["working_tree_state"])
+        self.assertEqual(head, clean_provenance["commit"])
+        self.assertEqual(head, clean_provenance["base_commit"])
+        self.assertNotEqual("unknown", clean_provenance["repository"])
+        self.assertNotEqual("unknown", clean_provenance["ref"])
+        self.assertNotEqual("unknown", clean_provenance["content_sha256"])
+        self.assertEqual("dirty", dirty_provenance["working_tree_state"])
+        self.assertEqual("unknown", dirty_provenance["commit"])
+        self.assertEqual(head, dirty_provenance["base_commit"])
+        self.assertNotEqual(clean_provenance["content_sha256"], dirty_provenance["content_sha256"])
+        self.assertEqual(section_list_hash, dirty_provenance["inputs"][0]["sha256"])
+
+    def test_skill_provenance_marks_copied_skill_metadata_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_root = Path(tmp) / "installed-skill"
+            script_path = skill_root / "scripts" / "publish_imagegallery_block.py"
+            script_path.parent.mkdir(parents=True)
+            script_path.write_text("# copied skill", encoding="utf-8")
+            (skill_root / "SKILL.md").write_text("name: copied-skill", encoding="utf-8")
+            section_list = Path(tmp) / "section-list.json"
+            section_list.write_text('{"sections":[{"block_type":"html"}]}', encoding="utf-8")
+            missing_input = Path(tmp) / "missing-section-list.json"
+            section_list_hash = module.file_sha256(section_list)
+
+            with patch.object(module, "__file__", str(script_path)):
+                provenance = module.skill_provenance(input_paths=[str(section_list), str(missing_input)])
+
+        self.assertEqual("unknown", provenance["repository"])
+        self.assertEqual("unknown", provenance["ref"])
+        self.assertEqual("unknown", provenance["commit"])
+        self.assertEqual("unknown", provenance["base_commit"])
+        self.assertEqual("unknown", provenance["working_tree_state"])
+        self.assertNotEqual("unknown", provenance["content_sha256"])
+        self.assertEqual(section_list_hash, provenance["inputs"][0]["sha256"])
+        self.assertEqual("unknown", provenance["inputs"][1]["sha256"])
+
+    def _run_single_publish_create_reconciliation(
+        self,
+        *,
+        mutation_applied: bool,
+        first_response: str = "timeout",
+        mutate_successful_create: bool = True,
+        first_success_mutates: bool = False,
+        reconciliation_locator: str = "",
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = self._write_manifest_bundle(Path(tmp))
+            vertical_id = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+            created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@createdaftertimeout"
+            before = {
+                "direct_child_count": 1,
+                "children": [
+                    {"locator": "block-v1:FIRAx+1040045+20260807+type@html+block@body", "type": "html", "order": 1},
+                ],
+            }
+            after = {
+                "direct_child_count": 2,
+                "children": [
+                    {"locator": "block-v1:FIRAx+1040045+20260807+type@html+block@body", "type": "html", "order": 1},
+                    {"locator": created_locator, "type": "imagesgallery", "order": 2},
+                ],
+            }
+            observed = {"applied": mutation_applied}
+            args = argparse.Namespace(
+                studio_url=f"https://studio.example.com/container/{vertical_id}",
+                manifest=str(manifest_path),
+                adapter=str(ADAPTER_PATH),
+                execute=True,
+                dry_run=False,
+                timeout=30,
+                vertical_block_id=vertical_id,
+                block_url="",
+                courses_base="",
+                account="",
+                password="",
+                cookie="csrftoken=fake",
+                csrf_token="",
+                skip_oss_multipart=True,
+                auth_retry_max_retries=4,
+                auth_retry_delay_seconds=0,
+                reconcile_create_block=lambda: {
+                    "status": "applied" if observed["applied"] else "not_applied",
+                    "block_locator": (reconciliation_locator or created_locator) if observed["applied"] else "",
+                    "observed_snapshot": after if observed["applied"] else before,
+                },
+            )
+            calls: list[str] = []
+
+            def fake_call_template(_session, name, _template, ctx, _execute, _timeout):
+                calls.append(name)
+                if name == "create_block":
+                    create_call_count = len([call for call in calls if call == "create_block"])
+                    if create_call_count == 1 and first_response == "timeout":
+                        raise module.TemplateCallError(name, 504, {"detail": "timeout"})
+                    if mutate_successful_create and (create_call_count > 1 or first_success_mutates):
+                        observed["applied"] = True
+                    ctx["block_locator"] = created_locator
+                    return {"step": name, "status": "ok", "block_locator": created_locator}
+                if name.startswith("upload_image"):
+                    return {"step": name, "status": "ok", "asset_id": "asset-001"}
+                if name == "upload_audio_prepare":
+                    ctx["file_key"] = "12345678-1234-1234-1234-123456789abc"
+                return {"step": name, "status": "ok"}
+
+            with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
+                with patch.object(module.requests, "Session", return_value=self._FakeStudioSession()):
+                    with patch.object(module, "call_template", side_effect=fake_call_template):
+                        try:
+                            result = module.run_single_publish(args)
+                        except Exception as exc:
+                            result = {
+                                "status": "failed",
+                                "failed_step": getattr(exc, "step_name", "create_block"),
+                                "error": exc,
+                            }
+        return result, calls, created_locator
+
+    def test_create_timeout_after_mutation_is_reconciled_without_recreating_gallery(self) -> None:
+        result, calls, created_locator = self._run_single_publish_create_reconciliation(mutation_applied=True)
+
+        create_step = next(step for step in result["steps"] if step["step"] == "create_block")
+        self.assertEqual(1, calls.count("create_block"))
+        self.assertEqual("reconciled", create_step["status"])
+        self.assertEqual("reconciled_after_reread", create_step["attempts"][0]["status"])
+        self.assertEqual(1, result["create_attempts"])
+        self.assertEqual(created_locator, result["block_locator"])
+
+    def test_create_timeout_without_mutation_retries_once_then_records_retried(self) -> None:
+        result, calls, created_locator = self._run_single_publish_create_reconciliation(mutation_applied=False)
+
+        create_step = next(step for step in result["steps"] if step["step"] == "create_block")
+        self.assertEqual(2, calls.count("create_block"))
+        self.assertEqual("retried", create_step["status"])
+        self.assertEqual(
+            ["not_applied_after_reconciliation", "response_ok"],
+            [attempt["status"] for attempt in create_step["attempts"]],
+        )
+        self.assertEqual(2, result["create_attempts"])
+        self.assertEqual(created_locator, result["block_locator"])
+
+    def test_successful_create_response_without_vertical_child_retries_once(self) -> None:
+        result, calls, _created_locator = self._run_single_publish_create_reconciliation(
+            mutation_applied=False,
+            first_response="success",
+        )
+
+        create_step = next(step for step in result["steps"] if step["step"] == "create_block")
+        self.assertEqual(2, calls.count("create_block"))
+        self.assertEqual("retried", create_step["status"])
+        self.assertEqual(
+            ["postcondition_missing_after_response", "response_ok"],
+            [attempt["status"] for attempt in create_step["attempts"]],
+        )
+        self.assertEqual("applied", create_step["attempts"][1]["postcondition_status"])
+
+    def test_successful_create_response_with_matching_vertical_child_completes(self) -> None:
+        result, calls, created_locator = self._run_single_publish_create_reconciliation(
+            mutation_applied=False,
+            first_response="success",
+            first_success_mutates=True,
+        )
+
+        create_step = next(step for step in result["steps"] if step["step"] == "create_block")
+        self.assertEqual(1, calls.count("create_block"))
+        self.assertEqual("completed", create_step["status"])
+        self.assertEqual("applied", create_step["attempts"][0]["postcondition_status"])
+        self.assertEqual(created_locator, create_step["block_locator"])
+
+    def test_successful_create_response_with_locator_mismatch_stops_before_upload(self) -> None:
+        result, calls, _created_locator = self._run_single_publish_create_reconciliation(
+            mutation_applied=True,
+            first_response="success",
+            first_success_mutates=True,
+            reconciliation_locator="block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@different",
+        )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("create_block", result["failed_step"])
+        self.assertEqual(1, calls.count("create_block"))
+        self.assertFalse(any(call.startswith("upload_image") for call in calls))
+
+    def test_successful_create_response_still_missing_after_retry_stops_before_upload(self) -> None:
+        result, calls, _created_locator = self._run_single_publish_create_reconciliation(
+            mutation_applied=False,
+            first_response="success",
+            mutate_successful_create=False,
+        )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("create_block", result["failed_step"])
+        self.assertEqual(2, calls.count("create_block"))
+        self.assertFalse(any(call.startswith("upload_image") for call in calls))
+
+    def test_process_persists_original_snapshot_and_wires_create_reconciler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._write_manifest_bundle(root)
+            self._mark_manifest_source(manifest_path, block_type="html")
+            course = self._make_course_structure(
+                include_gallery=False,
+                include_target_html=True,
+                include_section_html=False,
+            )
+            current_structure = json.loads(json.dumps(course, ensure_ascii=False))
+            vertical = current_structure["chapters"][0]["sections"][0]["verticals"][0]
+            vertical_id = vertical["block_location"]
+            created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@create-reconciled"
+            operation_path = root / "batch-operation.json"
+            operation_path.write_text(
+                json.dumps({"galleries": [{"gallery_key": "gallery-1", "manifest": str(manifest_path), "vertical_locator": vertical_id}]}),
+                encoding="utf-8",
+            )
+            args = self._in_place_args(manifest_path, root / "course.json", execute=True)
+            args.operation_file = str(operation_path)
+            args.gallery_key = "gallery-1"
+            args.execute = True
+            args.cookie = "csrftoken=fake"
+            observed_reconciliation: list[dict[str, object]] = []
+
+            def fake_live_plan(**kwargs):
+                plan = module.plan_publish_replacement(
+                    current_structure,
+                    source_vertical_block_id=kwargs["source_vertical_block_id"],
+                    target_vertical_block_id=kwargs["target_vertical_block_id"],
+                    block_type=kwargs.get("block_type", ""),
+                    excluded_block_locators=kwargs.get("excluded_block_locators", []),
+                )
+                return plan, {"step": "load_live_target_structure", "status": "ok"}
+
+            def fake_single_publish(publish_args):
+                saved = json.loads(operation_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    module.plan_publish_replacement(
+                        course,
+                        source_vertical_block_id=vertical_id,
+                        target_vertical_block_id=vertical_id,
+                        block_type="html",
+                    )["initial_snapshot"],
+                    saved["galleries"][0]["vertical_integrity"]["before"],
+                )
+                vertical["blocks"].append({
+                    "name": "有声幻灯片",
+                    "category": "imagesgallery",
+                    "block_location": created_locator,
+                })
+                evidence = publish_args.reconcile_create_block()
+                observed_reconciliation.append(evidence)
+                self.assertEqual("applied", evidence["status"])
+                return {
+                    "studio_base": "https://studio.example.com",
+                    "block_locator": created_locator,
+                    "steps": [{"step": "create_block", "status": "reconciled"}],
+                    "create_attempts": 1,
+                }
+
+            with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
+                with patch.object(module, "maybe_fetch_live_replacement_plan", side_effect=fake_live_plan):
+                    with patch.object(module, "run_single_publish", side_effect=fake_single_publish):
+                        with patch.object(
+                            module,
+                            "apply_in_place_publish_actions",
+                            return_value={"status": "replaced", "vertical_published": True, "steps": []},
+                        ):
+                            result = module.process_publish_target(
+                                {
+                                    "name": "1.1",
+                                    "manifest": str(manifest_path),
+                                    "section_id": "1.1",
+                                    "target_vertical_block_location": vertical_id,
+                                    "source_vertical_block_location": vertical_id,
+                                    "studio_vertical_url": f"https://studio.example.com/container/{vertical_id}",
+                                },
+                                course,
+                                args,
+                                self.adapter,
+                            )
+
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual(1, len(observed_reconciliation))
+        self.assertEqual("applied", observed_reconciliation[0]["status"])
+
+    def test_process_target_with_missing_type_stops_before_live_read_or_gallery_create(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = self._write_manifest_bundle(Path(tmp))
+            target_vertical = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+            target = {
+                "name": "1.1",
+                "manifest": str(manifest_path),
+                "source_vertical_block_location": target_vertical,
+                "target_vertical_block_location": target_vertical,
+                "studio_vertical_url": f"https://studio.example.com/container/{target_vertical}",
+            }
+            args = argparse.Namespace(
+                execute=True, timeout=30, cleanup_only=False, cookie="csrftoken=fake",
+                csrf_token="", account="", password="", courses_base="", adapter=str(ADAPTER_PATH),
+            )
+            with patch.object(module, "maybe_fetch_live_replacement_plan", side_effect=AssertionError("must fail before live reads")):
+                with patch.object(module, "run_single_publish", side_effect=AssertionError("must fail before creating Gallery")):
+                    result = module.process_publish_target(
+                        target,
+                        self._make_course_structure(include_gallery=False, include_target_html=True, include_section_html=False),
+                        args,
+                        self.adapter,
+                    )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("resolve_source_block_type", result["failed_step"])
+
+    def test_process_target_with_standalone_summary_page_stops_before_gallery_create(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = self._write_manifest_bundle(Path(tmp))
+            self._mark_manifest_source(manifest_path, block_type="html", subtitle="## 本节要点\n不得进入 Gallery")
+            target_vertical = "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical"
+            target = {
+                "name": "1.1",
+                "manifest": str(manifest_path),
+                "block_type": "html",
+                "target_vertical_block_location": target_vertical,
+                "source_vertical_block_location": target_vertical,
+                "studio_vertical_url": f"https://studio.example.com/container/{target_vertical}",
+            }
+            args = argparse.Namespace(execute=True, timeout=30, cleanup_only=False)
+            with patch.object(module, "run_single_publish", side_effect=AssertionError("must not create a leaking Gallery")):
+                result = module.process_publish_target(
+                    target,
+                    self._make_course_structure(include_gallery=False, include_target_html=True, include_section_html=False),
+                    args,
+                    self.adapter,
+                )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("stage_b_output_contract", result["failed_step"])
+        self.assertEqual([1], result["leaking_summary_pages"])
+        self.assertEqual("skipped", result["steps"][-1]["status"])
+
+    def _run_fake_vertical_replacement(
+        self,
+        *,
+        uncertain_move: str = "",
+        fail_delete: bool = False,
+        noop_delete_once: bool = False,
+        wrong_delete: bool = False,
+    ):
+        course = self._make_course_structure(
+            include_gallery=False,
+            include_target_html=True,
+            include_section_html=False,
+        )
+        target_vertical = course["chapters"][0]["sections"][0]["verticals"][0]
+        target_locator = target_vertical["block_location"]
+        created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@newgallery"
+        baseline_plan = module.plan_publish_replacement(
+            course,
+            source_vertical_block_id=target_locator,
+            target_vertical_block_id=target_locator,
+            block_type="html",
+        )
+        live_course = json.loads(json.dumps(course, ensure_ascii=False))
+        live_vertical = live_course["chapters"][0]["sections"][0]["verticals"][0]
+        live_vertical["blocks"].append({
+            "name": "有声幻灯片",
+            "category": "imagesgallery",
+            "block_location": created_locator,
+        })
+        live_plan = module.plan_publish_replacement(
+            live_course,
+            source_vertical_block_id=target_locator,
+            target_vertical_block_id=target_locator,
+            block_type="html",
+            excluded_block_locators=[created_locator],
+        )
+        live_plan["resolved_block_type"] = "html"
+        live_plan["plan_source"] = "live_target"
+        counts = {"reorder_children": 0, "delete_block": 0, "publish_vertical": 0}
+        reconciliation_state = {"applied_move": False}
+
+        def fake_write(_session, name, _template, ctx, _execute, _timeout):
+            counts[name] = counts.get(name, 0) + 1
+            if name == "reorder_children":
+                if uncertain_move == "not_applied_once" and counts[name] == 1:
+                    raise module.TemplateCallError(name, 504, {"detail": "timeout"})
+                by_locator = {block["block_location"]: block for block in live_vertical["blocks"]}
+                live_vertical["blocks"] = [by_locator[locator] for locator in ctx["vertical_children_obj"]]
+                reconciliation_state["applied_move"] = True
+                if uncertain_move == "applied_then_timeout" and counts[name] == 1:
+                    raise module.TemplateCallError(name, 504, {"detail": "timeout"})
+            elif name == "delete_block":
+                if fail_delete:
+                    raise module.TemplateCallError(name, 503, {"detail": "delete unavailable"})
+                if noop_delete_once and counts[name] == 1:
+                    return {"step": name, "status": "ok"}
+                locator = (
+                    "block-v1:FIRAx+1040045+20260807+type@problem+block@intro"
+                    if wrong_delete
+                    else ctx["delete_block_locator"]
+                )
+                live_vertical["blocks"] = [block for block in live_vertical["blocks"] if block["block_location"] != locator]
+            elif name == "publish_vertical":
+                live_vertical["published"] = True
+            return {"step": name, "status": "ok"}
+
+        def fake_state(*_args, **_kwargs):
+            return module.vertical_child_snapshot(live_vertical), live_vertical.get("published")
+
+        args = argparse.Namespace(execute=True, timeout=30, cookie="csrftoken=fake", csrf_token="", account="", password="", courses_base="")
+        with patch.object(module, "maybe_fetch_live_replacement_plan", return_value=(live_plan, {"step": "load_live_target_structure", "status": "ok"})):
+            with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
+                with patch.object(module, "fetch_vertical_state", side_effect=fake_state):
+                    with patch.object(module, "call_template", side_effect=fake_write):
+                        outcome = None
+                        failure = None
+                        try:
+                            outcome = module.apply_in_place_publish_actions(
+                                {"studio_base": "https://studio.example.com", "block_locator": created_locator, "steps": []},
+                                adapter=self.adapter,
+                                replacement_plan=baseline_plan,
+                                studio_url=f"https://studio.example.com/container/{target_locator}",
+                                execute=True,
+                                timeout=30,
+                                args=args,
+                            )
+                        except module.PublishFailure as exc:
+                            failure = exc
+        return outcome, failure, counts
+
+    def test_uncertain_applied_move_is_reconciled_without_replaying_and_final_count_is_preserved(self) -> None:
+        result, failure, counts = self._run_fake_vertical_replacement(uncertain_move="applied_then_timeout")
+
+        self.assertIsNone(failure)
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual(1, counts["reorder_children"])
+        self.assertEqual("reconciled", next(step["status"] for step in result["steps"] if step["step"] == "reorder_children"))
+        self.assertEqual(result["vertical_snapshot_before"]["direct_child_count"], result["expected_vertical_snapshot_after_delete"]["direct_child_count"])
+        self.assertTrue(result["vertical_published"])
+
+    def test_unresolved_delete_retries_once_then_skips_vertical_publish(self) -> None:
+        result, failure, counts = self._run_fake_vertical_replacement(fail_delete=True)
+
+        self.assertIsNone(result)
+        self.assertEqual(2, counts["delete_block"])
+        self.assertEqual(0, counts["publish_vertical"])
+        self.assertEqual("delete_block", failure.step_name)
+        self.assertIn("publish_vertical", [step["step"] for step in failure.steps if step["status"] == "skipped"])
+
+    def test_success_response_without_delete_postcondition_reconciles_and_retries_once(self) -> None:
+        result, failure, counts = self._run_fake_vertical_replacement(noop_delete_once=True)
+
+        self.assertIsNone(failure)
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual(2, counts["delete_block"])
+        delete_step = next(step for step in result["steps"] if step["step"] == "delete_block")
+        self.assertEqual("retried", delete_step["status"])
+        self.assertEqual("postcondition_missing_after_response", delete_step["attempts"][0]["status"])
+
+    def test_uncertain_unapplied_move_is_reconciled_and_retried_once(self) -> None:
+        result, failure, counts = self._run_fake_vertical_replacement(uncertain_move="not_applied_once")
+
+        self.assertIsNone(failure)
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual(2, counts["reorder_children"])
+        move_step = next(step for step in result["steps"] if step["step"] == "reorder_children")
+        self.assertEqual("retried", move_step["status"])
+
+    def test_count_preserving_wrong_deletion_fails_snapshot_comparison(self) -> None:
+        result, failure, counts = self._run_fake_vertical_replacement(wrong_delete=True)
+
+        self.assertIsNone(result)
+        self.assertEqual(1, counts["delete_block"])
+        self.assertEqual(0, counts["publish_vertical"])
+        failed_delete = next(step for step in failure.steps if step["step"] == "delete_block")
+        self.assertEqual("blocked", failed_delete["status"])
+        self.assertEqual(
+            failed_delete["expected_snapshot"]["direct_child_count"],
+            failed_delete["observed_snapshot"]["direct_child_count"],
+        )
+        self.assertNotEqual(failed_delete["expected_snapshot"], failed_delete["observed_snapshot"])
+
     def test_load_course_structure_snapshot_normalizes_concise_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -638,11 +1274,14 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             tmp_path = Path(tmp)
             targets_file = tmp_path / "imagegallery-push-studio-targets.json"
             report_file = tmp_path / "publish-report.json"
+            section_list = tmp_path / "section-list.json"
             (tmp_path / "course.json").write_text(json.dumps({"chapters": []}, ensure_ascii=False), encoding="utf-8")
+            section_list.write_text('{"sections":[]}', encoding="utf-8")
             targets_file.write_text(
                 json.dumps(
                     {
                         "course_structure_json": str(tmp_path / "course.json"),
+                        "section_list_json": str(section_list),
                         "targets": [
                             {"name": "1.1", "manifest": "a.json", "target_vertical_block_location": "vertical-a", "studio_vertical_url": "https://studio.example.com/container/vertical-a"},
                             {"name": "1.2", "manifest": "b.json", "target_vertical_block_location": "vertical-b", "studio_vertical_url": "https://studio.example.com/container/vertical-b"},
@@ -679,6 +1318,8 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             self.assertEqual("1.3", result["failed"][0]["name"])
             self.assertEqual("1.3", result["manual_followup_failed"][0]["name"])
             self.assertTrue(report_file.exists())
+            section_input = next(item for item in result["provenance"]["inputs"] if item["name"] == "section-list.json")
+            self.assertEqual(module.file_sha256(section_list), section_input["sha256"])
 
     def test_run_batch_publish_reloads_course_structure_before_each_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -773,12 +1414,77 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifest_path = self._write_manifest_bundle(tmp_path)
+            self._mark_manifest_source(manifest_path, block_type="imagesgallery")
+            section_list_path = tmp_path / "section-list.json"
+            section_list_path.write_text(
+                json.dumps({"sections": [{"section_id": "1.1", "section_title": "1.1 示例课程", "block_type": "imagesgallery"}]}),
+                encoding="utf-8",
+            )
             course_path = tmp_path / "course.json"
             course_path.write_text(
                 json.dumps(
                     self._make_course_structure(
                         include_gallery=True,
                         include_target_html=False,
+                        include_section_html=False,
+                    ),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            args = argparse.Namespace(
+                studio_url="https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                manifest=str(manifest_path),
+                adapter=str(ADAPTER_PATH),
+                execute=False,
+                dry_run=True,
+                timeout=30,
+                vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                block_url="",
+                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                course_structure_json=str(course_path),
+                courses_base="",
+                account="",
+                password="",
+                cookie="csrftoken=fake",
+                csrf_token="",
+                skip_oss_multipart=False,
+                auth_retry_max_retries=4,
+                auth_retry_delay_seconds=0,
+                targets_file="",
+                report_file="",
+                section_list_json=str(section_list_path),
+            )
+
+            with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
+                result = module.run_in_place_publish(args)
+
+            section_input = next(item for item in result["provenance"]["inputs"] if item["name"] == "section-list.json")
+            self.assertEqual(module.file_sha256(section_list_path), section_input["sha256"])
+
+        self.assertEqual("replaced", result["status"])
+        self.assertEqual(
+            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            result["target_vertical_url"],
+        )
+        self.assertEqual(
+            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@legacygallery",
+            result["matched_source_block_url"],
+        )
+        self.assertTrue(result["created_imagegallery_block_url"].startswith("https://studio.example.com/container/"))
+
+    def test_run_in_place_publish_html_section_sample_returns_working_vertical_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = self._write_manifest_bundle(tmp_path)
+            self._mark_manifest_source(manifest_path, block_type="html")
+            course_path = tmp_path / "course.json"
+            course_path.write_text(
+                json.dumps(
+                    self._make_course_structure(
+                        include_gallery=False,
+                        include_target_html=True,
                         include_section_html=False,
                     ),
                     ensure_ascii=False,
@@ -818,65 +1524,11 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             result["target_vertical_url"],
         )
         self.assertEqual(
-            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@legacygallery",
-            result["matched_source_block_url"],
-        )
-        self.assertTrue(result["created_imagegallery_block_url"].startswith("https://studio.example.com/container/"))
-
-    def test_run_in_place_publish_html_section_sample_returns_working_vertical_url(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            manifest_path = self._write_manifest_bundle(tmp_path)
-            course_path = tmp_path / "course.json"
-            course_path.write_text(
-                json.dumps(
-                    self._make_course_structure(
-                        include_gallery=False,
-                        include_target_html=False,
-                        include_section_html=True,
-                    ),
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            args = argparse.Namespace(
-                studio_url="https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
-                manifest=str(manifest_path),
-                adapter=str(ADAPTER_PATH),
-                execute=False,
-                dry_run=True,
-                timeout=30,
-                vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
-                block_url="",
-                source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
-                course_structure_json=str(course_path),
-                courses_base="",
-                account="",
-                password="",
-                cookie="csrftoken=fake",
-                csrf_token="",
-                skip_oss_multipart=False,
-                auth_retry_max_retries=4,
-                auth_retry_delay_seconds=0,
-                targets_file="",
-                report_file="",
-            )
-
-            with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
-                result = module.run_in_place_publish(args)
-
-        self.assertEqual("replaced", result["status"])
-        self.assertEqual(
-            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@sectionhtmlvertical",
-            result["target_vertical_url"],
-        )
-        self.assertEqual(
             "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
             result["requested_target_vertical_url"],
         )
         self.assertEqual(
-            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@html+block@wordiesthtml",
+            "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@html+block@targethtml",
             result["matched_source_block_url"],
         )
 
@@ -940,20 +1592,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
             result = module.run_in_place_publish(args)
 
-        self.assertEqual("replaced", result["status"])
-        self.assertEqual("preserved", result["summary_cleanup"]["status"])
-        self.assertEqual("", result["matched_summary_component_name"])
-        self.assertEqual("", result["matched_summary_block_url"])
-        steps = result["steps"]
-        save_index = max(index for index, step in enumerate(steps) if step["step"] == "save_block")
-        delete_indexes = [index for index, step in enumerate(steps) if step["step"] == "delete_block"]
-        publish_index = next(index for index, step in enumerate(steps) if step["step"] == "publish_vertical")
-        self.assertEqual(1, len(delete_indexes))
-        self.assertLess(save_index, min(delete_indexes))
-        self.assertLess(max(delete_indexes), publish_index)
-        deleted_urls = [steps[index]["url"] for index in delete_indexes]
-        self.assertTrue(any(url.endswith("block@targethtml") for url in deleted_urls))
-        self.assertFalse(any("summary" in url for url in deleted_urls))
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("stage_b_output_contract", result["failed_step"])
+        self.assertEqual([1], result["leaking_summary_pages"])
+        self.assertIn("publish_vertical", result["skipped_steps"])
 
     def test_cleanup_only_dry_run_is_unsupported_without_studio_actions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1111,8 +1753,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 course_structure,
                 source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
                 target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+                block_type="html",
             )
-            args = self._in_place_args(manifest_path, course_path, execute=True)
+            args = self._in_place_args(manifest_path, course_path, execute=False)
             calls: list[tuple[str, str]] = []
             created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@newgallery"
 
@@ -1138,6 +1781,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                                     "name": "1.1",
                                     "manifest": str(manifest_path),
                                     "section_id": "1.1",
+                                    "block_type": "html",
                                     "target_vertical_block_location": "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
                                     "source_vertical_block_location": "block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
                                     "studio_vertical_url": "https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
@@ -1148,7 +1792,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                             )
 
         self.assertEqual("replaced", result["status"])
-        self.assertTrue(result["created_imagegallery_block_url"].endswith("block@newgallery"))
+        self.assertTrue(result["created_imagegallery_block_url"].endswith("__dry_run_created_imagesgallery__"))
         self.assertTrue(result["target_vertical_url"].endswith("block@targetvertical"))
         self.assertEqual("", result["matched_summary_block_url"])
         self.assertEqual("preserved", result["summary_cleanup"]["status"])
@@ -1209,12 +1853,11 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             manifest_path = self._write_manifest_bundle(manifest_dir)
             self._mark_manifest_source(
                 manifest_path,
-                block_type=None,
+                block_type="html",
                 section_id="1.1",
                 section_title="1.1 示例课程",
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest.pop("block_type", None)
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
 
             unrelated_section_list = tmp_path / "section-list.json"
@@ -1249,7 +1892,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertFalse(any(url.endswith("block@terminal-summary") for url in delete_urls))
         self.assertEqual("preserved", explicit_path_result["summary_cleanup"]["status"])
 
-    def test_summary_preservation_ignores_missing_ambiguous_and_conflicting_source_metadata(self) -> None:
+    def test_missing_ambiguous_and_conflicting_source_metadata_fails_before_replacement(self) -> None:
         scenarios = ("missing", "ambiguous", "conflicting")
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
@@ -1297,12 +1940,10 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 }
                 result = module.process_publish_target(target, course_structure, args, self.adapter)
 
-                self.assertEqual("replaced", result["status"])
-                self.assertFalse(result["requires_manual_followup"])
-                self.assertEqual("preserved", result["summary_cleanup"]["status"])
-                deleted_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
-                self.assertTrue(deleted_urls)
-                self.assertFalse(any(url.endswith("block@terminal-summary") for url in deleted_urls))
+                self.assertEqual("failed", result["status"])
+                self.assertTrue(result["requires_manual_followup"])
+                self.assertIn(result["failed_step"], {"resolve_source_block_type"})
+                self.assertNotIn("delete_block", [step.get("step") for step in result["steps"]])
 
     def test_summary_preservation_is_independent_of_gallery_heading_and_match_count(self) -> None:
         for scenario in ("gallery_without_summary", "html_no_match", "html_nonterminal_summary", "imagegallery_origin", "ambiguous_summary"):
@@ -1310,7 +1951,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 tmp_path = Path(tmp)
                 manifest_path = self._write_manifest_bundle(tmp_path)
                 source_type = "imagesgallery" if scenario == "imagegallery_origin" else "html"
-                subtitle = "普通课程内容" if scenario == "gallery_without_summary" else "# 本节要点\n总结内容"
+                subtitle = "## 正文\n普通课程内容"
                 self._mark_manifest_source(manifest_path, block_type=source_type, subtitle=subtitle)
                 include_gallery = scenario == "imagegallery_origin"
                 course_structure = self._make_course_structure(
@@ -1370,7 +2011,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             }
             created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@newgallery"
             calls: list[str] = []
-            first_publish_failed = False
+            allow_publish_success = False
+            target_vertical = current_structure["chapters"][0]["sections"][0]["verticals"][0]
+            target_vertical["published"] = False
 
             def fake_live_plan(**kwargs):
                 return (
@@ -1378,19 +2021,42 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         current_structure,
                         source_vertical_block_id=kwargs["source_vertical_block_id"],
                         target_vertical_block_id=kwargs["target_vertical_block_id"],
+                        block_type=kwargs.get("block_type", ""),
                         excluded_block_locators=kwargs.get("excluded_block_locators", []),
                     ),
                     {"step": "load_live_target_structure", "status": "ok"},
                 )
 
             def fake_adapter(_session, name, _template, ctx, _execute, _timeout):
-                nonlocal first_publish_failed
+                nonlocal allow_publish_success
                 calls.append(name)
                 if name == "create_block":
                     ctx["block_locator"] = created_locator
-                if name == "publish_vertical" and not first_publish_failed:
-                    first_publish_failed = True
+                    target_vertical["blocks"].append(
+                        {
+                            "name": "有声幻灯片",
+                            "category": "imagesgallery",
+                            "block_location": created_locator,
+                        }
+                    )
+                if name == "reorder_children":
+                    blocks_by_locator = {
+                        block.get("block_location"): block for block in target_vertical["blocks"]
+                    }
+                    target_vertical["blocks"] = [
+                        blocks_by_locator[locator]
+                        for locator in ctx["vertical_children_obj"]
+                        if locator in blocks_by_locator
+                    ]
+                if name == "delete_block":
+                    target_vertical["blocks"] = [
+                        block for block in target_vertical["blocks"]
+                        if block.get("block_location") != ctx["delete_block_locator"]
+                    ]
+                if name == "publish_vertical" and not allow_publish_success:
                     raise module.TemplateCallError(name, 500, {"detail": "publish failed"})
+                if name == "publish_vertical":
+                    target_vertical["published"] = True
                 if name.startswith("upload_image"):
                     return {"step": name, "status": "ok", "asset_id": "asset-001"}
                 if name == "upload_audio_prepare":
@@ -1400,32 +2066,23 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             with patch.dict("os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False):
                 with patch.object(module, "maybe_fetch_live_replacement_plan", side_effect=fake_live_plan):
                     with patch.object(module, "build_studio_session_from_args", return_value=(object(), "csrf", True)):
-                        with patch.object(module, "call_template", side_effect=fake_adapter):
-                            first_result = module.process_publish_target(target, initial_structure, args, self.adapter)
-                            self.assertEqual("failed", first_result["status"])
-                            self.assertEqual("publish_vertical", first_result["failed_step"])
-                            self.assertEqual("preserved", first_result["summary_cleanup"]["status"])
+                        with patch.object(module, "fetch_vertical_state", side_effect=lambda _session, **kwargs: module.vertical_snapshot_for_course(current_structure, kwargs["vertical_locator"])):
+                            with patch.object(module, "call_template", side_effect=fake_adapter):
+                                first_result = module.process_publish_target(target, initial_structure, args, self.adapter)
+                                self.assertEqual("failed", first_result["status"])
+                                self.assertEqual("publish_vertical", first_result["failed_step"])
+                                self.assertEqual("preserved", first_result["summary_cleanup"]["status"])
+                                self.assertEqual(2, calls.count("publish_vertical"))
 
-                            target_vertical = current_structure["chapters"][0]["sections"][0]["verticals"][0]
-                            target_vertical["blocks"] = [
-                                block for block in target_vertical["blocks"]
-                                if block.get("block_location") != "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml"
-                            ]
-                            target_vertical["blocks"].append(
-                                {
-                                    "name": "有声幻灯片",
-                                    "category": "imagesgallery",
-                                    "block_location": created_locator,
-                                }
-                            )
-                            start_retry_calls = len(calls)
-                            second_result = module.process_publish_target(
-                                target,
-                                current_structure,
-                                args,
-                                self.adapter,
-                                previous_result=first_result,
-                            )
+                                allow_publish_success = True
+                                start_retry_calls = len(calls)
+                                second_result = module.process_publish_target(
+                                    target,
+                                    current_structure,
+                                    args,
+                                    self.adapter,
+                                    previous_result=first_result,
+                                )
 
         self.assertEqual("replaced", second_result["status"])
         self.assertTrue(second_result["resumed_from_previous_run"])
@@ -1475,7 +2132,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            args = self._in_place_args(manifest_path, course_path, execute=True)
+            args = self._in_place_args(manifest_path, course_path, execute=False)
             args.targets_file = str(targets_path)
             args.report_file = str(report_path)
             calls: list[str] = []
@@ -1724,7 +2381,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                             "matched_source_block_locator": "block-v1:FIRAx+211181+20251122+type@imagesgallery+block@stalegallery",
                         },
                         studio_url="https://studio.example.com/container/block-v1:FIRAx+211181+20251122+type@vertical+block@targetvertical",
-                        execute=True,
+                        execute=False,
                         timeout=30,
                         args=argparse.Namespace(
                             execute=True,
@@ -1799,7 +2456,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                             "matched_source_block_locator": legacy_block_locator,
                         },
                         studio_url="https://studio.example.com/container/block-v1:FIRAx+211181+20251122+type@vertical+block@targetvertical",
-                        execute=True,
+                        execute=False,
                         timeout=30,
                         args=argparse.Namespace(
                             execute=True,
@@ -1870,6 +2527,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         bundle_dir = tempfile.TemporaryDirectory()
         self.addCleanup(bundle_dir.cleanup)
         manifest_path = self._write_manifest_bundle(Path(bundle_dir.name))
+        self._mark_manifest_source(manifest_path, block_type="imagesgallery")
         course_structure = self._make_course_structure(
             include_gallery=True,
             include_target_html=False,
@@ -2309,8 +2967,8 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("cleanup-only", skill_doc)
         self.assertIn("返回 `unsupported`", skill_doc)
         self.assertIn("--section-list-json", skill_doc)
-        self.assertIn("不会影响 HTML 摘要保留行为", skill_doc)
-        self.assertIn("保留独立的 HTML 摘要组件", skill_doc)
+        self.assertIn("`本节要点组件` 会保留", skill_doc)
+        self.assertIn("保留独立的 `本节要点组件`", skill_doc)
         self.assertIn("失败步骤", skill_doc)
 
 

@@ -61,13 +61,23 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
    - 上传图片
    - 上传 / 注册 / 绑定音频
    - 保存播放配置和展示名称
-   - 如提供课程结构信息，则按课程结构替换小节正文并发布 vertical；单独的 HTML 摘要组件会保留
+   - 如提供课程结构信息，先核对来源 `block_type`，再按类型替换正文并校验 vertical；独立的 `本节要点组件` 会保留
 5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
 
-## HTML 摘要组件保留
+## 就地替换与发布完整性
 
-- 普通发布、批量发布、失败重试和中断恢复都会按原流程替换小节正文，同时保留独立的 HTML 摘要组件。
-- 摘要组件的位置、数量、标题和可见内容不会触发删除，也不会阻止正文替换。发布器会将识别到的摘要组件从正文候选中排除。
+- `block_type` 是每个 target 的来源契约。发布器核对 Gallery manifest、publish target 和可用的 `section-list.json`；缺失或冲突时，在 Studio 写入前停止该 target。不要依据 Studio 现有子组件推断来源类型。
+- `html` target 只在目标 vertical 中替换第一个直接 HTML 子组件 `文字讲解组件`。没有匹配项时停止该 target。`imagesgallery` target 只在目标 vertical 中替换唯一的 Gallery 替换目标组件；目标缺失或有多个候选时停止该 target。
+- 在第一次 Studio 写入前保存目标 vertical 的纵向组件快照，记录直接子组件数量、locator、类型和顺序。创建 Gallery、移动 Gallery、删除替换目标组件后分别重新读取 Studio，并执行状态对账。数量相同但 locator、类型或顺序不同也属于失败。
+- 创建、移动或删除收到成功响应后也要核对纵向组件快照。若响应不确定或状态未达到预期，先重新读取 Studio；目标状态已经生效时，按 `completed` 或 `reconciled` 记录并继续，能确认未生效时最多重试一次，无法确认时停止。保留最初的纵向组件快照作为整个恢复过程的基线。
+- 只有所有结构步骤都与预期纵向组件快照相符，才发布 vertical；Studio 必须明确返回 `published=true` 才算小节正式发布状态通过。未解决的创建、移动、删除或结构问题会跳过该 vertical 的最终发布，并记录失败步骤与预期、观察快照。
+- 发布前检查 Gallery 页和 speech 输入中的独立 `本节要点组件` 内容。发现泄漏时，在创建 Gallery 前将该 target 标为失败并跳过 vertical 发布；Studio 原有的 `本节要点组件` 继续保留。
+- 结果报告记录前后快照、步骤状态、重试记录、发布状态和可验证的 skill / 输入 provenance。无法确认的 provenance 写作 `unknown`。单 Gallery operation 文件中的 `vertical_integrity` 证据供批次验证器核对。
+
+## 本节要点组件保留
+
+- 普通发布、批量发布、失败重试和中断恢复都会按原流程替换小节正文，同时保留独立的 `本节要点组件`。
+- `本节要点组件` 的位置、数量、标题和可见内容不会触发删除，也不会阻止正文替换。发布器会将识别到的组件从替换目标候选中排除。
 - 旧的 `--cleanup-only` 参数仍可识别，但会在读取 Studio 课程结构、认证或发出请求前返回 `unsupported`（退出码 `2`）。
 - 批量 targets 中标记 `cleanup_only` 的目标返回 `unsupported`；批次继续处理其他目标，在汇总中统计该目标，并以退出码 `2` 返回。
 
@@ -149,12 +159,12 @@ python scripts/publish_imagegallery_block.py \
 - `--auth-retry-delay-seconds`：认证重试之间的等待秒数；默认 `3`
 - `--course-structure-json`：课程结构快照，用于就地替换小节正文
 - `--source-vertical-block-id`：当目标课是导入副本时，用源课 vertical locator 做课程结构匹配
-- `--section-id` / `--section-title` / `--block-type` / `--section-list-json`：旧 targets 与调用方的兼容字段；不会影响 HTML 摘要保留行为
+- `--section-id` / `--section-title` / `--block-type` / `--section-list-json`：target 类型和 section-list 来源元数据
 - `--cleanup-only`：兼容旧命令行调用；返回 `unsupported`，不访问 Studio
 - `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
 - `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`unsupported` 和失败项
 
-每个 vertical 的结果会包含可点击的目标 vertical URL、新建或复用的 gallery URL、摘要组件保留状态、已完成和失败步骤，以及失败原因或人工跟进说明。
+每个 vertical 的结果会包含可点击的目标 vertical URL、新建或复用的 gallery URL、`本节要点组件` 保留状态、纵向组件快照、已完成和失败步骤，以及失败原因或人工跟进说明。
 
 ## 单 Gallery 发布检查点
 
