@@ -27,6 +27,42 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
     def setUp(self) -> None:
         self.adapter = json.loads(ADAPTER_PATH.read_text(encoding="utf-8"))
 
+    def test_atomic_write_json_retries_windows_permission_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "operation.json"
+            real_replace = module.os.replace
+            replace_calls = 0
+
+            def flaky_replace(source, destination):
+                nonlocal replace_calls
+                replace_calls += 1
+                if replace_calls <= 2:
+                    raise PermissionError("temporary sharing violation")
+                real_replace(source, destination)
+
+            with patch.object(module.os, "name", "nt"):
+                with patch.object(module.os, "replace", side_effect=flaky_replace):
+                    with patch.object(module.time, "sleep") as sleep:
+                        module.atomic_write_json(path, {"status": "saved"})
+
+            self.assertEqual(3, replace_calls)
+            self.assertEqual(2, sleep.call_count)
+            self.assertEqual({"status": "saved"}, json.loads(path.read_text(encoding="utf-8")))
+
+    def test_atomic_write_json_preserves_last_permission_error_after_retry_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "operation.json"
+            error = PermissionError("destination remained locked")
+            with patch.object(module.os, "name", "nt"):
+                with patch.object(module.os, "replace", side_effect=error) as replace:
+                    with patch.object(module.time, "sleep") as sleep:
+                        with self.assertRaises(PermissionError) as caught:
+                            module.atomic_write_json(path, {"status": "saved"})
+
+            self.assertIs(error, caught.exception)
+            self.assertEqual(module.ATOMIC_WRITE_REPLACE_RETRIES + 1, replace.call_count)
+            self.assertEqual(module.ATOMIC_WRITE_REPLACE_RETRIES, sleep.call_count)
+
     def _write_manifest_bundle(self, root: Path) -> Path:
         image_path = root / "page-001.png"
         audio_path = root / "full_speech.mp3"

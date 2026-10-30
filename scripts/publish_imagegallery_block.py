@@ -24,6 +24,8 @@ import requests
 
 DEFAULT_AUTH_RETRY_MAX_RETRIES = 4
 DEFAULT_AUTH_RETRY_DELAY_SECONDS = 3.0
+ATOMIC_WRITE_REPLACE_RETRIES = 2
+ATOMIC_WRITE_REPLACE_RETRY_DELAY_SECONDS = 0.05
 DEFAULT_BATCH_REPORT_FILENAME = "imagegallery-publish-report.json"
 AUTH_ERROR_HINTS = (
     "not login",
@@ -1673,7 +1675,14 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         temp_file.flush()
         os.fsync(temp_file.fileno())
     try:
-        os.replace(temp_path, path)
+        for attempt in range(ATOMIC_WRITE_REPLACE_RETRIES + 1):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt >= ATOMIC_WRITE_REPLACE_RETRIES:
+                    raise
+                time.sleep(ATOMIC_WRITE_REPLACE_RETRY_DELAY_SECONDS)
     finally:
         if temp_path.exists():
             temp_path.unlink()
