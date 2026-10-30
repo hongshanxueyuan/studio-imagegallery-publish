@@ -400,6 +400,29 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertIn("structure_mismatch", target["issues"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
 
+    def test_final_course_check_retains_unresolved_publisher_vertical_issue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation = self._operation(manifest)
+            operation["galleries"][0]["vertical_integrity"]["status"] = "unresolved"
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            target = next(item for item in state["course_structure_verification"]["subsections"] if item["vertical_locator"] == VERTICAL_1)
+            self.assertEqual("issue", target["status"])
+            self.assertIn("publisher_vertical_integrity_unresolved", target["issues"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+
     def test_cli_continues_after_one_gallery_is_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
