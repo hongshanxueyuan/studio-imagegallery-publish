@@ -61,16 +61,18 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
    - 上传图片
    - 上传 / 注册 / 绑定音频
    - 保存播放配置和展示名称
-   - 如提供课程结构信息，先核对来源 `block_type`，再按类型替换正文并校验 vertical；独立的 `本节要点组件` 会保留
+   - 如提供课程结构信息，先核对来源 `block_type`，再按类型替换正文；独立的 `本节要点组件` 会保留
 5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
+
+批量执行时，按目标顺序尝试全部章节。某一 target 的操作失败后，记录失败步骤和原因，跳过依赖该结果的后续步骤，并继续其他 target；不在批次中途要求用户决定如何处理。所有目标都处理完后，统一执行批量校验并输出每章节操作结果、实时校验结果和修复结果。
 
 ## 就地替换与发布完整性
 
 - `block_type` 是每个 target 的来源契约。发布器核对 Gallery manifest、publish target 和可用的 `section-list.json`；缺失或冲突时，在 Studio 写入前停止该 target。不要依据 Studio 现有子组件推断来源类型。
 - `html` target 只在目标 vertical 中替换第一个直接 HTML 子组件 `文字讲解组件`。没有匹配项时停止该 target。`imagesgallery` target 只在目标 vertical 中替换唯一的 Gallery 替换目标组件；目标缺失或有多个候选时停止该 target。
-- 在第一次 Studio 写入前保存目标 vertical 的纵向组件快照，记录直接子组件数量、locator、类型和顺序。创建 Gallery、移动 Gallery、删除替换目标组件后分别重新读取 Studio，并执行状态对账。数量相同但 locator、类型或顺序不同也属于失败。
-- 创建、移动或删除收到成功响应后也要核对纵向组件快照。若响应不确定或状态未达到预期，先重新读取 Studio；目标状态已经生效时，按 `completed` 或 `reconciled` 记录并继续，能确认未生效时最多重试一次，无法确认时停止。保留最初的纵向组件快照作为整个恢复过程的基线。
-- 只有所有结构步骤都与预期纵向组件快照相符，才发布 vertical；Studio 必须明确返回 `published=true` 才算小节正式发布状态通过。未解决的创建、移动、删除或结构问题会跳过该 vertical 的最终发布，并记录失败步骤与预期、观察快照。
+- 在第一次 Studio 写入前保存目标 vertical 的纵向组件快照，记录直接子组件数量、locator、类型和顺序。替换或删除前重新读取 Studio，确认目标和当前结构符合预期；安全前置检查失败时，跳过该 target 的依赖步骤，记录问题并继续其他 target。
+- API 写请求的响应状态、asset ID、步骤和错误摘要写入操作记录。常规发布不在每次写入后立即读取状态、重试该写请求或据此阻断整个批次；实际结构和图片结果由批次末尾的验证器核对。
+- 纵向组件快照中的数量、locator、类型或顺序不符合预期时，将该 target 标记为失败并跳过依赖该结构的写入。Studio 写入响应不等同于实际发布状态；最终以批次末尾实时读取到的 vertical 结构和发布状态为准。
 - 发布前检查 Gallery 页和 speech 输入中的独立 `本节要点组件` 内容。发现泄漏时，在创建 Gallery 前将该 target 标为失败并跳过 vertical 发布；Studio 原有的 `本节要点组件` 继续保留。
 - 结果报告记录前后快照、步骤状态、重试记录、发布状态和可验证的 skill / 输入 provenance。无法确认的 provenance 写作 `unknown`。单 Gallery operation 文件中的 `vertical_integrity` 证据供批次验证器核对。
 
@@ -91,8 +93,8 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 - 安全模式应当是：
   - 如有需要，可以并行准备本地 `imagesgallery` 产物
   - 先把 deck A 推到 Studio
-  - deck A 完整成功后，再推 deck B
-  - 然后再推 deck C，以此类推
+  - deck A 即使有失败步骤，也记录结果后继续推 deck B
+  - 然后继续处理 deck C 和其余目标，结束后统一验证并报告
 
 ## 认证错误重试规则
 
@@ -110,6 +112,8 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 - 后续保存步骤因为 csrf/session 在运行中途过期而失败
 
 如果认证相关重试次数耗尽，必须停下，并清楚报告失败发生在哪个步骤。
+
+批量执行时，此失败只结束当前 target 中依赖该认证步骤的操作；记录错误后继续其他 target。全部目标处理完后仍运行批次验证，并将该失败列入最终报告。
 
 ## 命令接口
 
@@ -185,15 +189,15 @@ operation 文件包含 `galleries[]`。发布器要求恰有一个 `gallery_key`
 - `images`、`asset_ids`：已确认的页码、图片文件名和 Studio asset ID。
 - `steps`、`active_step`、`failed_step`、`error_summary`：安全的步骤状态、HTTP 状态和脱敏错误摘要。
 
-每个远程步骤开始前和确认完成后都会原子更新检查点。图片上传没有返回可用 ID 时，发布器停止后续上传和排序，只对 `get_files` 做一次恢复读取；仅当文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时才继续。状态不完整或有歧义时，保留现场并停止，不盲目重传。恢复时若图片与排序已确认，发布器从音频阶段继续。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
+Gallery 图片、音频和配置的每个远程步骤开始前、响应成功后或失败后都会原子更新检查点。图片上传没有返回可用 ID 时，记录该步骤失败并跳过依赖图片 ID 的排序、音频及后续发布；不立即读取 Gallery 来判定该次上传，也不盲目重传。批量调用方继续其他 target，并在全部 target 结束后统一校验这个 Gallery。显式恢复旧检查点时，发布器可在下一次写入前对已开始但记录不完整的图片执行一次 `get_files` 对账；仅当文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时才从后续阶段继续。状态不完整或有歧义时，保留现场并将该 target 记为失败。创建 Gallery 的 API 响应不确定时，可用创建前快照作一次定位恢复，避免重复创建；无法唯一确认 locator 时将 target 记入报告。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
 
 ## 批量发布后的验证与修复
 
-外部批量工作流负责创建 `batch-operation.json`，按顺序发布所有目标 Gallery 和 vertical，并在初始发布全部结束后调用一次验证器。它继续负责本地素材准备；验证器只读取这些 manifest 与 Studio 状态。
+外部批量工作流负责创建 `batch-operation.json`，按顺序尝试所有目标 Gallery 和 vertical，并在所有 target 都完成或记录失败后调用一次验证器。即使部分 target 的初始发布失败，只要 operation 文件中有可用的 Gallery locator，验证器仍要读取其 Gallery 和课程结构；不得因 `publish.status` 未完成而跳过诊断。它继续负责本地素材准备；验证器读取 manifest、操作记录与 Studio 实时状态。
 
-每个 `galleries[]` 条目至少包含 `gallery_key`、`manifest`、`vertical_locator`、`gallery_locator`、Ticket 01 的 `publish` 检查点，以及 `initial_vertical_publish: {"status":"completed"}`。验证器只检查 `publish.status == "completed"` 且 `publish.completed_stage == "saved"` 的 Gallery；初始 vertical 发布缺失或失败时仍会采集 Studio 诊断，但批次结果保持未通过。发布器保留调用方字段。验证器原子更新同一文件中的 `validation`、`repair_attempts`、`repair_history` 和 `batch_result`；修复后的 vertical 发布结果记录在对应的 `repair_history[].vertical_publish` 中。
+每个 `galleries[]` 条目包含 `gallery_key`、`manifest`、`vertical_locator`、`gallery_locator`、`publish` 操作检查点，以及 `initial_vertical_publish` 的响应状态。只要 Gallery 和 vertical locator 可用，验证器就读取实时 Gallery 内容，即使初始 publish 检查点或 vertical 发布响应失败也不跳过诊断。最终是否 verified 以实际 Gallery 内容和实时课程结构为准；初始操作状态仍单独保留在报告。发布器保留调用方字段。验证器原子更新同一文件中的 `validation`、`repair_attempts`、`repair_history` 和 `batch_result`；修复后的 vertical 发布响应记录在对应的 `repair_history[].vertical_publish` 中。
 
-所有初始 vertical 发布完成后执行：
+所有 target 的初始发布均已尝试后执行一次：
 
 ```bash
 python scripts/validate_imagegallery_batch.py \
@@ -202,13 +206,15 @@ python scripts/validate_imagegallery_batch.py \
   --execute
 ```
 
-真实执行使用现有 Studio 认证输入：`--account` / `--password`、环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`，或 `--cookie`。验证器在正常路径只读取一次 Studio `format=concise` 课程结构，再通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容。图片只比较有效文件记录数、`total_count` 和 manifest 页数；配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不比较图片名、顺序或内容，也不检查 learner-side LMS 或远端音频播放。
+真实执行使用现有 Studio 认证输入：`--account` / `--password`、环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`，或 `--cookie`。验证器读取操作记录、manifest 和 Studio 实时状态；通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容，并最终重新读取 Studio `format=concise` 课程结构。图片核对有效文件记录数、`total_count`、manifest 页数、逐图文件名、asset ID 和顺序；期望 asset ID 来自发布操作检查点。配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不检查 learner-side LMS 或远端音频播放。
 
-有效计数不符会记为 `mismatch`，最多触发一次完整修复；请求失败或响应结构无效会记为 `unverified`，不修改该 Gallery，并继续检查其他目标。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时停止，不开始第二次完整修复。
+任一可确认的图片、播放配置或音频绑定不匹配会记为 `mismatch`，最多触发一次完整修复；Studio 请求失败、响应结构无效或 operation 缺少逐图预期 ID 时记为 `unverified`，不修改该 Gallery，并继续检查其他目标。图片 ID、文件名和顺序必须逐项与 operation 检查点及 manifest 一致；数量相同不能单独证明图片正确。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时记录结果，不开始第二次完整修复，也不要求用户在批次中途决定下一步。
 
 若进程在修复记录完成最终校验前中断，可用同一 operation 文件重跑验证器：Gallery 状态仍可读时续跑现有修复尝试并复用各阶段检查点；已确认完成的步骤不会重复执行，完整修复次数仍为一次。读取状态为 `unverified` 时不继续修改，待读取恢复后再重跑。
 
-`all_sections_verified` 只有在每个目标最终为 `verified` 且初始 vertical 发布成功（修复过的 Gallery 还须修复后 vertical 发布成功）时才为 true。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
+`all_sections_verified` 依据最终 Gallery 校验和实时课程结构校验结果计算。批次报告同时保留初始写操作状态，因此即使实时最终状态可验证，API 写入错误仍会出现在对应 target 的 `publish` 记录中。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
+
+批次结束后直接输出汇总，不在中途或报告末尾追问是否继续、是否修复或如何处理失败章节。报告逐 target 列出写入步骤、失败步骤、最终校验、自动修复结果和 vertical URL。
 
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：

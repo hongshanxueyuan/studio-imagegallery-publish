@@ -2866,8 +2866,10 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
                     continue
                 if not asset_id:
                     accept_step(image_step, page_image=page_image)
-                    images = run_reconciliation(f"upload_image[{idx}]", page_image=page_image)
-                    break
+                    error = PublishFailure(f"upload_image[{idx}]", "Studio did not return a usable image asset ID")
+                    error.safe_summary = f"Studio did not return an image asset ID for {page_image}"
+                    mark_failure(error, f"upload_image[{idx}]", page_image=page_image)
+                    raise error
                 if any(saved["asset_id"] == asset_id for saved in images):
                     error = PublishFailure(f"upload_image[{idx}]", "Studio returned a duplicate image asset ID")
                     error.safe_summary = f"Studio returned a duplicate asset ID for {page_image}"
@@ -3235,150 +3237,124 @@ def apply_in_place_publish_actions(
         except Exception as exc:
             raise PublishFailure("verify_vertical_structure", "Studio vertical structure could not be reread") from exc
 
-    def read_before_mutation(step_name: str) -> tuple[dict[str, Any], Any]:
+    def read_before_mutation(
+        step_name: str,
+        expected_snapshot: dict[str, Any],
+        *,
+        blocked_step: str,
+    ) -> None:
         try:
-            return read_current_state()
+            observed_snapshot, _published_state = read_current_state()
         except PublishFailure as exc:
             steps.append({"step": step_name, "status": "failed", "reason": safe_error_summary(exc)})
-            steps.append({"step": "publish_vertical", "status": "skipped", "reason": "vertical structure could not be verified before publishing"})
+            steps.append({"step": blocked_step, "status": "skipped", "reason": "vertical structure could not be verified before the write"})
+            if blocked_step != "publish_vertical":
+                steps.append({"step": "publish_vertical", "status": "skipped", "reason": f"{blocked_step} was skipped"})
             exc.steps = steps.copy()
             exc.vertical_evidence = vertical_evidence()
             raise
+        if observed_snapshot != expected_snapshot:
+            steps.append({
+                "step": step_name,
+                "status": "failed",
+                "reason": "Studio vertical structure did not match the safe precondition",
+                "expected_snapshot": expected_snapshot,
+                "observed_snapshot": observed_snapshot,
+            })
+            steps.append({"step": blocked_step, "status": "skipped", "reason": "vertical structure did not match the safe precondition"})
+            if blocked_step != "publish_vertical":
+                steps.append({"step": "publish_vertical", "status": "skipped", "reason": f"{blocked_step} was skipped"})
+            failure = PublishFailure(step_name, "Studio vertical structure did not match the safe precondition")
+            failure.steps = steps.copy()
+            failure.vertical_evidence = vertical_evidence()
+            raise failure
+        steps.append({
+            "step": step_name,
+            "status": "completed",
+            "expected_snapshot": expected_snapshot,
+            "observed_snapshot": observed_snapshot,
+        })
 
     def call_optional_step(
         step_name: str,
         *,
-        before_snapshot: dict[str, Any],
         expected_snapshot: dict[str, Any],
         delete_locator: str = "",
         require_published: bool = False,
-    ) -> dict[str, Any]:
+    ) -> None:
         tmpl = adapter.get(step_name)
         if not tmpl:
             exc = PublishFailure(step_name, f"adapter missing required step: {step_name}")
+            steps.append({"step": step_name, "status": "failed", "reason": safe_error_summary(exc)})
+            if step_name != "publish_vertical":
+                steps.append({"step": "publish_vertical", "status": "skipped", "reason": f"{step_name} could not be executed"})
             exc.steps = steps.copy()
+            exc.vertical_evidence = vertical_evidence()
             raise exc
         if delete_locator:
             ctx["delete_block_locator"] = delete_locator
-        attempts: list[dict[str, Any]] = []
-        current_expected = before_snapshot
-        for attempt_number in range(1, 3):
-            write_error: TemplateCallError | None = None
-            try:
-                record = call_template(session, step_name, tmpl, ctx, execute, timeout)
-            except TemplateCallError as exc:
-                write_error = exc
-                record = {"step": step_name, "reason": safe_error_summary(exc)}
-            if not execute:
-                record["status"] = "ok"
-                steps.append(record)
-                return expected_snapshot
-            try:
-                observed_snapshot, published_state = read_current_state()
-            except PublishFailure as exc:
-                action = {
-                    "step": step_name,
-                    "status": "blocked",
-                    "attempt": attempt_number,
-                    "reason": safe_error_summary(exc),
-                    "expected_snapshot": expected_snapshot,
-                }
-                attempts.append(action)
-                break
-            postcondition = (
-                published_state is True
-                if require_published
-                else observed_snapshot == expected_snapshot
-            )
-            if postcondition:
-                status = "completed" if write_error is None and attempt_number == 1 else ("reconciled" if write_error is not None and attempt_number == 1 else "retried")
-                action = {
-                    "step": step_name,
-                    "status": status,
-                    "attempts": attempts + [{"attempt": attempt_number, "status": "response_uncertain" if write_error else "response_ok"}],
-                    "expected_snapshot": expected_snapshot,
-                    "observed_snapshot": observed_snapshot,
-                }
-                if require_published:
-                    action["published"] = published_state
-                if delete_locator:
-                    action["block_locator"] = delete_locator
-                steps.append(action)
-                return observed_snapshot
-            state_unchanged = observed_snapshot == current_expected
-            if state_unchanged and attempt_number == 1:
-                attempts.append({
-                    "attempt": attempt_number,
-                    "status": "not_applied_after_reconciliation" if write_error is not None else "postcondition_missing_after_response",
-                    "observed_snapshot": observed_snapshot,
-                })
-                current_expected = observed_snapshot
-                continue
-            status = "failed" if state_unchanged else "blocked"
-            action = {
-                "step": step_name,
-                "status": status,
-                "attempts": attempts + [{"attempt": attempt_number, "status": "response_uncertain" if write_error else "response_ok"}],
-                "reason": safe_error_summary(write_error) if write_error else "Studio structure did not match the planned postcondition",
-                "expected_snapshot": expected_snapshot,
-                "observed_snapshot": observed_snapshot,
-            }
-            if require_published:
-                action["published"] = published_state
-            if delete_locator:
-                action["block_locator"] = delete_locator
+        try:
+            record = call_template(session, step_name, tmpl, ctx, execute, timeout)
+        except Exception as exc:
+            action = {"step": step_name, "status": "failed", "reason": safe_error_summary(exc)}
+            if isinstance(exc, TemplateCallError):
+                action["http_status"] = exc.status_code
             steps.append(action)
-            break
-        if step_name != "publish_vertical":
-            steps.append({"step": "publish_vertical", "status": "skipped", "reason": f"{step_name} did not reach its verified postcondition"})
-        failure = PublishFailure(step_name, f"{step_name} did not reach its verified postcondition")
-        failure.steps = steps.copy()
-        failure.vertical_evidence = vertical_evidence()
-        raise failure
+            if step_name != "publish_vertical":
+                steps.append({"step": "publish_vertical", "status": "skipped", "reason": f"{step_name} request failed"})
+            failure = PublishFailure(step_name, safe_error_summary(exc))
+            failure.steps = steps.copy()
+            failure.vertical_evidence = vertical_evidence()
+            raise failure from exc
+        if not execute:
+            record["status"] = "ok"
+            steps.append(record)
+            return
+        action = {
+            "step": step_name,
+            "status": "completed",
+            "verification": "deferred_to_batch_validation",
+            "expected_snapshot": expected_snapshot,
+        }
+        response_status = record.get("response_status")
+        if isinstance(response_status, int):
+            action["http_status"] = response_status
+        if delete_locator:
+            action["block_locator"] = delete_locator
+        if require_published:
+            action["published"] = "deferred_to_batch_validation"
+        steps.append(action)
 
     if execute:
         if not publish_only and [str(child.get("locator", "")) for child in post_create_snapshot["children"]] != desired_children:
-            current_snapshot, _published = read_before_mutation("verify_vertical_before_move")
+            read_before_mutation("verify_vertical_before_move", post_create_snapshot, blocked_step="reorder_children")
             call_optional_step(
                 "reorder_children",
-                before_snapshot=current_snapshot,
                 expected_snapshot=move_snapshot,
             )
-            steps.append({"step": "verify_vertical_after_move", "status": "completed", "expected_snapshot": move_snapshot})
         elif not publish_only:
-            steps.append({"step": "verify_vertical_after_move", "status": "completed", "expected_snapshot": move_snapshot})
+            steps.append({"step": "verify_vertical_after_move", "status": "completed", "verification": "no_reorder_required", "expected_snapshot": move_snapshot})
         if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
-            current_snapshot, _published = read_before_mutation("verify_vertical_before_delete")
+            read_before_mutation("verify_vertical_before_delete", move_snapshot, blocked_step="delete_block")
             call_optional_step(
                 "delete_block",
-                before_snapshot=current_snapshot,
                 expected_snapshot=final_snapshot,
                 delete_locator=matched_source_block_locator,
             )
-            steps.append({"step": "verify_vertical_after_delete", "status": "completed", "expected_snapshot": final_snapshot})
-        current_snapshot, _published = read_before_mutation("verify_vertical_before_publish")
-        if current_snapshot != final_snapshot:
-            steps.append({"step": "verify_vertical_before_publish", "status": "failed", "expected_snapshot": final_snapshot, "observed_snapshot": current_snapshot})
-            steps.append({"step": "publish_vertical", "status": "skipped", "reason": "pre-publish vertical structure did not match the planned replacement"})
-            failure = PublishFailure("verify_vertical_before_publish", "pre-publish vertical structure did not match the planned replacement")
-            failure.steps = steps.copy()
-            failure.vertical_evidence = vertical_evidence()
-            raise failure
-        steps.append({"step": "verify_vertical_before_publish", "status": "completed", "expected_snapshot": final_snapshot, "observed_snapshot": current_snapshot})
+        read_before_mutation("verify_vertical_before_publish", final_snapshot, blocked_step="publish_vertical")
         call_optional_step(
             "publish_vertical",
-            before_snapshot=current_snapshot,
             expected_snapshot=final_snapshot,
             require_published=True,
         )
     else:
         if not publish_only and desired_children != [*current_children, created_block_locator]:
-            call_optional_step("reorder_children", before_snapshot={}, expected_snapshot={})
+            call_optional_step("reorder_children", expected_snapshot={})
 
         if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
-            call_optional_step("delete_block", before_snapshot={}, expected_snapshot={}, delete_locator=matched_source_block_locator)
+            call_optional_step("delete_block", expected_snapshot={}, delete_locator=matched_source_block_locator)
 
-        call_optional_step("publish_vertical", before_snapshot={}, expected_snapshot={})
+        call_optional_step("publish_vertical", expected_snapshot={})
 
     summary_cleanup = {"status": "preserved"}
 
@@ -3411,7 +3387,7 @@ def apply_in_place_publish_actions(
         "vertical_snapshot_after_create": post_create_snapshot,
         "expected_vertical_snapshot_after_move": move_snapshot,
         "expected_vertical_snapshot_after_delete": final_snapshot,
-        "vertical_published": True if execute else None,
+        "vertical_published": None,
         "plan_source": replacement_plan.get("plan_source", ""),
         "requires_manual_followup": False,
         "steps": steps,
@@ -4040,13 +4016,14 @@ def persist_vertical_integrity_evidence(args: argparse.Namespace, result: dict[s
     provenance = result.get("provenance")
     if isinstance(provenance, dict):
         operation["skill_provenance"] = provenance
+    expected_snapshot = result.get("expected_vertical_snapshot_after_delete")
     evidence = {
-        "status": "verified" if result.get("status") in {"replaced", "fallback_inserted"} and result.get("vertical_published") is True else "unresolved",
+        "status": "pending_validation" if isinstance(expected_snapshot, dict) else "unresolved",
         "block_type": result.get("block_type", "unknown"),
         "matched_source_block_locator": result.get("matched_source_block_locator", ""),
         "before": result.get("vertical_snapshot_before"),
-        "expected": result.get("expected_vertical_snapshot_after_delete"),
-        "published": result.get("vertical_published"),
+        "expected": expected_snapshot,
+        "published": None,
         "vertical_snapshot_before": result.get("vertical_snapshot_before"),
         "vertical_snapshot_after_create": result.get("vertical_snapshot_after_create"),
         "expected_vertical_snapshot_after_delete": result.get("expected_vertical_snapshot_after_delete"),
@@ -4056,7 +4033,11 @@ def persist_vertical_integrity_evidence(args: argparse.Namespace, result: dict[s
             {
                 "step": safe_step_name(step.get("step")),
                 "status": safe_step_name(step.get("status")),
-                **({"attempts": step["attempts"]} if isinstance(step.get("attempts"), list) else {}),
+                **{
+                    key: step[key]
+                    for key in ("http_status", "verification", "reason", "block_locator", "expected_snapshot", "observed_snapshot", "attempts")
+                    if key in step
+                },
             }
             for step in result.get("steps", []) if isinstance(step, dict)
         ],
