@@ -56,7 +56,9 @@ class FakeStudio:
         self.next_asset = 1
         self.assets = []
         for gallery in galleries.values():
-            for item in gallery["files"]:
+            for index, item in enumerate(gallery["files"], start=1):
+                if not any(item.get(key) for key in ("display_name", "name", "filename", "file_name")):
+                    item["display_name"] = f"page-{index:03d}.png"
                 asset_id = item.get("id") or item.get("asset_key")
                 if asset_id and all(asset.get("id") != asset_id for asset in self.assets):
                     self.assets.append({"id": asset_id, "display_name": item.get("display_name", "page.png")})
@@ -225,10 +227,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 "publish": {
                     "status": "completed",
                     "completed_stage": "saved",
-                    "asset_ids": [f"old-{index + 1}-{page}" for page in range(1, 3)],
+                    "asset_ids": ["asset-a", "asset-b"],
                     "images": [
-                        {"page": page, "image": f"page-{page:03d}.png", "asset_id": f"old-{index + 1}-{page}"}
-                        for page in range(1, 3)
+                        {"page": page, "image": f"page-{page:03d}.png", "asset_id": asset_id}
+                        for page, asset_id in enumerate(("asset-a", "asset-b"), start=1)
                     ],
                     "steps": [],
                 },
@@ -279,12 +281,13 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             ],
         }))
 
-    def test_cli_verifies_counts_without_comparing_server_file_names_or_scanning_course_assets(self):
+    def test_cli_reports_filename_mismatch_without_scanning_course_asset_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
             operation_path = root / "batch-operation.json"
             operation = self._operation(manifest)
+            operation["galleries"][0]["repair_attempts"] = 1
             operation["skill_provenance"] = {"commit": "fixture-commit", "installation_path": "fixture-skill"}
             operation["provenance"] = {"repository_commit": "fallback-commit"}
             self._write_operation_file(operation_path, operation)
@@ -296,7 +299,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
 
-            self.assertEqual(0, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
+            self.assertEqual(1, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
             self.assertEqual("", stderr)
             self.assertEqual(2, studio.course_reads)
             self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
@@ -304,10 +307,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(operation["skill_provenance"], state["skill_provenance"])
             self.assertEqual(operation["skill_provenance"], state["batch_result"]["skill_provenance"])
             self.assertEqual(operation["provenance"], state["batch_result"]["provenance"])
-            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
             gallery = state["galleries"][0]
-            self.assertEqual("verified", gallery["validation"]["status"])
+            self.assertEqual("mismatch", gallery["validation"]["status"])
             self.assertEqual(2, gallery["validation"]["observed"]["image_file_count"])
+            self.assertEqual("mismatch", gallery["validation"]["checks"]["image_names"])
+            self.assertEqual("pass", gallery["validation"]["checks"]["image_asset_ids"])
             all_output = stdout + stderr + json.dumps(state)
             for secret in ("success-sts-secret", "success-cookie-secret", "success-csrf-secret", "success-auth-secret", "success-token-secret", "session-secret", "csrf-secret"):
                 self.assertNotIn(secret, all_output)
@@ -421,6 +426,26 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(1, state["course_structure_verification"]["unverified_count"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
 
+    def test_initial_course_read_failure_does_not_skip_gallery_content_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{"page": 1}, {"page": 2}],
+                "audios": [{"id": "audio-binding"}],
+            }}, fail_course_reads={1})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("verified", state["course_structure_verification"]["status"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+
     def test_final_course_check_compares_targeted_vertical_with_publisher_expectation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -472,7 +497,13 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
             operation_path = root / "batch-operation.json"
-            self._write_operation_file(operation_path, self._operation(manifest, galleries=(GALLERY_1, GALLERY_2)))
+            operation = self._operation(manifest, galleries=(GALLERY_1, GALLERY_2))
+            operation["galleries"][1]["publish"]["asset_ids"] = ["b1", "b2"]
+            operation["galleries"][1]["publish"]["images"] = [
+                {"page": page, "image": f"page-{page:03d}.png", "asset_id": asset_id}
+                for page, asset_id in enumerate(("b1", "b2"), start=1)
+            ]
+            self._write_operation_file(operation_path, operation)
             studio = FakeStudio({
                 GALLERY_1: {"files": [], "time_config": [], "audios": []},
                 GALLERY_2: {"files": [{"id": "b1"}, {"id": "b2"}], "time_config": [{}, {}], "audios": [{}]},
@@ -604,7 +635,13 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 root = Path(tmp)
                 manifest = self._write_bundle(root, page_count=2)
                 operation_path = root / "batch-operation.json"
-                self._write_operation_file(operation_path, self._operation(manifest))
+                operation = self._operation(manifest)
+                operation["galleries"][0]["publish"]["asset_ids"] = ["asset-1", "asset-2"]
+                operation["galleries"][0]["publish"]["images"] = [
+                    {"page": 1, "image": "page-001.png", "asset_id": "asset-1"},
+                    {"page": 2, "image": "page-002.png", "asset_id": "asset-2"},
+                ]
+                self._write_operation_file(operation_path, operation)
                 studio = FakeStudio({GALLERY_1: {
                     "files": [{"id": "asset-1"}, {"id": "asset-2"}],
                     "time_config": state["time_config"],
@@ -625,7 +662,13 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
             operation_path = root / "batch-operation.json"
-            self._write_operation_file(operation_path, self._operation(manifest))
+            operation = self._operation(manifest)
+            operation["galleries"][0]["publish"]["asset_ids"] = ["asset-shared", "asset-orphan"]
+            operation["galleries"][0]["publish"]["images"] = [
+                {"page": 1, "image": "page-001.png", "asset_id": "asset-shared"},
+                {"page": 2, "image": "page-002.png", "asset_id": "asset-orphan"},
+            ]
+            self._write_operation_file(operation_path, operation)
             studio = FakeStudio({
                 GALLERY_1: {
                     "files": [
@@ -713,7 +756,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             operation_path = root / "batch-operation.json"
             self._write_operation_file(operation_path, self._operation(manifest, initial_vertical_status="failed"))
             studio = FakeStudio({GALLERY_1: {
-                "files": [{"id": "a"}, {"id": "b"}],
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
                 "time_config": [{}, {}],
                 "audios": [{}],
             }})
@@ -746,7 +789,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             operation_path = root / "batch-operation.json"
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
-                "files": [{"id": "a"}, {"id": "b"}],
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
                 "time_config": [{}, {}],
                 "audios": [{}],
             }})

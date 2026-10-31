@@ -1097,6 +1097,8 @@ def verify_final_course_structure(
 
         published_value = vertical.get("published")
         published = published_value if isinstance(published_value, bool) else None
+        if locator in unresolved_operations:
+            issues.append("publisher_vertical_integrity_unresolved")
         if published is False:
             issues.append("published_false")
         elif published is None:
@@ -1189,13 +1191,6 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
         vertical = vertical_results.get(vertical_locator, {})
         vertical_ok = vertical.get("status") == "verified" and vertical.get("published") is True
         history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
-        repair_attempts = entry.get("repair_attempts", 0)
-        gallery_ok = validation.get("status") == "verified" and vertical_ok
-        all_verified = all_verified and gallery_ok
-        if validation.get("status") in {"mismatch", "failed"} or (validation.get("status") == "verified" and not vertical_ok):
-            gallery_issue_count += 1
-        elif validation.get("status") != "verified":
-            gallery_unverified_count += 1
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
         initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
         original_publish = history[0].get("initial_publish") if history and isinstance(history[0], dict) else publish
@@ -1205,13 +1200,29 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
             isinstance(step, dict) and step.get("status") in {"failed", "blocked"}
             for step in publish_steps
         )
-        operation_status = (
-            "completed"
-            if original_publish.get("status") == "completed"
+        operation_ok = (
+            original_publish.get("status") == "completed"
             and initial_vertical.get("status") == "completed"
             and not has_failed_publish_step
-            else "has_issues"
         )
+        repair_attempts = entry.get("repair_attempts", 0)
+        gallery_ok = validation.get("status") == "verified" and vertical_ok
+        repair_ok = True
+        if history and isinstance(history[-1], dict):
+            latest_repair = history[-1]
+            repair_vertical = latest_repair.get("vertical_publish") if isinstance(latest_repair.get("vertical_publish"), dict) else {}
+            repair_validation = latest_repair.get("final_validation") if isinstance(latest_repair.get("final_validation"), dict) else {}
+            repair_ok = (
+                latest_repair.get("status") == "completed"
+                and repair_vertical.get("status") == "completed"
+                and repair_validation.get("status") == "verified"
+            )
+        all_verified = all_verified and gallery_ok and operation_ok and repair_ok
+        if validation.get("status") in {"mismatch", "failed"} or (validation.get("status") == "verified" and not vertical_ok):
+            gallery_issue_count += 1
+        elif validation.get("status") != "verified":
+            gallery_unverified_count += 1
+        operation_status = "completed" if operation_ok and repair_ok else "has_issues"
         if operation_status != "completed":
             operation_issue_count += 1
         item = {
@@ -1360,21 +1371,26 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             entry["validation"] = invalid_gallery_result(entry, None, step="manifest", summary="Local Gallery manifest or package could not be validated")
             store()
             continue
-        if structure_error:
-            entry["validation"] = invalid_gallery_result(entry, expected_count, step="load_live_course_structure", summary=structure_error, http_status=(structure_diagnostic or {}).get("http_status"))
-            store()
-            continue
-        gallery_owners = owners.get(entry["gallery_locator"], [])
-        if len(gallery_owners) != 1 or gallery_owners[0] != entry["vertical_locator"]:
-            entry["validation"] = invalid_gallery_result(entry, expected_count, step="course_structure_lookup", summary="Gallery locator is missing, ambiguous, or owned by a different vertical")
-            store()
-            continue
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
         entry["validation"] = validate_gallery(client, entry, manifest)
         entry["validation"]["publish_status"] = publish.get("status", "not_started")
         if publish.get("failed_step"):
             entry["validation"]["publish_failed_step"] = publish["failed_step"]
         store()
+        if structure_error:
+            entry["validation"]["pre_repair_structure_status"] = "unverified"
+            entry["validation"]["pre_repair_structure_failed_step"] = "load_live_course_structure"
+            entry["validation"]["pre_repair_structure_error"] = structure_error[:240]
+            if isinstance((structure_diagnostic or {}).get("http_status"), int):
+                entry["validation"]["pre_repair_structure_http_status"] = structure_diagnostic["http_status"]
+            store()
+            continue
+        gallery_owners = owners.get(entry["gallery_locator"], [])
+        if len(gallery_owners) != 1 or gallery_owners[0] != entry["vertical_locator"]:
+            entry["validation"]["pre_repair_structure_status"] = "issue"
+            entry["validation"]["pre_repair_structure_error"] = "Gallery locator is missing, ambiguous, or owned by a different vertical"
+            store()
+            continue
         attempts = entry.get("repair_attempts", 0)
         resume_attempt = resumable_repair_attempt(entry) if attempts >= 1 else None
         if resume_attempt is not None and entry["validation"]["status"] == "unverified":

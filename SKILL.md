@@ -189,7 +189,7 @@ operation 文件包含 `galleries[]`。发布器要求恰有一个 `gallery_key`
 - `images`、`asset_ids`：已确认的页码、图片文件名和 Studio asset ID。
 - `steps`、`active_step`、`failed_step`、`error_summary`：安全的步骤状态、HTTP 状态和脱敏错误摘要。
 
-Gallery 图片、音频和配置的每个远程步骤开始前、响应成功后或失败后都会原子更新检查点。图片上传没有返回可用 ID 时，记录该步骤失败并跳过依赖图片 ID 的排序、音频及后续发布；不立即读取 Gallery 来判定该次上传，也不盲目重传。批量调用方继续其他 target，并在全部 target 结束后统一校验这个 Gallery。显式恢复旧检查点时，发布器可在下一次写入前对已开始但记录不完整的图片执行一次 `get_files` 对账；仅当文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时才从后续阶段继续。状态不完整或有歧义时，保留现场并将该 target 记为失败。创建 Gallery 的 API 响应不确定时，可用创建前快照作一次定位恢复，避免重复创建；无法唯一确认 locator 时将 target 记入报告。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
+Gallery 图片、音频和配置的每个远程步骤开始前、响应成功后或失败后都会原子更新检查点。图片上传响应没有返回可用 ID 时，执行一次异常恢复用的 `get_files` 对账；只有 Studio 文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时，才从后续步骤继续。对账不完整或有歧义时，保留现场，将该 target 记为失败，并继续其他 target。正常发布不在每次写入后读取状态；全部 target 结束后仍统一运行批量校验。显式恢复旧检查点时，也可对已开始但记录不完整的图片执行一次相同的对账。创建 Gallery 的 API 响应不确定时，可用创建前快照作一次定位恢复，避免重复创建；无法唯一确认 locator 时将 target 记入报告。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
 
 ## 批量发布后的验证与修复
 
@@ -212,7 +212,7 @@ python scripts/validate_imagegallery_batch.py \
 
 若进程在修复记录完成最终校验前中断，可用同一 operation 文件重跑验证器：Gallery 状态仍可读时续跑现有修复尝试并复用各阶段检查点；已确认完成的步骤不会重复执行，完整修复次数仍为一次。读取状态为 `unverified` 时不继续修改，待读取恢复后再重跑。
 
-`all_sections_verified` 依据最终 Gallery 校验和实时课程结构校验结果计算。批次报告同时保留初始写操作状态，因此即使实时最终状态可验证，API 写入错误仍会出现在对应 target 的 `publish` 记录中。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
+`all_sections_verified` 要求初始发布操作、最终 Gallery 内容、实时课程结构和发布状态都通过；发生失败或待确认步骤时，即使部分实时内容匹配，也会在最终批次结果中保留问题。Gallery 内容、发布操作、修复记录和课程结构分别报告，避免一种状态覆盖另一种状态。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
 
 批次结束后直接输出汇总，不在中途或报告末尾追问是否继续、是否修复或如何处理失败章节。报告逐 target 列出写入步骤、失败步骤、最终校验、自动修复结果和 vertical URL。
 

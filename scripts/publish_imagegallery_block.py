@@ -2866,10 +2866,8 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
                     continue
                 if not asset_id:
                     accept_step(image_step, page_image=page_image)
-                    error = PublishFailure(f"upload_image[{idx}]", "Studio did not return a usable image asset ID")
-                    error.safe_summary = f"Studio did not return an image asset ID for {page_image}"
-                    mark_failure(error, f"upload_image[{idx}]", page_image=page_image)
-                    raise error
+                    images = run_reconciliation(f"upload_image[{idx}]", page_image=page_image)
+                    break
                 if any(saved["asset_id"] == asset_id for saved in images):
                     error = PublishFailure(f"upload_image[{idx}]", "Studio returned a duplicate image asset ID")
                     error.safe_summary = f"Studio returned a duplicate asset ID for {page_image}"
@@ -3326,8 +3324,10 @@ def apply_in_place_publish_actions(
         steps.append(action)
 
     if execute:
+        structure_precondition_checked = False
         if not publish_only and [str(child.get("locator", "")) for child in post_create_snapshot["children"]] != desired_children:
             read_before_mutation("verify_vertical_before_move", post_create_snapshot, blocked_step="reorder_children")
+            structure_precondition_checked = True
             call_optional_step(
                 "reorder_children",
                 expected_snapshot=move_snapshot,
@@ -3335,13 +3335,16 @@ def apply_in_place_publish_actions(
         elif not publish_only:
             steps.append({"step": "verify_vertical_after_move", "status": "completed", "verification": "no_reorder_required", "expected_snapshot": move_snapshot})
         if not publish_only and replacement_plan.get("result_type") == "replaced" and matched_source_block_locator:
-            read_before_mutation("verify_vertical_before_delete", move_snapshot, blocked_step="delete_block")
+            if not structure_precondition_checked:
+                read_before_mutation("verify_vertical_before_delete", post_create_snapshot, blocked_step="delete_block")
+                structure_precondition_checked = True
             call_optional_step(
                 "delete_block",
                 expected_snapshot=final_snapshot,
                 delete_locator=matched_source_block_locator,
             )
-        read_before_mutation("verify_vertical_before_publish", final_snapshot, blocked_step="publish_vertical")
+        if not structure_precondition_checked:
+            read_before_mutation("verify_vertical_before_publish", final_snapshot, blocked_step="publish_vertical")
         call_optional_step(
             "publish_vertical",
             expected_snapshot=final_snapshot,

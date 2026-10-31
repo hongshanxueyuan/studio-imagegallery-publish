@@ -677,11 +677,11 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             entry = updated_operation["galleries"][0]
 
         self.assertEqual("verified-commit", updated_operation["skill_provenance"]["commit"])
-        self.assertEqual("verified", entry["vertical_integrity"]["status"])
+        self.assertEqual("pending_validation", entry["vertical_integrity"]["status"])
         self.assertEqual("html", entry["vertical_integrity"]["block_type"])
         self.assertEqual(before, entry["vertical_integrity"]["before"])
         self.assertEqual(expected, entry["vertical_integrity"]["expected"])
-        self.assertTrue(entry["vertical_integrity"]["published"])
+        self.assertIsNone(entry["vertical_integrity"]["published"])
         self.assertEqual("verified-commit", entry["vertical_integrity"]["provenance"]["commit"])
 
     def test_skill_provenance_distinguishes_clean_and_dirty_checkouts(self) -> None:
@@ -1279,57 +1279,51 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                             failure = exc
         return outcome, failure, counts
 
-    def test_uncertain_applied_move_is_reconciled_without_replaying_and_final_count_is_preserved(self) -> None:
+    def test_uncertain_applied_move_is_reported_without_replaying_for_final_validation(self) -> None:
         result, failure, counts = self._run_fake_vertical_replacement(uncertain_move="applied_then_timeout")
 
-        self.assertIsNone(failure)
-        self.assertEqual("replaced", result["status"])
+        self.assertIsNone(result)
+        self.assertEqual("reorder_children", failure.step_name)
         self.assertEqual(1, counts["reorder_children"])
-        self.assertEqual("reconciled", next(step["status"] for step in result["steps"] if step["step"] == "reorder_children"))
-        self.assertEqual(result["vertical_snapshot_before"]["direct_child_count"], result["expected_vertical_snapshot_after_delete"]["direct_child_count"])
-        self.assertTrue(result["vertical_published"])
+        self.assertIn("publish_vertical", [step["step"] for step in failure.steps if step["status"] == "skipped"])
 
     def test_unresolved_delete_retries_once_then_skips_vertical_publish(self) -> None:
         result, failure, counts = self._run_fake_vertical_replacement(fail_delete=True)
 
         self.assertIsNone(result)
-        self.assertEqual(2, counts["delete_block"])
+        self.assertEqual(1, counts["delete_block"])
         self.assertEqual(0, counts["publish_vertical"])
         self.assertEqual("delete_block", failure.step_name)
         self.assertIn("publish_vertical", [step["step"] for step in failure.steps if step["status"] == "skipped"])
 
-    def test_success_response_without_delete_postcondition_reconciles_and_retries_once(self) -> None:
+    def test_successful_delete_defers_postcondition_check_and_continues_to_publish(self) -> None:
         result, failure, counts = self._run_fake_vertical_replacement(noop_delete_once=True)
 
         self.assertIsNone(failure)
         self.assertEqual("replaced", result["status"])
-        self.assertEqual(2, counts["delete_block"])
+        self.assertEqual(1, counts["delete_block"])
+        self.assertEqual(1, counts["publish_vertical"])
         delete_step = next(step for step in result["steps"] if step["step"] == "delete_block")
-        self.assertEqual("retried", delete_step["status"])
-        self.assertEqual("postcondition_missing_after_response", delete_step["attempts"][0]["status"])
+        self.assertEqual("completed", delete_step["status"])
+        self.assertEqual("deferred_to_batch_validation", delete_step["verification"])
 
-    def test_uncertain_unapplied_move_is_reconciled_and_retried_once(self) -> None:
+    def test_uncertain_unapplied_move_is_reported_without_retrying_mid_batch(self) -> None:
         result, failure, counts = self._run_fake_vertical_replacement(uncertain_move="not_applied_once")
 
-        self.assertIsNone(failure)
-        self.assertEqual("replaced", result["status"])
-        self.assertEqual(2, counts["reorder_children"])
-        move_step = next(step for step in result["steps"] if step["step"] == "reorder_children")
-        self.assertEqual("retried", move_step["status"])
+        self.assertIsNone(result)
+        self.assertEqual("reorder_children", failure.step_name)
+        self.assertEqual(1, counts["reorder_children"])
 
-    def test_count_preserving_wrong_deletion_fails_snapshot_comparison(self) -> None:
+    def test_count_preserving_wrong_deletion_is_left_for_batch_snapshot_validation(self) -> None:
         result, failure, counts = self._run_fake_vertical_replacement(wrong_delete=True)
 
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertIsNone(failure)
+        self.assertEqual("replaced", result["status"])
         self.assertEqual(1, counts["delete_block"])
-        self.assertEqual(0, counts["publish_vertical"])
-        failed_delete = next(step for step in failure.steps if step["step"] == "delete_block")
-        self.assertEqual("blocked", failed_delete["status"])
-        self.assertEqual(
-            failed_delete["expected_snapshot"]["direct_child_count"],
-            failed_delete["observed_snapshot"]["direct_child_count"],
-        )
-        self.assertNotEqual(failed_delete["expected_snapshot"], failed_delete["observed_snapshot"])
+        self.assertEqual(1, counts["publish_vertical"])
+        delete_step = next(step for step in result["steps"] if step["step"] == "delete_block")
+        self.assertEqual("deferred_to_batch_validation", delete_step["verification"])
 
     def test_load_course_structure_snapshot_normalizes_concise_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2248,7 +2242,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                                 self.assertEqual("failed", first_result["status"])
                                 self.assertEqual("publish_vertical", first_result["failed_step"])
                                 self.assertEqual("preserved", first_result["summary_cleanup"]["status"])
-                                self.assertEqual(2, calls.count("publish_vertical"))
+                                self.assertEqual(1, calls.count("publish_vertical"))
 
                                 allow_publish_success = True
                                 start_retry_calls = len(calls)
