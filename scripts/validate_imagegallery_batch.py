@@ -281,6 +281,34 @@ def manifest_image_count(manifest: dict[str, Any]) -> int:
     return len(items)
 
 
+def expected_image_records(entry: dict[str, Any], manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str] | None, str]:
+    expected = [
+        {"page": int(item["page"]), "image": publisher.manifest_image_name(item)}
+        for item in manifest["items"]
+    ]
+    publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
+    checkpoint_images = publisher.safe_image_checkpoint_records(publish.get("images"))
+    if len(checkpoint_images) == len(expected):
+        checkpoint_matches = all(
+            checkpoint["page"] == image["page"] and checkpoint["image"] == image["image"]
+            for checkpoint, image in zip(checkpoint_images, expected)
+        )
+        ids = [checkpoint["asset_id"] for checkpoint in checkpoint_images]
+        if not checkpoint_matches or len(set(ids)) != len(ids):
+            return expected, None, "mismatch"
+        return expected, ids, "pass"
+
+    asset_ids = publish.get("asset_ids")
+    if (
+        isinstance(asset_ids, list)
+        and len(asset_ids) == len(expected)
+        and all(isinstance(asset_id, str) and asset_id for asset_id in asset_ids)
+        and len(set(asset_ids)) == len(asset_ids)
+    ):
+        return expected, list(asset_ids), "pass"
+    return expected, None, "unverified"
+
+
 def valid_file_records(payload: Any) -> tuple[list[dict[str, Any]] | None, int | None]:
     if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
         return None, None
@@ -313,6 +341,8 @@ def get_files(client: StudioClient, gallery_locator: str) -> tuple[list[dict[str
 def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     locator = safe_locator(entry.get("gallery_locator"))
     expected_count = manifest_image_count(manifest)
+    expected_images, expected_asset_ids, checkpoint_status = expected_image_records(entry, manifest)
+    expected_names = [image["image"] for image in expected_images]
     referer = publisher.build_container_block_url(client.studio_base, locator)
     observed: dict[str, Any] = {}
     checks: dict[str, str] = {}
@@ -323,10 +353,49 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         diagnostics.append(file_diagnostic)
     if files is None:
         checks["images"] = "unverified"
+        checks["image_count"] = "unverified"
+        checks["image_names"] = "unverified"
+        checks["image_asset_ids"] = "unverified"
+        checks["image_order"] = "unverified"
     else:
         observed["image_file_count"] = len(files)
         observed["image_total_count"] = total_count
-        checks["images"] = "pass" if len(files) == total_count == expected_count else "mismatch"
+        observed_images = []
+        for index, file_record in enumerate(files):
+            raw_name = (
+                file_record.get("display_name")
+                or file_record.get("name")
+                or file_record.get("filename")
+                or file_record.get("file_name")
+                or ""
+            )
+            image_name = Path(str(raw_name).replace("\\", "/")).name if raw_name else ""
+            observed_images.append({
+                "page": expected_images[index]["page"] if index < len(expected_images) else index + 1,
+                "image": image_name,
+                "asset_id": str(file_record.get("id") or file_record.get("asset_key") or ""),
+            })
+        observed["images"] = observed_images
+        checks["image_count"] = "pass" if len(files) == total_count == expected_count else "mismatch"
+        observed_names = [image["image"] for image in observed_images]
+        if all(observed_names):
+            checks["image_names"] = "pass" if sorted(observed_names) == sorted(expected_names) else "mismatch"
+            checks["image_order"] = "pass" if observed_names == expected_names else "mismatch"
+        else:
+            checks["image_names"] = "unverified"
+            checks["image_order"] = "unverified"
+        observed_asset_ids = [image["asset_id"] for image in observed_images]
+        if expected_asset_ids is None:
+            checks["image_asset_ids"] = checkpoint_status
+        else:
+            checks["image_asset_ids"] = "pass" if observed_asset_ids == expected_asset_ids else "mismatch"
+        image_checks = [checks[key] for key in ("image_count", "image_names", "image_asset_ids", "image_order")]
+        if "mismatch" in image_checks:
+            checks["images"] = "mismatch"
+        elif "unverified" in image_checks:
+            checks["images"] = "unverified"
+        else:
+            checks["images"] = "pass"
 
     config_payload, config_diagnostic = read_json_call(
         client,
@@ -376,7 +445,14 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
     failed = next((item for item in diagnostics if item.get("status") != "ok"), None)
     result: dict[str, Any] = {
         "status": status,
-        "expected": {"image_count": expected_count, "audio_binding_count": 1},
+        "expected": {
+            "image_count": expected_count,
+            "images": [
+                {**image, **({"asset_id": expected_asset_ids[index]} if expected_asset_ids is not None else {})}
+                for index, image in enumerate(expected_images)
+            ],
+            "audio_binding_count": 1,
+        },
         "observed": observed,
         "checks": checks,
         "checked_at": utc_now(),
@@ -718,8 +794,7 @@ def repair_gallery(
                 store()
 
     attempt["prior_asset_ids"] = list(prior_publish.get("asset_ids", []))
-    checkpoint = safe_publish_state(entry.get("publish"))
-    if not attempt.get("publish_started") and not attempt.get("publish") and checkpoint.get("status") == "completed" and checkpoint.get("completed_stage") == "saved":
+    if not attempt.get("publish_started") and not attempt.get("publish"):
         entry["publish"] = {
             "gallery_key": entry["gallery_key"],
             "status": "in_progress",
@@ -833,11 +908,6 @@ def resumable_repair_attempt(entry: dict[str, Any]) -> dict[str, Any] | None:
     return attempt
 
 
-def initial_vertical_published(entry: dict[str, Any]) -> bool:
-    record = entry.get("initial_vertical_publish")
-    return isinstance(record, dict) and record.get("status") == "completed"
-
-
 def normalize_child_snapshot(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -906,6 +976,32 @@ def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, di
     return expected, missing, ambiguous, unresolved
 
 
+def live_vertical_structure_status(
+    structure: dict[str, Any],
+    locator: str,
+    *,
+    expected: dict[str, dict[str, Any]],
+    missing: set[str],
+    ambiguous: set[str],
+) -> str:
+    if locator not in expected or locator in missing or locator in ambiguous:
+        return "unverified"
+    matches = [
+        record.get("vertical")
+        for record in publisher.iter_section_vertical_records(structure)
+        if isinstance(record.get("vertical"), dict)
+        and safe_locator(record["vertical"].get("block_location")) == locator
+    ]
+    if len(matches) != 1:
+        return "unverified"
+    if not isinstance(matches[0].get("published"), bool):
+        return "unverified"
+    observed = observed_child_snapshot(matches[0])
+    if observed is None:
+        return "unverified"
+    return "verified" if observed == expected[locator] else "mismatch"
+
+
 def verify_final_course_structure(
     client: StudioClient,
     *,
@@ -956,6 +1052,14 @@ def verify_final_course_structure(
         }
 
     expected_by_vertical, missing_expectations, ambiguous_expectations, unresolved_operations = expected_vertical_snapshots(operation)
+    integrity_statuses: dict[str, set[str]] = {}
+    for entry in operation.get("galleries", []):
+        if not isinstance(entry, dict):
+            continue
+        locator = safe_locator(entry.get("vertical_locator"))
+        integrity = entry.get("vertical_integrity") if isinstance(entry.get("vertical_integrity"), dict) else {}
+        if locator and isinstance(integrity.get("status"), str):
+            integrity_statuses.setdefault(locator, set()).add(integrity["status"])
     subsection_results = []
     issue_count = 0
     unverified_count = 0
@@ -971,8 +1075,6 @@ def verify_final_course_structure(
         unverified_reasons = []
         expected = expected_by_vertical.get(locator)
 
-        if locator in unresolved_operations:
-            issues.append("publisher_vertical_integrity_unresolved")
         if not locator:
             unverified_reasons.append("vertical_locator_missing")
         if observed is None:
@@ -1019,6 +1121,11 @@ def verify_final_course_structure(
             "expected": expected,
             "observed": observed,
             "published": published,
+            "publisher_integrity_status": (
+                next(iter(integrity_statuses[locator]))
+                if locator in integrity_statuses and len(integrity_statuses[locator]) == 1
+                else "ambiguous" if locator in integrity_statuses else "missing"
+            ),
             "issues": issues,
             "unverified_reasons": unverified_reasons,
         }
@@ -1063,18 +1170,26 @@ def verify_final_course_structure(
 
 def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
     entries = operation["galleries"]
+    course_check = operation.get("course_structure_verification")
+    if not isinstance(course_check, dict):
+        course_check = {"status": "unverified", "issue_count": 0, "unverified_count": 1, "subsection_count": 0, "verified_count": 0, "subsections": []}
+    vertical_results = {
+        safe_locator(item.get("vertical_locator")): item
+        for item in course_check.get("subsections", [])
+        if isinstance(item, dict) and safe_locator(item.get("vertical_locator"))
+    }
     all_verified = bool(entries)
     results = []
     gallery_issue_count = 0
     gallery_unverified_count = 0
+    operation_issue_count = 0
     for entry in entries:
         validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
-        vertical_ok = initial_vertical_published(entry)
+        vertical_locator = safe_locator(entry.get("vertical_locator"))
+        vertical = vertical_results.get(vertical_locator, {})
+        vertical_ok = vertical.get("status") == "verified" and vertical.get("published") is True
         history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
         repair_attempts = entry.get("repair_attempts", 0)
-        if repair_attempts > 0:
-            vertical = history[-1].get("vertical_publish") if history and isinstance(history[-1], dict) else None
-            vertical_ok = vertical_ok and repair_attempts == 1 and isinstance(vertical, dict) and vertical.get("status") == "completed"
         gallery_ok = validation.get("status") == "verified" and vertical_ok
         all_verified = all_verified and gallery_ok
         if validation.get("status") in {"mismatch", "failed"} or (validation.get("status") == "verified" and not vertical_ok):
@@ -1082,18 +1197,37 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
         elif validation.get("status") != "verified":
             gallery_unverified_count += 1
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
+        initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
+        original_publish = history[0].get("initial_publish") if history and isinstance(history[0], dict) else publish
+        original_publish = original_publish if isinstance(original_publish, dict) else publish
+        publish_steps = original_publish.get("steps") if isinstance(original_publish.get("steps"), list) else []
+        has_failed_publish_step = any(
+            isinstance(step, dict) and step.get("status") in {"failed", "blocked"}
+            for step in publish_steps
+        )
+        operation_status = (
+            "completed"
+            if original_publish.get("status") == "completed"
+            and initial_vertical.get("status") == "completed"
+            and not has_failed_publish_step
+            else "has_issues"
+        )
+        if operation_status != "completed":
+            operation_issue_count += 1
         item = {
             "gallery_key": entry.get("gallery_key", ""),
             "status": validation.get("status", "unverified"),
+            "operation_status": operation_status,
             "initial_vertical_publish_status": (entry.get("initial_vertical_publish") or {}).get("status", "missing") if isinstance(entry.get("initial_vertical_publish"), dict) else "missing",
             "expected": validation.get("expected", {}),
             "observed": validation.get("observed", {}),
             "repair_attempts": repair_attempts,
         }
-        publish_report = {key: publish[key] for key in ("status", "completed_stage", "failed_step", "failure_http_status", "error_summary", "failed_page_image", "asset_ids") if key in publish}
+        publish_report = {key: publish[key] for key in ("status", "completed_stage", "active_step", "failed_step", "failure_http_status", "error_summary", "failed_page_image", "asset_ids", "images", "steps") if key in publish}
         if publish_report:
             item["publish"] = publish_report
-        initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
+        if history and isinstance(history[0], dict) and isinstance(history[0].get("initial_publish"), dict):
+            item["initial_publish"] = copy.deepcopy(history[0]["initial_publish"])
         vertical_report = {key: initial_vertical[key] for key in ("status", "failed_step", "http_status", "error_summary") if key in initial_vertical}
         if vertical_report:
             item["initial_vertical_publish"] = vertical_report
@@ -1115,6 +1249,7 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
             if "error_summary" not in item and isinstance(initial_vertical.get("error_summary"), str):
                 item["error_summary"] = initial_vertical["error_summary"]
         if history:
+            item["repair_history"] = copy.deepcopy(history)
             latest_repair = history[-1] if isinstance(history[-1], dict) else {}
             item["repair_status"] = latest_repair.get("status", "unknown")
             vertical_publish = latest_repair.get("vertical_publish") if isinstance(latest_repair.get("vertical_publish"), dict) else {}
@@ -1137,13 +1272,11 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
                 "before": integrity.get("before"),
                 "expected": integrity.get("expected"),
                 "observed": vertical.get("observed") if isinstance(vertical, dict) else None,
+                "steps": copy.deepcopy(integrity.get("steps", [])),
             }
         item["asset_ids"] = [value for value in (entry.get("publish") or {}).get("asset_ids", []) if isinstance(value, str)] if isinstance(entry.get("publish"), dict) else []
         results.append(item)
 
-    course_check = operation.get("course_structure_verification")
-    if not isinstance(course_check, dict):
-        course_check = {"status": "unverified", "issue_count": 0, "unverified_count": 1, "subsection_count": 0, "verified_count": 0, "subsections": []}
     course_issues = course_check.get("issue_count", 0) if isinstance(course_check.get("issue_count"), int) else 0
     course_unverified = course_check.get("unverified_count", 0) if isinstance(course_check.get("unverified_count"), int) else 1
     all_verified = all_verified and course_check.get("status") == "verified" and course_issues == 0 and course_unverified == 0
@@ -1154,6 +1287,7 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
         "verified_count": sum(item["status"] == "verified" for item in results),
         "issue_count": gallery_issue_count + course_issues,
         "unverified_count": gallery_unverified_count + course_unverified,
+        "operation_issue_count": operation_issue_count,
         "course_structure_verification": course_check,
         "galleries": results,
         "completed_at": utc_now(),
@@ -1212,6 +1346,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         except Exception:
             structure_error = "Studio course structure could not be normalized"
     owners = map_gallery_owners(structure) if structure is not None and not structure_error else {}
+    expected_verticals, missing_verticals, ambiguous_verticals, _unresolved_verticals = expected_vertical_snapshots(operation)
 
     for entry in operation["galleries"]:
         if not entry.get("gallery_locator") or not entry.get("vertical_locator"):
@@ -1235,12 +1370,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             store()
             continue
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
-        if publish.get("status") != "completed" or publish.get("completed_stage") != "saved":
-            entry["validation"] = invalid_gallery_result(entry, expected_count, step="initial_gallery_publish", summary="Initial Gallery publishing did not complete")
-            store()
-            continue
-
         entry["validation"] = validate_gallery(client, entry, manifest)
+        entry["validation"]["publish_status"] = publish.get("status", "not_started")
+        if publish.get("failed_step"):
+            entry["validation"]["publish_failed_step"] = publish["failed_step"]
         store()
         attempts = entry.get("repair_attempts", 0)
         resume_attempt = resumable_repair_attempt(entry) if attempts >= 1 else None
@@ -1250,6 +1383,18 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if attempts >= 1 and resume_attempt is None:
             entry["validation"]["repair_limit_reached"] = True
+            store()
+            continue
+        structure_status = live_vertical_structure_status(
+            structure,
+            entry["vertical_locator"],
+            expected=expected_verticals,
+            missing=missing_verticals,
+            ambiguous=ambiguous_verticals,
+        )
+        if structure_status != "verified":
+            entry["validation"]["repair_status"] = "skipped"
+            entry["validation"]["repair_skip_reason"] = f"vertical_structure_{structure_status}"
             store()
             continue
         try:
