@@ -949,6 +949,7 @@ def plan_publish_replacement(
         classify_replacement_kind(lookup_record, excluded_block_locators=excluded)
     )
     target_record = lookup_record
+    target_vertical_summaries = summary_html_blocks(target_record["vertical"])
     summary_matches = [
         block
         for vertical in target_record["section"].get("verticals", [])
@@ -993,15 +994,27 @@ def plan_publish_replacement(
                 match_scope = "target_vertical"
                 result_type = "replaced"
     else:
-        matched_block = (
-            pick_lesson_html_candidate(target_record["vertical"], excluded_block_locators=excluded_for_body)
-            if source_type == "html"
-            else pick_best_html_candidate(target_record["vertical"], excluded_block_locators=excluded_for_body)
-        )
+        if source_type == "html":
+            html_targets = [
+                block for block in target_record["vertical"].get("blocks", [])
+                if isinstance(block, dict)
+                and block_category(block) == "html"
+                and block_locator(block)
+                and block_locator(block) not in excluded_for_body
+                and str(block.get("name", "")).strip() == "文字讲解"
+            ]
+            matched_block = html_targets[0] if len(html_targets) == 1 else None
+            if len(html_targets) > 1:
+                planning_issue = {
+                    "code": "ambiguous_html_replacement_target",
+                    "reason": "HTML replacement requires exactly one direct HTML child titled 文字讲解",
+                }
+        else:
+            matched_block = pick_best_html_candidate(target_record["vertical"], excluded_block_locators=excluded_for_body)
         if matched_block is not None:
             match_scope = "target_vertical"
             result_type = "replaced"
-        elif source_type == "html":
+        elif source_type == "html" and planning_issue is None:
             planning_issue = {
                 "code": "missing_html_replacement_target",
                 "reason": "target vertical has no direct HTML child titled 文字讲解",
@@ -1036,6 +1049,7 @@ def plan_publish_replacement(
     ]
     matched_source_block_locator = ""
     matched_source_block_category = ""
+    summary_block_locator = ""
     if matched_block is not None:
         matched_source_block_locator = remap_block_locator_course(
             block_locator(matched_block),
@@ -1043,6 +1057,27 @@ def plan_publish_replacement(
             target_vertical_block_id,
         )
         matched_source_block_category = block_category(matched_block)
+
+    strict_final_structure = source_type in {"html", "imagesgallery"}
+    if strict_final_structure and planning_issue is None and matched_source_block_locator:
+        summary_locators = [
+            remap_block_locator_course(block_locator(block), source_vertical_block_id, target_vertical_block_id)
+            for block in target_vertical_summaries
+            if block_locator(block)
+        ]
+        if len(summary_locators) != 1:
+            planning_issue = {
+                "code": "final_vertical_contract_invalid",
+                "reason": "The target vertical must retain exactly one 本节要点 HTML component",
+            }
+        else:
+            summary_block_locator = summary_locators[0]
+            contract_children = [locator for locator in current_children if locator not in excluded]
+            if len(contract_children) != 2 or set(contract_children) != {matched_source_block_locator, summary_block_locator}:
+                planning_issue = {
+                    "code": "final_vertical_contract_invalid",
+                    "reason": "The target vertical must contain only the replacement target and 本节要点 before publishing",
+                }
 
     return {
         "course_kind": course_kind,
@@ -1063,6 +1098,8 @@ def plan_publish_replacement(
             target_vertical_block_id=target_vertical_block_id,
         ),
         "resolved_block_type": source_type,
+        "strict_final_structure": strict_final_structure,
+        "summary_block_locator": summary_block_locator,
         "planning_issue": planning_issue,
         "matched_source_block_locator": matched_source_block_locator,
         "matched_source_block_category": matched_source_block_category,
@@ -3130,6 +3167,34 @@ def apply_in_place_publish_actions(
             "expected_vertical_snapshot_after_delete": final_snapshot,
         }
 
+    def strict_replacement_snapshots() -> tuple[dict[str, Any], dict[str, Any]]:
+        summary_locator = str(replacement_plan.get("summary_block_locator", "")).strip()
+        by_locator = {
+            str(child.get("locator", "")): dict(child)
+            for child in baseline_children
+            if isinstance(child, dict) and child.get("locator")
+        }
+        if (
+            len(baseline_children) != 2
+            or matched_source_block_locator not in by_locator
+            or summary_locator not in by_locator
+            or matched_source_block_locator == summary_locator
+        ):
+            raise PublishFailure("replacement_validation", "target vertical no longer matches the two-component replacement contract")
+        moved_children = [
+            {"locator": created_block_locator, "type": "imagesgallery", "order": 1},
+            {**by_locator[matched_source_block_locator], "order": 2},
+            {**by_locator[summary_locator], "order": 3},
+        ]
+        final_children = [
+            {"locator": created_block_locator, "type": "imagesgallery", "order": 1},
+            {**by_locator[summary_locator], "order": 2},
+        ]
+        return (
+            {"direct_child_count": len(moved_children), "children": moved_children},
+            {"direct_child_count": len(final_children), "children": final_children},
+        )
+
     if publish_only:
         post_create_snapshot = (
             live_plan.get("initial_snapshot")
@@ -3185,16 +3250,19 @@ def apply_in_place_publish_actions(
             "observed_snapshot": post_create_snapshot,
         })
         try:
-            move_snapshot = replace_snapshot_child(
-                baseline_snapshot,
-                old_locator=matched_source_block_locator,
-                new_locator=created_block_locator,
-            )
-            final_snapshot = replacement_after_delete_snapshot(
-                move_snapshot,
-                old_locator=matched_source_block_locator,
-                new_locator=created_block_locator,
-            )
+            if replacement_plan.get("strict_final_structure"):
+                move_snapshot, final_snapshot = strict_replacement_snapshots()
+            else:
+                move_snapshot = replace_snapshot_child(
+                    baseline_snapshot,
+                    old_locator=matched_source_block_locator,
+                    new_locator=created_block_locator,
+                )
+                final_snapshot = replacement_after_delete_snapshot(
+                    move_snapshot,
+                    old_locator=matched_source_block_locator,
+                    new_locator=created_block_locator,
+                )
         except PublishFailure as exc:
             steps.append({"step": "verify_vertical_after_create", "status": "failed", "reason": safe_error_summary(exc)})
             steps.append({"step": "publish_vertical", "status": "skipped", "reason": "replacement snapshot could not be planned"})
@@ -3207,16 +3275,19 @@ def apply_in_place_publish_actions(
             "direct_child_count": len(baseline_children) + 1,
             "children": [*baseline_children, {"locator": created_block_locator, "type": "imagesgallery", "order": len(baseline_children) + 1}],
         }
-        move_snapshot = replace_snapshot_child(
-            baseline_snapshot,
-            old_locator=matched_source_block_locator,
-            new_locator=created_block_locator,
-        )
-        final_snapshot = replacement_after_delete_snapshot(
-            move_snapshot,
-            old_locator=matched_source_block_locator,
-            new_locator=created_block_locator,
-        )
+        if replacement_plan.get("strict_final_structure"):
+            move_snapshot, final_snapshot = strict_replacement_snapshots()
+        else:
+            move_snapshot = replace_snapshot_child(
+                baseline_snapshot,
+                old_locator=matched_source_block_locator,
+                new_locator=created_block_locator,
+            )
+            final_snapshot = replacement_after_delete_snapshot(
+                move_snapshot,
+                old_locator=matched_source_block_locator,
+                new_locator=created_block_locator,
+            )
         desired_children = [str(child.get("locator", "")) for child in move_snapshot["children"]]
 
     ctx["vertical_children_obj"] = desired_children

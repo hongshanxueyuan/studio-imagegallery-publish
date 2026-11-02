@@ -304,14 +304,24 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         course_structure["chapters"][0]["sections"][0]["verticals"][0]["blocks"].append(block)
         return block
 
-    def _make_course_structure(self, *, include_gallery: bool, include_target_html: bool, include_section_html: bool) -> dict:
-        target_vertical_blocks = [
-            {
-                "name": "导语",
-                "category": "problem",
-                "block_location": "block-v1:FIRAx+1040045+20260807+type@problem+block@intro",
-            }
-        ]
+    def _make_course_structure(
+        self,
+        *,
+        include_gallery: bool,
+        include_target_html: bool,
+        include_section_html: bool,
+        include_intro: bool = True,
+        include_summary: bool = False,
+    ) -> dict:
+        target_vertical_blocks = []
+        if include_intro:
+            target_vertical_blocks.append(
+                {
+                    "name": "导语",
+                    "category": "problem",
+                    "block_location": "block-v1:FIRAx+1040045+20260807+type@problem+block@intro",
+                }
+            )
         if include_gallery:
             target_vertical_blocks.append(
                 {
@@ -327,6 +337,15 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                     "category": "html",
                     "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml",
                     "html": "<p>短文</p>",
+                }
+            )
+        if include_summary:
+            target_vertical_blocks.append(
+                {
+                    "name": "本节要点",
+                    "category": "html",
+                    "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary",
+                    "html": "<h2>本节要点</h2><p>课程要点回顾。</p>",
                 }
             )
 
@@ -559,6 +578,8 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             include_gallery=True,
             include_target_html=True,
             include_section_html=True,
+            include_intro=False,
+            include_summary=True,
         )
 
         plan = module.plan_publish_replacement(
@@ -573,8 +594,89 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml",
             plan["matched_source_block_locator"],
         )
+        self.assertEqual("final_vertical_contract_invalid", plan["planning_issue"]["code"])
         self.assertEqual(3, plan["initial_snapshot"]["direct_child_count"])
-        self.assertEqual("imagesgallery", plan["initial_snapshot"]["children"][1]["type"])
+        self.assertEqual("imagesgallery", plan["initial_snapshot"]["children"][0]["type"])
+
+    def test_explicit_source_plan_requires_unique_target_and_retained_summary_only(self) -> None:
+        course_structure = self._make_course_structure(
+            include_gallery=False,
+            include_target_html=True,
+            include_section_html=False,
+        )
+        target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
+        summary_locator = "block-v1:FIRAx+1040045+20260807+type@html+block@summary"
+        body_locator = "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml"
+        target_vertical["blocks"] = [
+            {"name": "本节要点", "category": "html", "block_location": summary_locator, "html": "<h2>本节要点</h2>"},
+            {"name": "文字讲解", "category": "html", "block_location": body_locator, "html": "<p>正文</p>"},
+        ]
+
+        plan = module.plan_publish_replacement(
+            course_structure,
+            source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            block_type="html",
+        )
+
+        self.assertIsNone(plan["planning_issue"])
+        self.assertTrue(plan["strict_final_structure"])
+        self.assertEqual(summary_locator, plan["summary_block_locator"])
+        live_course = json.loads(json.dumps(course_structure, ensure_ascii=False))
+        live_vertical = live_course["chapters"][0]["sections"][0]["verticals"][0]
+        created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@created"
+        live_vertical["blocks"].append(
+            {"name": "有声幻灯片", "category": "imagesgallery", "block_location": created_locator}
+        )
+        live_plan = module.plan_publish_replacement(
+            live_course,
+            source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            block_type="html",
+            excluded_block_locators=[created_locator],
+        )
+        self.assertIsNone(live_plan["planning_issue"])
+        result = module.apply_in_place_publish_actions(
+            {"studio_base": "https://studio.example.com", "block_locator": "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@new", "steps": []},
+            adapter=self.adapter,
+            replacement_plan=plan,
+            studio_url="https://studio.example.com/container/block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            execute=False,
+            timeout=30,
+            args=argparse.Namespace(cookie="csrftoken=fake", csrf_token="", account="", password="", courses_base=""),
+        )
+        self.assertEqual(
+            {
+                "direct_child_count": 2,
+                "children": [
+                    {"locator": "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@new", "type": "imagesgallery", "order": 1},
+                    {"locator": summary_locator, "type": "html", "order": 2},
+                ],
+            },
+            result["expected_vertical_snapshot_after_delete"],
+        )
+
+    def test_explicit_source_plan_blocks_extra_or_ambiguous_vertical_children(self) -> None:
+        course_structure = self._make_course_structure(
+            include_gallery=False,
+            include_target_html=True,
+            include_section_html=False,
+        )
+        target_vertical = course_structure["chapters"][0]["sections"][0]["verticals"][0]
+        target_vertical["blocks"] = [
+            {"name": "文字讲解", "category": "html", "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@targethtml"},
+            {"name": "本节要点", "category": "html", "block_location": "block-v1:FIRAx+1040045+20260807+type@html+block@summary", "html": "<h2>本节要点</h2>"},
+            {"name": "额外组件", "category": "problem", "block_location": "block-v1:FIRAx+1040045+20260807+type@problem+block@extra"},
+        ]
+
+        plan = module.plan_publish_replacement(
+            course_structure,
+            source_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            target_vertical_block_id="block-v1:FIRAx+1040045+20260807+type@vertical+block@targetvertical",
+            block_type="html",
+        )
+
+        self.assertEqual("final_vertical_contract_invalid", plan["planning_issue"]["code"])
 
     def test_explicit_html_type_does_not_guess_from_another_vertical(self) -> None:
         course_structure = self._make_course_structure(
@@ -948,7 +1050,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery=False,
                 include_target_html=True,
                 include_section_html=False,
+                include_intro=False,
             )
+            self._add_terminal_summary(course)
             current_structure = json.loads(json.dumps(course, ensure_ascii=False))
             vertical = current_structure["chapters"][0]["sections"][0]["verticals"][0]
             vertical_id = vertical["block_location"]
@@ -1201,7 +1305,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             include_gallery=False,
             include_target_html=True,
             include_section_html=False,
+            include_intro=False,
         )
+        self._add_terminal_summary(course)
         target_vertical = course["chapters"][0]["sections"][0]["verticals"][0]
         target_locator = target_vertical["block_location"]
         created_locator = "block-v1:FIRAx+1040045+20260807+type@imagesgallery+block@newgallery"
@@ -1246,7 +1352,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 if noop_delete_once and counts[name] == 1:
                     return {"step": name, "status": "ok"}
                 locator = (
-                    "block-v1:FIRAx+1040045+20260807+type@problem+block@intro"
+                    "block-v1:FIRAx+1040045+20260807+type@html+block@terminal-summary"
                     if wrong_delete
                     else ctx["delete_block_locator"]
                 )
@@ -1597,6 +1703,8 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         include_gallery=True,
                         include_target_html=False,
                         include_section_html=False,
+                        include_intro=False,
+                        include_summary=True,
                     ),
                     ensure_ascii=False,
                 ),
@@ -1656,6 +1764,8 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                         include_gallery=False,
                         include_target_html=True,
                         include_section_html=False,
+                        include_intro=False,
+                        include_summary=True,
                     ),
                     ensure_ascii=False,
                 ),
@@ -1717,6 +1827,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery=False,
                 include_target_html=True,
                 include_section_html=False,
+                include_intro=False,
             )
             terminal_summary = {
                 "name": "要点小结",
@@ -1915,6 +2026,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery=False,
                 include_target_html=True,
                 include_section_html=False,
+                include_intro=False,
             )
             summary = self._add_terminal_summary(course_structure)
             course_path = tmp_path / "course.json"
@@ -2003,6 +2115,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                     include_gallery=False,
                     include_target_html=True,
                     include_section_html=False,
+                    include_intro=False,
                 )
                 self._add_terminal_summary(course_structure)
                 course_path = tmp_path / "course.json"
@@ -2042,6 +2155,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery=False,
                 include_target_html=True,
                 include_section_html=False,
+                include_intro=False,
             )
             self._add_terminal_summary(course_structure)
             course_path = tmp_path / "course.json"
@@ -2089,6 +2203,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                     include_gallery=False,
                     include_target_html=True,
                     include_section_html=False,
+                    include_intro=False,
                 )
                 summary = self._add_terminal_summary(course_structure)
                 course_path = tmp_path / "course.json"
@@ -2115,7 +2230,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 self.assertIn(result["failed_step"], {"resolve_source_block_type"})
                 self.assertNotIn("delete_block", [step.get("step") for step in result["steps"]])
 
-    def test_summary_preservation_is_independent_of_gallery_heading_and_match_count(self) -> None:
+    def test_summary_contract_rejects_missing_ambiguous_or_nonterminal_components(self) -> None:
         for scenario in ("gallery_without_summary", "html_no_match", "html_nonterminal_summary", "imagegallery_origin", "ambiguous_summary"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
@@ -2126,8 +2241,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery = scenario == "imagegallery_origin"
                 course_structure = self._make_course_structure(
                     include_gallery=include_gallery,
-                    include_target_html=True,
+                    include_target_html=not include_gallery,
                     include_section_html=False,
+                    include_intro=False,
                 )
                 if scenario in {"gallery_without_summary", "html_nonterminal_summary", "imagegallery_origin"}:
                     self._add_terminal_summary(course_structure)
@@ -2149,12 +2265,18 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
 
                 result = module.run_in_place_publish(self._in_place_args(manifest_path, course_path))
 
-                self.assertEqual("replaced", result["status"])
-                self.assertEqual("preserved", result["summary_cleanup"]["status"])
-                delete_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
-                self.assertFalse(any("summary" in url for url in delete_urls))
-                if scenario == "imagegallery_origin":
-                    self.assertTrue(any(url.endswith("block@legacygallery") for url in delete_urls))
+                if scenario in {"html_no_match", "html_nonterminal_summary", "ambiguous_summary"}:
+                    self.assertEqual("failed", result["status"])
+                    self.assertEqual("resolve_replacement_target", result["failed_step"])
+                    publish_step = next(step for step in result["steps"] if step["step"] == "publish_vertical")
+                    self.assertEqual("skipped", publish_step["status"])
+                else:
+                    self.assertEqual("replaced", result["status"])
+                    self.assertEqual("preserved", result["summary_cleanup"]["status"])
+                    delete_urls = [step.get("url", "") for step in result["steps"] if step["step"] == "delete_block"]
+                    self.assertFalse(any("summary" in url for url in delete_urls))
+                    if scenario == "imagegallery_origin":
+                        self.assertTrue(any(url.endswith("block@legacygallery") for url in delete_urls))
 
     def test_publish_only_retry_preserves_summary_without_repeating_body_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2165,6 +2287,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery=False,
                 include_target_html=True,
                 include_section_html=False,
+                include_intro=False,
             )
             self._add_terminal_summary(initial_structure)
             current_structure = initial_structure
@@ -2269,6 +2392,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 include_gallery=False,
                 include_target_html=True,
                 include_section_html=False,
+                include_intro=False,
             )
             summary = self._add_terminal_summary(course_structure)
             course_path = tmp_path / "course.json"
