@@ -7,7 +7,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 使用这个 skill，把本地 `imagesgallery` 产物（图片 + 音频 + 时间轴字幕）发布到 Studio。
 
-## 真实推送的凭据前置检查
+## 认证输入
 
 真实推送创建或编辑 block 之前，必须先完成认证。`--dry-run` 不访问 Studio 或 OSS，也不会登录；不需要认证输入，请求计划中的认证字段会显示为 `<redacted>`。
 
@@ -23,13 +23,6 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
    - `--cookie`
 
 两阶段批量发布与审核优先使用 `FIRA_SAAS_OP_ACCOUNT` 和 `FIRA_SAAS_OP_PASSWORD`，让发布验证和审核子 agent 复用当前进程环境。batch validator 和 auditor 也支持 `FIRA_SAAS_OP_COOKIE` 与 `FIRA_SAAS_OP_CSRF_TOKEN` 环境变量。
-
-如果执行真实推送时以上方式都没有提供，将认证缺失记录为阻塞项，不向用户索要或等待凭据：
-
-- `FIRA_SAAS_OP_ACCOUNT`
-- `FIRA_SAAS_OP_PASSWORD`
-
-跳过所有依赖 Studio 认证的写入和远程校验，把未执行的发布目标记为 `failed`（步骤 `authentication`），把无法完成的校验记为 `unverified`，然后继续打印最终报告。报告可以指出下次运行需要配置的环境变量，但不得要求用户在当前流程中补充后再继续；不要虚构 Studio 写入或校验结果。
 
 安全边界：
 
@@ -59,16 +52,15 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 用户明确启动真实推送或批次后，从开始执行到打印最终报告，全程不等待用户补充信息、确认版本、决定失败处理方式或批准单个步骤。直接使用已给输入和默认值；输入缺失、认证失败或安全前置检查不通过时，将受影响的发布步骤记为 `failed`，将无法读取或核实的结果记为 `unverified`，跳过依赖动作，继续独立目标和报告收尾。若没有可继续的工作，立即打印包含失败原因和未完成项的最终报告；不要在中途向用户发问或等待回复。
 
-1. 仅在真实推送前运行凭据检查；dry-run 无需凭据
-2. 根据 URL + manifest 构建运行时上下文
-3. 先做 dry-run 请求渲染（推荐）
-4. 执行真实推送：
+1. 根据 URL + manifest 构建运行时上下文
+2. 先做 dry-run 请求渲染（推荐）
+3. 执行真实推送：
    - 创建 block
    - 上传图片
    - 上传 / 注册 / 绑定音频
    - 保存播放配置和展示名称
    - 如提供课程结构信息，先核对来源 `block_type`，再按类型替换正文；独立的 `本节要点组件` 会保留
-5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
+4. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
 
 批量执行时，按目标顺序尝试全部章节。某一 target 的操作失败后，记录失败步骤和原因，跳过依赖该结果的后续步骤，并继续其他 target；不在批次中途要求用户决定如何处理。所有目标都处理完后，统一执行批量校验；随后按“批次结束后的整课审核和运营报告”完成审核子任务与最终报告。
 
