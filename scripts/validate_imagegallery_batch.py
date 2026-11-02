@@ -302,6 +302,116 @@ def course_structure_payload_is_complete(payload: Any) -> bool:
     return str(payload.get("category", "")).strip().lower() == "course" and valid_node(payload)
 
 
+def iter_course_nodes(payload: Any):
+    pending = [payload]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        yield node
+        children: list[Any] = []
+        child_info = node.get("child_info")
+        if isinstance(child_info, dict) and isinstance(child_info.get("children"), list):
+            children.extend(child_info["children"])
+        for key in ("children", "chapters", "sections", "verticals", "blocks"):
+            value = node.get(key)
+            if isinstance(value, list):
+                children.extend(value)
+        pending.extend(reversed(children))
+
+
+def publication_state_for_node(node: dict[str, Any]) -> dict[str, Any]:
+    published = node.get("published")
+    has_changes = node.get("has_changes")
+    visibility_present = "visibility_state" in node
+    visibility_state = node.get("visibility_state")
+    issues = []
+    unverified_reasons = []
+
+    if published is False:
+        issues.append("published_false")
+    elif not isinstance(published, bool):
+        unverified_reasons.append("published_state_missing")
+    if has_changes is True or visibility_state == "needs_attention":
+        issues.append("unpublished_changes")
+    elif not isinstance(has_changes, bool):
+        unverified_reasons.append("pending_changes_state_missing")
+    if visibility_present and (not isinstance(visibility_state, str) or not visibility_state.strip()):
+        unverified_reasons.append("visibility_state_invalid")
+
+    status = "unverified" if unverified_reasons else "mismatch" if issues else "pass"
+    evidence: dict[str, Any] = {
+        "status": status,
+        "published": published if isinstance(published, bool) else None,
+        "has_changes": has_changes if isinstance(has_changes, bool) else None,
+        "issues": issues,
+        "unverified_reasons": unverified_reasons,
+    }
+    if isinstance(visibility_state, str) and visibility_state.strip():
+        evidence["visibility_state"] = visibility_state.strip()
+    return evidence
+
+
+def saved_publication_states(payload: Any, target_verticals: set[str]) -> dict[str, dict[str, Any]]:
+    matches: dict[str, list[dict[str, Any]]] = {locator: [] for locator in target_verticals}
+    for node in iter_course_nodes(payload):
+        locator = safe_locator(node.get("id") or node.get("block_location") or node.get("locator"))
+        if locator in matches and "+type@vertical+" in locator:
+            matches[locator].append(node)
+
+    results = {}
+    for locator, nodes in matches.items():
+        if len(nodes) == 1:
+            results[locator] = publication_state_for_node(nodes[0])
+        else:
+            results[locator] = {
+                "status": "unverified",
+                "published": None,
+                "has_changes": None,
+                "issues": [],
+                "unverified_reasons": ["publication_state_missing" if not nodes else "publication_state_ambiguous"],
+            }
+    return results
+
+
+def read_saved_publication_states(
+    client: StudioClient,
+    *,
+    studio_base: str,
+    course_key: str,
+    studio_url: str,
+    target_verticals: set[str],
+    step: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+    payload, diagnostic = read_json_call(
+        client,
+        step,
+        "GET",
+        f"{studio_base}/course/{course_key}",
+        referer=studio_url,
+    )
+    if diagnostic and diagnostic.get("status") != "ok":
+        states = {
+            locator: {
+                "status": "unverified",
+                "published": None,
+                "has_changes": None,
+                "issues": [],
+                "unverified_reasons": ["publication_state_read_failed"],
+                "failed_step": publisher.safe_step_name(step),
+                "error_summary": safe_summary_text(diagnostic.get("error_summary") or "Saved Studio publication state could not be read"),
+            }
+            for locator in target_verticals
+        }
+        if isinstance(diagnostic.get("http_status"), int):
+            for state in states.values():
+                state["http_status"] = diagnostic["http_status"]
+        return states, diagnostic
+    return saved_publication_states(payload, target_verticals), diagnostic
+
+
 def map_gallery_owners(course_structure: dict[str, Any]) -> dict[str, list[str]]:
     owners: dict[str, list[str]] = {}
     for record in publisher.iter_section_vertical_records(course_structure):
@@ -954,6 +1064,68 @@ def resumable_repair_attempt(entry: dict[str, Any]) -> dict[str, Any] | None:
     return attempt
 
 
+def republish_vertical_for_pending_changes(
+    client: StudioClient,
+    entry: dict[str, Any],
+    args: argparse.Namespace,
+    adapter: dict[str, Any],
+    store,
+    *,
+    repair_round: int,
+    attempt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    history = entry.setdefault("repair_history", [])
+    if attempt is None:
+        attempt = {
+            "attempt": len(history) + 1,
+            "status": "running",
+            "repair_mode": "publish_vertical",
+            "repair_round": repair_round,
+            "started_at": utc_now(),
+            "trigger_validation": copy.deepcopy(entry.get("validation", {})),
+            "initial_publish": safe_publish_state(entry.get("publish")),
+            "steps": [],
+        }
+        history.append(attempt)
+    else:
+        attempt["status"] = "running"
+        attempt["repair_mode"] = "publish_vertical"
+        attempt["repair_round"] = repair_round
+        attempt["resumed_at"] = utc_now()
+        attempt.pop("finished_at", None)
+        attempt.pop("failed_step", None)
+        attempt.pop("error_summary", None)
+        attempt.pop("http_status", None)
+    entry["repair_attempts"] = max(int(entry.get("repair_attempts", 0)), int(attempt.get("attempt", 1)))
+    store()
+
+    vertical_publish = attempt.get("vertical_publish")
+    if not isinstance(vertical_publish, dict) or vertical_publish.get("status") != "completed":
+        vertical_publish = {"step": "publish_vertical", "status": "started"}
+        attempt["vertical_publish"] = vertical_publish
+        store()
+        try:
+            context = {
+                "studio_base": client.studio_base,
+                "vertical_block_id": entry["vertical_locator"],
+                "block_url": publisher.build_container_block_url(client.studio_base, entry["vertical_locator"]),
+                "csrftoken": client.csrftoken,
+            }
+            record, retries = client.request_template("publish_vertical", adapter["publish_vertical"], context)
+            vertical_publish.update({"status": "completed", "http_status": record.get("http_status")})
+            if retries:
+                vertical_publish["auth_retry_attempts"] = len(retries)
+                vertical_publish["auth_retry_events"] = retries
+        except Exception as exc:
+            vertical_publish.update({"status": "failed", "error_summary": safe_error(exc, "publish_vertical")})
+            if safe_http_status(exc) is not None:
+                vertical_publish["http_status"] = safe_http_status(exc)
+        attempt["finished_at"] = utc_now()
+        attempt["status"] = "completed" if vertical_publish["status"] == "completed" else "failed"
+        store()
+    return attempt
+
+
 def normalize_child_snapshot(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -1178,6 +1350,7 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
                 issue_messages = {
                     "structure_mismatch": ("组件结构", "这节的 Gallery 与“本节要点”组件数量或顺序不符合要求。"),
                     "published_false": ("发布状态", "Studio 中这节的当前内容尚未正式发布。"),
+                    "unpublished_changes": ("发布状态", "Studio 中这节仍有未发布改动，当前内容尚未同步到学员可见版本。"),
                     "publisher_vertical_integrity_unresolved": ("组件结构", "这节发布前的组件结构无法确认，不能保证 Gallery 替换结果正确。"),
                     "target_vertical_missing": ("目标小节", "Studio 中找不到本次目标小节，无法确认发布结果。"),
                 }
@@ -1189,8 +1362,8 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
                     add_finding(entry, "issue", category, message)
             elif subsection.get("status") == "unverified":
                 reasons = subsection.get("unverified_reasons") if isinstance(subsection.get("unverified_reasons"), list) else []
-                if "published_state_missing" in reasons:
-                    message = "Studio 未返回这节当前发布状态，暂时无法确认本次内容是否已正式发布。"
+                if any(reason in reasons for reason in ("published_state_missing", "pending_changes_state_missing", "publication_state_missing", "publication_state_ambiguous", "publication_state_read_failed", "visibility_state_invalid")):
+                    message = "Studio 未提供足够的发布状态信息，暂时无法确认这节当前内容已发布且没有待发布改动。"
                 elif "expected_structure_ambiguous" in reasons or "expected_structure_missing" in reasons:
                     message = "发布记录不足以唯一确认目标组件，暂时无法核对这节的课程结构。"
                 else:
@@ -1336,6 +1509,14 @@ def verify_final_course_structure(
         if isinstance(entry, dict) and safe_locator(entry.get("vertical_locator"))
     }
     target_verticals |= set(expected_by_vertical) | missing_expectations | ambiguous_expectations | unresolved_operations
+    publication_states, _publication_diagnostic = read_saved_publication_states(
+        client,
+        studio_base=studio_base,
+        course_key=course_key,
+        studio_url=studio_url,
+        target_verticals=target_verticals,
+        step="verify_saved_publication_state",
+    )
     gallery_by_vertical: dict[str, str] = {}
     for entry in operation.get("galleries", []):
         if not isinstance(entry, dict):
@@ -1393,12 +1574,17 @@ def verify_final_course_structure(
             structure_status = "unverified"
             unverified_reasons.append("expected_structure_missing")
 
-        published_value = vertical.get("published")
-        published = published_value if isinstance(published_value, bool) else None
-        if published is False:
-            issues.append("published_false")
-        elif published is None:
-            unverified_reasons.append("published_state_missing")
+        publication = publication_states.get(locator, {
+            "status": "unverified",
+            "published": None,
+            "has_changes": None,
+            "issues": [],
+            "unverified_reasons": ["publication_state_missing"],
+        })
+        published = publication.get("published") if isinstance(publication.get("published"), bool) else None
+        has_changes = publication.get("has_changes") if isinstance(publication.get("has_changes"), bool) else None
+        issues.extend(publication.get("issues", []))
+        unverified_reasons.extend(publication.get("unverified_reasons", []))
 
         if issues:
             status = "issue"
@@ -1419,6 +1605,7 @@ def verify_final_course_structure(
             "expected": expected,
             "observed": observed,
             "published": published,
+            "has_changes": has_changes,
             "publisher_integrity_status": (
                 next(iter(integrity_statuses[locator]))
                 if locator in integrity_statuses and len(integrity_statuses[locator]) == 1
@@ -1427,6 +1614,11 @@ def verify_final_course_structure(
             "issues": issues,
             "unverified_reasons": unverified_reasons,
         }
+        if isinstance(publication.get("visibility_state"), str):
+            subsection["visibility_state"] = publication["visibility_state"]
+        for field in ("failed_step", "http_status", "error_summary"):
+            if field in publication:
+                subsection[field] = publication[field]
         subsection_results.append(subsection)
 
     owners = map_gallery_owners(structure)
@@ -1497,7 +1689,12 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
         validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
         vertical_locator = safe_locator(entry.get("vertical_locator"))
         vertical = vertical_results.get(vertical_locator, {})
-        vertical_ok = vertical.get("status") == "verified" and vertical.get("published") is True
+        vertical_ok = (
+            vertical.get("status") == "verified"
+            and vertical.get("published") is True
+            and vertical.get("has_changes") is False
+            and vertical.get("visibility_state") != "needs_attention"
+        )
         history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
         initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
@@ -1675,6 +1872,19 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         structure, structure_diagnostic, structure_error = read_live_structure()
         owners = map_gallery_owners(structure) if structure is not None else {}
         expected_verticals, missing_verticals, ambiguous_verticals, _ = expected_vertical_snapshots(operation)
+        target_verticals = {
+            safe_locator(entry.get("vertical_locator"))
+            for entry in operation["galleries"]
+            if isinstance(entry, dict) and safe_locator(entry.get("vertical_locator"))
+        }
+        publication_states, publication_diagnostic = read_saved_publication_states(
+            client,
+            studio_base=studio_base,
+            course_key=course_key,
+            studio_url=args.studio_url,
+            target_verticals=target_verticals,
+            step="load_saved_publication_state",
+        )
         vertical_records = []
         if structure is not None:
             try:
@@ -1724,12 +1934,27 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 ) if len(vertical_matches) == 1 else "mismatch"
                 owner_matches = owners.get(gallery_locator, [])
                 owner_status = "pass" if len(owner_matches) == 1 and owner_matches[0] == vertical_locator else "mismatch"
-                published_value = vertical_matches[0].get("published") if len(vertical_matches) == 1 else False
-                publication_status = "unverified" if not isinstance(published_value, bool) else "pass" if published_value else "mismatch"
+                publication = publication_states.get(vertical_locator, {
+                    "status": "unverified",
+                    "published": None,
+                    "has_changes": None,
+                    "issues": [],
+                    "unverified_reasons": ["publication_state_missing"],
+                })
+                publication_status = publication.get("status", "unverified")
                 validation["observed_vertical"] = {
-                    "published": published_value if isinstance(published_value, bool) else None,
+                    **{
+                        key: publication[key]
+                        for key in ("published", "has_changes", "visibility_state", "issues", "unverified_reasons")
+                        if key in publication
+                    },
                     "child_snapshot": observed_child_snapshot(vertical_matches[0]) if len(vertical_matches) == 1 else None,
                 }
+                for field in ("failed_step", "http_status", "error_summary"):
+                    if field in publication:
+                        validation[f"publication_{field}"] = publication[field]
+                if publication_diagnostic and publication_diagnostic.get("status") != "ok":
+                    validation["publication_read_failed"] = True
             checks["vertical_structure"] = "pass" if vertical_structure_status == "verified" else vertical_structure_status
             checks["gallery_owner"] = owner_status
             checks["vertical_publication"] = publication_status
@@ -1757,9 +1982,26 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 and all(state in {"pass", "mismatch"} for state in states)
                 and (content_mismatches or publication_mismatch)
             )
+            if validation["repairable"]:
+                validation["repair_scope"] = "publish_vertical" if publication_mismatch and not content_mismatches else "gallery"
             if validation["status"] == "mismatch" and not validation["repairable"]:
                 validation["repair_skip_reason"] = "The current section structure or Gallery ownership is not safe to change automatically"
             entry["validation"] = validation
+            history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
+            latest_attempt = history[-1] if history and isinstance(history[-1], dict) else {}
+            if (
+                latest_attempt.get("repair_mode") == "publish_vertical"
+                and latest_attempt.get("repair_round") == round_number
+                and "final_validation" not in latest_attempt
+            ):
+                latest_attempt["final_validation"] = copy.deepcopy(validation)
+                if validation["status"] == "verified" and (latest_attempt.get("vertical_publish") or {}).get("status") == "completed":
+                    latest_attempt["status"] = "completed"
+                elif validation["status"] == "unverified":
+                    latest_attempt["status"] = "unverified"
+                elif validation["status"] == "mismatch":
+                    latest_attempt["status"] = "mismatch"
+                latest_attempt["finished_at"] = utc_now()
             store()
         return owners
 
@@ -1776,6 +2018,9 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 validation["repair_limit_reached"] = True
                 store()
                 continue
+            if validation.get("repair_scope") == "publish_vertical":
+                repair_targets.append((entry, None, resume_attempt))
+                continue
             try:
                 manifest = publisher.ensure_manifest(Path(str(entry.get("manifest", ""))).expanduser().resolve())
             except Exception:
@@ -1788,7 +2033,18 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             break
         for entry, manifest, resume_attempt in repair_targets:
             try:
-                repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store, attempt=resume_attempt)
+                if manifest is None:
+                    republish_vertical_for_pending_changes(
+                        client,
+                        entry,
+                        args,
+                        adapter,
+                        store,
+                        repair_round=cycle,
+                        attempt=resume_attempt,
+                    )
+                else:
+                    repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store, attempt=resume_attempt)
             except Exception as exc:
                 history = entry.setdefault("repair_history", [])
                 attempt = history[-1] if history and isinstance(history[-1], dict) else {"attempt": len(history) + 1, "steps": []}
