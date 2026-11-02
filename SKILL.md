@@ -7,7 +7,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 使用这个 skill，把本地 `imagesgallery` 产物（图片 + 音频 + 时间轴字幕）发布到 Studio。
 
-## 认证输入
+## 真实推送的凭据前置检查
 
 真实推送创建或编辑 block 之前，必须先完成认证。`--dry-run` 不访问 Studio 或 OSS，也不会登录；不需要认证输入，请求计划中的认证字段会显示为 `<redacted>`。
 
