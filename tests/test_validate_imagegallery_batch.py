@@ -42,7 +42,7 @@ class FakeCookies:
 
 
 class FakeStudio:
-    def __init__(self, galleries, *, keep_mismatch_after_repair=False, fail_get_files=None, payload_overrides=None, extra_assets=None, fail_vertical_publish=False, vertical_overrides=None, fail_course_reads=None):
+    def __init__(self, galleries, *, keep_mismatch_after_repair=False, fail_get_files=None, payload_overrides=None, extra_assets=None, fail_vertical_publish=False, vertical_overrides=None, fail_course_reads=None, fail_publication_reads=None):
         self.galleries = galleries
         self.keep_mismatch_after_repair = keep_mismatch_after_repair
         self.fail_get_files = fail_get_files or {}
@@ -50,10 +50,12 @@ class FakeStudio:
         self.fail_vertical_publish = fail_vertical_publish
         self.vertical_overrides = vertical_overrides or {}
         self.fail_course_reads = set(fail_course_reads or [])
+        self.fail_publication_reads = set(fail_publication_reads or [])
         self.calls = []
         self.path_counts = {}
         self.get_files_counts = {}
         self.course_reads = 0
+        self.publication_reads = 0
         self.next_asset = 1
         self.assets = []
         for gallery in galleries.values():
@@ -79,8 +81,14 @@ class FakeStudio:
 
     def _response(self, method, path, kwargs):
         if method == "GET" and path == f"/course/{COURSE_KEY}":
-            self.course_reads += 1
-            if self.course_reads in self.fail_course_reads:
+            is_concise = (kwargs.get("params") or {}).get("format") == "concise"
+            if is_concise:
+                self.course_reads += 1
+                failed = self.course_reads in self.fail_course_reads
+            else:
+                self.publication_reads += 1
+                failed = self.publication_reads in self.fail_publication_reads
+            if failed:
                 return FakeResponse({"detail": "structure unavailable"}, 503)
             return FakeResponse(make_course_structure(self.galleries, self.vertical_overrides))
         if method == "GET" and path == f"/assets/{COURSE_KEY}/":
@@ -164,6 +172,10 @@ class FakeStudio:
         if method == "POST" and path.startswith("/xblock/") and "+type@vertical+" in path:
             if self.fail_vertical_publish:
                 return FakeResponse({"detail": "vertical publish failed", "Authorization": "Bearer vertical-secret"}, 503)
+            for locator in (VERTICAL_1, VERTICAL_2):
+                if locator in path:
+                    override = self.vertical_overrides.setdefault(locator, {})
+                    override.update({"published": True, "has_changes": False, "visibility_state": "live"})
             return FakeResponse({"ok": True})
         if method == "DELETE" and path.startswith(f"/assets/{COURSE_KEY}/"):
             asset_id = path.rsplit("/", 1)[-1]
@@ -203,6 +215,10 @@ def make_course_structure(galleries, vertical_overrides=None):
         }
         if not override.get("omit_published"):
             node["published"] = override.get("published", True)
+        if not override.get("omit_has_changes"):
+            node["has_changes"] = override.get("has_changes", False)
+        if "visibility_state" in override:
+            node["visibility_state"] = override["visibility_state"]
         if blocks or override.get("include_empty"):
             vertical_nodes.append(node)
     section = {"id": "block-v1:ORG+COURSE+RUN+type@sequential+block@section", "category": "sequential", "child_info": {"children": vertical_nodes}}
@@ -947,6 +963,158 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
+
+    def test_cli_does_not_pass_published_vertical_with_unpublished_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }}, vertical_overrides={VERTICAL_1: {
+                "has_changes": True,
+                "visibility_state": "needs_attention",
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertEqual("verified", state["course_structure_verification"]["subsections"][0]["status"])
+            self.assertFalse(state["course_structure_verification"]["subsections"][0]["has_changes"])
+            self.assertEqual(1, state["galleries"][0]["repair_attempts"])
+            self.assertTrue(any(call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith(("remove_files", "file_upload", "save_audio", "update_play_config")) for call in studio.calls))
+
+    def test_cli_marks_pending_visibility_state_as_issue_even_when_has_changes_is_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }}, vertical_overrides={VERTICAL_1: {
+                "has_changes": False,
+                "visibility_state": "needs_attention",
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertFalse(state["course_structure_verification"]["subsections"][0]["has_changes"])
+            self.assertEqual("live", state["course_structure_verification"]["subsections"][0]["visibility_state"])
+            self.assertEqual(1, state["galleries"][0]["repair_attempts"])
+            self.assertEqual(1, sum(call["method"] == "POST" and call["path"].startswith("/xblock/") and "+type@vertical+" in call["path"] for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith(("remove_files", "file_upload", "save_audio", "update_play_config")) for call in studio.calls))
+
+    def test_cli_passes_target_published_without_pending_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            subsection = state["course_structure_verification"]["subsections"][0]
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertTrue(subsection["published"])
+            self.assertFalse(subsection["has_changes"])
+            self.assertNotIn("visibility_state", subsection)
+            self.assertFalse(any(call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
+
+    def test_cli_does_not_write_when_saved_publication_evidence_is_missing_or_invalid(self):
+        cases = (
+            ({"omit_published": True, "has_changes": False}, "unverified"),
+            ({"published": "true", "has_changes": False}, "unverified"),
+            ({"omit_has_changes": True}, "unverified"),
+            # A confirmed unpublished section remains an issue even when its
+            # pending-change evidence is also missing.
+            ({"published": False, "omit_has_changes": True}, "issue"),
+            ({"has_changes": "false"}, "unverified"),
+            ({"has_changes": False, "visibility_state": 1}, "unverified"),
+        )
+        for override, expected_section_status in cases:
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                operation_path = root / "batch-operation.json"
+                self._write_operation_file(operation_path, self._operation(manifest))
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [
+                        {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": [{}, {}],
+                    "audios": [{}],
+                }}, vertical_overrides={VERTICAL_1: override})
+
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+                self.assertEqual(1, exit_code, stdout + stderr)
+                state = json.loads(operation_path.read_text(encoding="utf-8"))
+                self.assertFalse(state["batch_result"]["all_sections_verified"])
+                self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
+                self.assertEqual(expected_section_status, state["course_structure_verification"]["subsections"][0]["status"])
+                self.assertFalse(any(
+                    call["method"] == "DELETE"
+                    or call["path"].endswith(("remove_files", "file_upload", "change_files_order", "save_audio", "update_play_config"))
+                    or (call["method"] == "POST" and call["path"].startswith("/xblock/") and "+type@vertical+" in call["path"])
+                    for call in studio.calls
+                ))
+
+    def test_cli_marks_saved_publication_read_failure_unverified_without_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }}, fail_publication_reads={1, 2})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("unverified", state["course_structure_verification"]["status"])
+            self.assertFalse(any(
+                call["method"] == "DELETE"
+                or call["path"].endswith(("remove_files", "file_upload", "change_files_order", "save_audio", "update_play_config"))
+                or (call["method"] == "POST" and call["path"].startswith("/xblock/") and "+type@vertical+" in call["path"])
+                for call in studio.calls
+            ))
 
     def test_batch_report_keeps_safe_publisher_and_vertical_failure_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
