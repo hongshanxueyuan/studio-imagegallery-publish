@@ -169,6 +169,7 @@ python scripts/publish_imagegallery_block.py \
 - `--cleanup-only`：兼容旧命令行调用；返回 `unsupported`，不访问 Studio
 - `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
 - `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`unsupported` 和失败项
+- `--report-mode`：运营摘要分组方式；`categories` 默认按检查结果分类，`sections` 按 sequential 小节归类
 
 每个 vertical 的结果会包含可点击的目标 vertical URL、新建或复用的 gallery URL、`本节要点组件` 保留状态、纵向组件快照、已完成和失败步骤，以及失败原因或人工跟进说明。
 
@@ -208,7 +209,7 @@ python scripts/validate_imagegallery_batch.py \
   --execute
 ```
 
-真实执行优先使用环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`；也可使用 `FIRA_SAAS_OP_COOKIE` / `FIRA_SAAS_OP_CSRF_TOKEN`、`--account` / `--password` 或 `--cookie`。验证器读取操作记录、manifest 和 Studio 实时状态；通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容，并最终重新读取 Studio `format=concise` 课程结构。图片核对有效文件记录数、`total_count`、manifest 页数、逐图文件名、asset ID 和顺序；期望 asset ID 来自发布操作检查点。配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不检查 learner-side LMS 或远端音频播放。
+真实执行优先使用环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`；也可使用 `FIRA_SAAS_OP_COOKIE` / `FIRA_SAAS_OP_CSRF_TOKEN`、`--account` / `--password` 或 `--cookie`。验证器读取操作记录、manifest 和 Studio 实时状态；通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容，并最终重新读取 Studio `format=concise` 课程结构。使用结构树前，验证器会递归确认 `course`、`chapter`、`sequential`、`vertical` 都返回子节点列表；任一容器缺少子树时将结果标为 `unverified`，不据此修复或扫描可删除资产。图片核对有效文件记录数、`total_count`、manifest 页数、逐图文件名、asset ID 和顺序；期望 asset ID 来自发布操作检查点。配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不检查 learner-side LMS 或远端音频播放。
 
 任一可确认的图片、播放配置或音频绑定不匹配会记为 `mismatch`，最多触发一次完整修复；Studio 请求失败、响应结构无效或 operation 缺少逐图预期 ID 时记为 `unverified`，不修改该 Gallery，并继续检查其他目标。图片 ID、文件名和顺序必须逐项与 operation 检查点及 manifest 一致；数量相同不能单独证明图片正确。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时记录结果，不开始第二次完整修复，也不要求用户在批次中途决定下一步。
 
@@ -216,7 +217,7 @@ python scripts/validate_imagegallery_batch.py \
 
 `all_sections_verified` 要求初始发布操作、最终 Gallery 内容、实时课程结构和发布状态都通过；发生失败或待确认步骤时，即使部分实时内容匹配，也会在最终批次结果中保留问题。Gallery 内容、发布操作、修复记录和课程结构分别报告，避免一种状态覆盖另一种状态。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
 
-批次结束后直接输出汇总，不在中途或报告末尾追问是否继续、是否修复或如何处理失败章节。报告逐 target 列出写入步骤、失败步骤、最终校验、自动修复结果和 vertical URL。
+批次结束后直接输出汇总，不在中途或报告末尾追问是否继续、是否修复或如何处理失败章节。报告逐 target 列出写入步骤、失败步骤、最终校验、自动修复结果和 vertical URL。运营摘要默认按检查结果分类，例如“开头出现 >”“章节未发布”“加粗识别失败”“ImageGallery 相关问题”；需要按小节查看时传入 `--report-mode sections`，验证器会在 operation 中保存该选择并供最终化复用。全部检查通过时保留结构化 `pass` 状态，但摘要正文为空。
 
 ## 批次结束后的整课审核和运营报告
 
@@ -236,7 +237,7 @@ python scripts/validate_imagegallery_batch.py \
   --finalize-audit-report "<course_audit_request.report_path>"
 ```
 
-最终化只读取保存的 auditor 报告，不访问 Studio；它核对课程身份，把报告合并到现有 operation 文件，保留批次发布与 Gallery 校验结果，并重建 `batch_result` 和 `operator_report`。结构化明细和中文摘要使用同一组发现。报告按 sequential 小节的安全 Studio 路由归并发布步骤、Gallery 校验、正式发布状态和课程审核发现；无法确认路由的小节发现使用课程链接。问题说明区分已确认问题和无法确认，所有检查通过时显示简短结论。
+最终化只读取保存的 auditor 报告，不访问 Studio；它核对课程身份，把报告合并到现有 operation 文件，保留批次发布与 Gallery 校验结果，并重建 `batch_result` 和 `operator_report`。结构化明细和中文摘要使用同一组发现。默认报告按检查结果分类，每个类别下列出关联小节和安全 Studio 链接；传入 `--report-mode sections` 可按 sequential 小节归并发布步骤、Gallery 校验、正式发布状态和课程审核发现。无法确认路由的小节发现使用课程链接。问题说明区分已确认问题和无法确认；全部检查通过时摘要正文为空。
 
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
