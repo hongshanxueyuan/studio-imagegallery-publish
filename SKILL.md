@@ -224,13 +224,7 @@ python scripts/validate_imagegallery_batch.py \
 
 批次结束后先运行 `validate_imagegallery_batch.py --execute`。它完成所有目标的 Gallery 校验和课程结构核对，并将 `course_audit_request` 写入 operation 文件及输出结果。请求包含 `status`、`course_id`、`course_url`、`working_directory` 和 `report_path`。第一阶段因为整课审核仍待运行会返回退出码 `1`；父流程读取 JSON，在 `status` 为 `pending` 时继续启动子 agent，即使部分 target 发布失败也照常审核。课程身份不可用时不会创建待处理请求，并会在当前结果中报告课程审核无法运行。
 
-子 agent 接收上述课程 URL、工作目录和报告路径后，先检查 `nlm-course-auditor` skill 是否已安装。找不到时，在 Codex skill 目录（`$CODEX_HOME/skills`；未设置时使用 `~/.codex/skills`）克隆 `https://github.com/hongshanxueyuan/nlm-course-auditor`，并按该仓库的 `requirements.txt` 自动准备运行依赖，不询问用户确认。无论使用已安装副本还是新克隆的仓库，都将 `<auditor-root>` 设为包含 `SKILL.md` 和 `scripts/` 的目录绝对路径。随后子 agent 必须明确运行 `nlm-course-auditor` skill，对课程执行一次只读审核：
-
-```bash
-python "<auditor-root>/scripts/nlm_course_auditor.py" \
-  --studio-url "<course_audit_request.course_url>" \
-  --working-directory "<course_audit_request.working_directory>"
-```
+子 agent 接收上述课程 URL、工作目录和报告路径后，检查 `nlm-course-auditor` skill 是否可用。若未安装，从 `https://github.com/hongshanxueyuan/nlm-course-auditor` 安装该 skill，无需询问用户确认。随后按该 skill 自己的说明，对课程执行一次只读审核，并使用请求中的工作目录。
 
 子 agent 必须让审核报告保存到 `course_audit_request.report_path`，并将该路径交还给父流程。子 agent 只从继承的环境读取 `FIRA_SAAS_OP_ACCOUNT`、`FIRA_SAAS_OP_PASSWORD`、`FIRA_SAAS_OP_COOKIE` 和 `FIRA_SAAS_OP_CSRF_TOKEN`；父流程不得把 CLI 参数里的密码、Cookie 或 CSRF 值放进子 agent 提示，也不得让子 agent 把这些值写入命令参数、报告或 operation 文件。审核只读，不修改、修复、重发或清理 Studio 内容。若 auditor 安装或执行失败，子 agent 仍须在 `report_path` 写入与 auditor `report.json` 兼容的 `unverified` JSON，包含匹配的 `course_id`、`status`、计数、空的 `target_sections` / `sequential_sections`，以及带 `failure_stage`（值以 `auditor_` 开头）的课程级 `NLMCA-007` 发现；不要写入原始异常或凭据。
 
