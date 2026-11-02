@@ -6,6 +6,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -244,7 +245,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             })
         return {"operation_id": "operation-1", "galleries": entries}
 
-    def _run_cli(self, operation_path, studio, *, extra_args=()):
+    def _run_cli(self, operation_path, studio, *, extra_args=(), audit_report=None):
         args = [
             "validate_imagegallery_batch.py",
             "--studio-url",
@@ -260,10 +261,29 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
         ]
         stdout = StringIO()
         stderr = StringIO()
-        with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.dict(
+        default_audit_report = {
+            "status": "pass",
+            "pass_count": 1,
+            "issue_count": 0,
+            "unverified_count": 0,
+            "sequential_sections": [{
+                "name": "1.2",
+                "locator": "block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                "studio_url": "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                "checks": [{"check_id": "NLMCA-013", "status": "pass"}],
+            }],
+            "target_sections": [],
+            "course_findings": [],
+        }
+        if audit_report is None:
+            audit_report = default_audit_report
+        with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.object(
+            module, "run_course_audit", return_value=audit_report, create=True
+        ) as auditor, patch.dict(
             "os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = module.main()
+        self.last_auditor_mock = auditor
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
     def _write_operation_file(self, path, operation):
@@ -805,6 +825,262 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(403, result["initial_vertical_publish"]["http_status"])
             self.assertNotIn("vertical-secret", stdout + stderr + json.dumps(state))
 
+    def test_course_audit_runs_once_after_gallery_checks_even_when_publish_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation = self._operation(manifest, initial_vertical_status="failed")
+            operation["galleries"][0]["publish"].update({
+                "status": "failed",
+                "failed_step": "upload_image[2]",
+                "error_summary": "Studio request failed (HTTP 503) during upload_image[2]",
+            })
+            operation["galleries"][0]["vertical_integrity"].update({
+                "status": "unresolved",
+                "steps": [{"step": "resolve_replacement_target", "status": "failed"}],
+            })
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            self.assertEqual(1, self.last_auditor_mock.call_count)
+            self.assertTrue(any(call["path"].endswith("get_audios") for call in studio.calls))
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("failed", state["galleries"][0]["publish"]["status"])
+            self.assertEqual("pass", state["batch_result"]["course_audit"]["status"])
+
+    def test_operator_report_groups_publisher_and_auditor_findings_by_sequential_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation = self._operation(manifest, initial_vertical_status="failed")
+            operation["galleries"][0]["publish"].update({
+                "status": "failed",
+                "failed_step": "upload_image[2]",
+                "error_summary": "Studio request failed (HTTP 503) during upload_image[2]",
+            })
+            operation["galleries"][0]["vertical_integrity"].update({
+                "status": "unresolved",
+                "steps": [{"step": "resolve_replacement_target", "status": "failed"}],
+            })
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+            auditor_report = {
+                "status": "issue",
+                "pass_count": 1,
+                "issue_count": 1,
+                "unverified_count": 0,
+                "sequential_sections": [{
+                    "name": "1.2",
+                    "locator": "block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                    "studio_url": "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                    "checks": [{
+                        "check_id": "NLMCA-013",
+                        "name": "Sequential publication state",
+                        "status": "issue",
+                        "actual": {"published": True, "has_changes": True},
+                    }],
+                }],
+                "target_sections": [],
+                "course_findings": [],
+            }
+
+            self._run_cli(operation_path, studio, audit_report=auditor_report)
+
+            result = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]
+            self.assertEqual("issue", result["course_audit"]["status"])
+            self.assertFalse(result["all_sections_verified"])
+            report = result["operator_report"]
+            self.assertEqual("issue", report["status"])
+            self.assertEqual(1, len(report["groups"]))
+            group = report["groups"][0]
+            self.assertEqual("https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section", group["studio_url"])
+            self.assertGreaterEqual(len(group["findings"]), 2)
+            self.assertTrue(any("图片" in item["message"] for item in group["findings"]))
+            self.assertTrue(any("替换" in item["message"] for item in group["findings"]))
+            self.assertTrue(any("未发布改动" in item["message"] for item in group["findings"]))
+
+    def test_course_audit_installs_missing_auditor_and_keeps_credentials_out_of_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "nlm-course-auditor" / "scripts" / "nlm_course_auditor.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# fake auditor", encoding="utf-8")
+            commands = []
+            environments = []
+
+            def fake_process(command, **kwargs):
+                commands.append(command)
+                environments.append(kwargs["env"])
+                working_directory = Path(command[command.index("--working-directory") + 1])
+                report_path = module._auditor_report_path(working_directory, COURSE_KEY)
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(json.dumps({
+                    "status": "issue",
+                    "pass_count": 1,
+                    "issue_count": 1,
+                    "unverified_count": 0,
+                    "sequential_sections": [],
+                    "target_sections": [],
+                    "course_findings": [],
+                }), encoding="utf-8")
+                return SimpleNamespace(returncode=1)
+
+            args = SimpleNamespace(
+                account="account-secret",
+                password="password-secret",
+                cookie="session-secret",
+                csrf_token="csrf-secret",
+            )
+            with patch.object(module, "locate_auditor_script", return_value=None), patch.object(
+                module, "install_auditor", return_value=script
+            ) as installer, patch.object(module.subprocess, "run", side_effect=fake_process):
+                result = module.run_course_audit(studio_base="https://studio.example.com", course_key=COURSE_KEY, args=args)
+
+            self.assertEqual(1, installer.call_count)
+            self.assertEqual("issue", result["status"])
+            self.assertIn("https://studio.example.com/course/" + COURSE_KEY, result["course_url"])
+            self.assertEqual(1, len(commands))
+            self.assertFalse(any(secret in " ".join(commands[0]) for secret in ("account-secret", "password-secret", "session-secret", "csrf-secret")))
+            self.assertEqual("password-secret", environments[0]["FIRA_SAAS_OP_PASSWORD"])
+            self.assertEqual("session-secret", environments[0]["FIRA_SAAS_OP_COOKIE"])
+
+    def test_install_auditor_clones_the_configured_github_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "cache" / "nlm-course-auditor"
+            commands = []
+
+            def fake_clone(command, **_kwargs):
+                commands.append(command)
+                target = Path(command[-1])
+                script = target / "scripts" / "nlm_course_auditor.py"
+                script.parent.mkdir(parents=True)
+                script.write_text("# fake auditor", encoding="utf-8")
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(module.subprocess, "run", side_effect=fake_clone), patch.object(
+                module.importlib.util, "find_spec", return_value=object()
+            ):
+                script = module.install_auditor(destination)
+
+            self.assertEqual(destination / "scripts" / "nlm_course_auditor.py", script)
+            self.assertEqual(["git", "clone", "--depth", "1", module.AUDITOR_REPOSITORY_URL, str(destination)], commands[0])
+
+    def test_auditor_requirements_are_installed_when_its_markdown_dependency_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "nlm-course-auditor"
+            script = root / "scripts" / "nlm_course_auditor.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# fake auditor", encoding="utf-8")
+            requirements = root / "requirements.txt"
+            requirements.write_text("markdown-it-py", encoding="utf-8")
+            with patch.object(module.importlib.util, "find_spec", return_value=None), patch.object(
+                module.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+            ) as install:
+                module.install_auditor_requirements(script)
+
+            command = install.call_args.args[0]
+            self.assertEqual([sys.executable, "-m", "pip", "install", "-r", str(requirements)], command)
+
+    def test_auditor_installation_and_report_read_failures_are_unverified(self):
+        args = SimpleNamespace(account="", password="", cookie="", csrf_token="")
+        with patch.object(module, "locate_auditor_script", return_value=None), patch.object(
+            module, "install_auditor", side_effect=RuntimeError("clone failed")
+        ):
+            install_failure = module.run_course_audit(studio_base="https://studio.example.com", course_key=COURSE_KEY, args=args)
+        self.assertEqual("unverified", install_failure["status"])
+        self.assertEqual("auditor_unavailable", install_failure["course_findings"][0]["evidence"]["failure_category"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "nlm_course_auditor.py"
+            script.write_text("# fake auditor", encoding="utf-8")
+            with patch.object(module, "locate_auditor_script", return_value=script), patch.object(
+                module.subprocess, "run", return_value=SimpleNamespace(returncode=2)
+            ):
+                read_failure = module.run_course_audit(studio_base="https://studio.example.com", course_key=COURSE_KEY, args=args)
+        self.assertEqual("unverified", read_failure["status"])
+        self.assertEqual("auditor_execution", read_failure["course_findings"][0]["evidence"]["failure_stage"])
+
+    def test_cli_reports_auditor_unverified_when_course_identity_cannot_be_parsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            stdout = StringIO()
+            args = [
+                "validate_imagegallery_batch.py",
+                "--studio-url", "https://studio.example.com/course/not-a-container",
+                "--operation-file", str(operation_path),
+                "--execute",
+            ]
+
+            with patch("sys.argv", args), redirect_stdout(stdout):
+                exit_code = module.main()
+
+            self.assertEqual(2, exit_code)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual("unverified", result["course_audit"]["status"])
+            self.assertEqual("course_identity", result["course_audit"]["course_findings"][0]["evidence"]["failure_stage"])
+            self.assertIn("课程审核未能运行", result["operator_report"]["text"])
+
+    def test_unverified_audit_keeps_publication_result_and_course_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+            audit_report = module._audit_unverified(COURSE_KEY, stage="auditor_install")
+            audit_report["course_url"] = "https://studio.example.com/course/" + COURSE_KEY
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, audit_report=audit_report)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("completed", state["galleries"][0]["publish"]["status"])
+            self.assertEqual("unverified", state["batch_result"]["course_audit"]["status"])
+            finding = state["batch_result"]["operator_report"]["course_findings"][0]
+            self.assertEqual("https://studio.example.com/course/" + COURSE_KEY, finding["studio_url"])
+            self.assertEqual("unverified", finding["status"])
+            self.assertIn("无法确认", state["batch_result"]["operator_report"]["text"])
+            self.assertIn("课程审核程序未能完成运行", state["batch_result"]["operator_report"]["text"])
+
+    def test_all_clear_operator_report_is_short_and_has_no_problem_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            report = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]["operator_report"]
+            self.assertEqual("pass", report["status"])
+            self.assertEqual([], report["groups"])
+            self.assertEqual("本次发布批次和全课程审核均通过，未发现需要处理的问题。", report["summary"])
+            self.assertEqual(report["summary"], report["text"])
 
 if __name__ == "__main__":
     unittest.main()
