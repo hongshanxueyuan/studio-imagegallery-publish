@@ -24,10 +24,12 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 两阶段批量发布与审核优先使用 `FIRA_SAAS_OP_ACCOUNT` 和 `FIRA_SAAS_OP_PASSWORD`，让发布验证和审核子 agent 复用当前进程环境。batch validator 和 auditor 也支持 `FIRA_SAAS_OP_COOKIE` 与 `FIRA_SAAS_OP_CSRF_TOKEN` 环境变量。
 
-如果执行真实推送时以上方式都没有提供，这个 skill 必须停下，并明确提醒用户配置：
+如果执行真实推送时以上方式都没有提供，将认证缺失记录为阻塞项，不向用户索要或等待凭据：
 
 - `FIRA_SAAS_OP_ACCOUNT`
 - `FIRA_SAAS_OP_PASSWORD`
+
+跳过所有依赖 Studio 认证的写入和远程校验，把未执行的发布目标记为 `failed`（步骤 `authentication`），把无法完成的校验记为 `unverified`，然后继续打印最终报告。报告可以指出下次运行需要配置的环境变量，但不得要求用户在当前流程中补充后再继续；不要虚构 Studio 写入或校验结果。
 
 安全边界：
 
@@ -54,6 +56,8 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 - 可选的 `--adapter` JSON（通常不需要；默认模板已适配大多数站点）
 
 ## 工作流
+
+用户明确启动真实推送或批次后，从开始执行到打印最终报告，全程不等待用户补充信息、确认版本、决定失败处理方式或批准单个步骤。直接使用已给输入和默认值；输入缺失、认证失败或安全前置检查不通过时，将受影响的发布步骤记为 `failed`，将无法读取或核实的结果记为 `unverified`，跳过依赖动作，继续独立目标和报告收尾。若没有可继续的工作，立即打印包含失败原因和未完成项的最终报告；不要在中途向用户发问或等待回复。
 
 1. 仅在真实推送前运行凭据检查；dry-run 无需凭据
 2. 根据 URL + manifest 构建运行时上下文
@@ -113,7 +117,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 - `upload_audio_register` 返回 `401 Not Login yet`
 - 后续保存步骤因为 csrf/session 在运行中途过期而失败
 
-如果认证相关重试次数耗尽，必须停下，并清楚报告失败发生在哪个步骤。
+如果认证相关重试次数耗尽，将当前 target 标记失败，并清楚记录失败步骤；单 target 流程立即打印结果，批量流程继续其他目标并在最后汇总。
 
 批量执行时，此失败只结束当前 target 中依赖该认证步骤的操作；记录错误后继续其他 target。全部目标处理完后仍运行批次验证，并将该失败列入最终报告。
 
