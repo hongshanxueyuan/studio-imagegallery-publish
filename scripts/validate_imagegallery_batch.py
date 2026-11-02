@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +23,151 @@ import publish_imagegallery_block as publisher
 DEFAULT_ADAPTER = Path(__file__).resolve().parents[1] / "references" / "adapter.template.json"
 DEFAULT_TIMEOUT = 30
 IMAGE_PAGE_SIZE = 50
+AUDITOR_REPOSITORY_URL = "https://github.com/hongshanxueyuan/nlm-course-auditor"
+AUDITOR_SCRIPT_NAME = "nlm_course_auditor.py"
+
+
+def _auditor_script_in(path: Path) -> Path | None:
+    script = path / "scripts" / AUDITOR_SCRIPT_NAME if path.is_dir() else path
+    return script if script.is_file() and script.name == AUDITOR_SCRIPT_NAME else None
+
+
+def locate_auditor_script() -> Path | None:
+    configured = os.environ.get("NLM_COURSE_AUDITOR_PATH", "").strip()
+    candidates = [Path(configured).expanduser()] if configured else []
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    candidates.extend((
+        codex_home / "skills" / "nlm-course-auditor",
+        Path.home() / ".agents" / "skills" / "nlm-course-auditor",
+    ))
+    publisher_root = Path(__file__).resolve().parents[1]
+    candidates.extend((
+        publisher_root.parent / "nlm-course-auditor",
+        publisher_root.parent.parent / "nlm-course-auditor",
+        publisher_root.parent.parent / "skills" / "nlm-course-auditor",
+    ))
+    for candidate in candidates:
+        script = _auditor_script_in(candidate)
+        if script is not None:
+            return script
+    return None
+
+
+def install_auditor(destination: Path) -> Path:
+    installed_script = _auditor_script_in(destination)
+    if installed_script is not None:
+        return installed_script
+    if destination.exists():
+        raise RuntimeError("auditor installation directory is unavailable")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", AUDITOR_REPOSITORY_URL, str(destination)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    script = _auditor_script_in(destination)
+    if script is None:
+        raise RuntimeError("auditor repository does not contain the expected entry point")
+    return script
+
+
+def install_auditor_requirements(script: Path) -> None:
+    requirements = script.parents[1] / "requirements.txt"
+    if requirements.is_file() and importlib.util.find_spec("markdown_it") is None:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _auditor_working_directory() -> Path:
+    cache_base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".cache")
+    cache_root = Path(cache_base).expanduser() / "studio-imagegallery-publish" / "nlm-course-auditor"
+    return cache_root
+
+
+def _auditor_report_path(working_directory: Path, course_key: str) -> Path:
+    safe_course_key = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", course_key).rstrip(" .")
+    return working_directory / "auditor" / safe_course_key / "report.json"
+
+
+def _auditor_environment(args: argparse.Namespace) -> dict[str, str]:
+    environment = os.environ.copy()
+    for argument, variable in (
+        ("account", "FIRA_SAAS_OP_ACCOUNT"),
+        ("password", "FIRA_SAAS_OP_PASSWORD"),
+        ("cookie", "FIRA_SAAS_OP_COOKIE"),
+        ("csrf_token", "FIRA_SAAS_OP_CSRF_TOKEN"),
+    ):
+        value = getattr(args, argument, "")
+        if isinstance(value, str) and value:
+            environment[variable] = value
+    return environment
+
+
+def _audit_unverified(course_key: str, *, stage: str) -> dict[str, Any]:
+    course_finding = {
+        "check_id": "NLMCA-007",
+        "category": "课程读取",
+        "name": "课程审核无法确认",
+        "status": "unverified",
+        "expected": {"audit": "complete"},
+        "actual": {"audit": "unavailable"},
+        "evidence": {"failure_stage": stage, "failure_category": "auditor_unavailable"},
+    }
+    return {
+        "course_id": course_key,
+        "status": "unverified",
+        "pass_count": 0,
+        "issue_count": 0,
+        "unverified_count": 1,
+        "sequential_sections": [],
+        "target_sections": [],
+        "course_findings": [course_finding],
+    }
+
+
+def run_course_audit(*, studio_base: str, course_key: str, args: argparse.Namespace) -> dict[str, Any]:
+    """Run the read-only auditor after batch validation and load its structured report."""
+    try:
+        script = locate_auditor_script()
+        if script is None:
+            script = install_auditor(_auditor_working_directory())
+        install_auditor_requirements(script)
+        with tempfile.TemporaryDirectory(prefix="imagegallery-audit-") as temporary:
+            working_directory = Path(temporary)
+            command = [
+                sys.executable,
+                str(script),
+                "--studio-url",
+                f"{studio_base.rstrip('/')}/course/{course_key}",
+                "--working-directory",
+                str(working_directory),
+            ]
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=_auditor_environment(args),
+            )
+            report_path = _auditor_report_path(working_directory, course_key)
+            if completed.returncode not in {0, 1} or not report_path.is_file():
+                return _audit_unverified(course_key, stage="auditor_execution")
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(report, dict)
+                or report.get("status") not in {"pass", "issue", "unverified"}
+                or not isinstance(report.get("sequential_sections"), list)
+            ):
+                return _audit_unverified(course_key, stage="auditor_report")
+            report["course_url"] = f"{studio_base.rstrip('/')}/course/{course_key}"
+            return report
+    except Exception:
+        return _audit_unverified(course_key, stage="auditor_install_or_read")
 
 
 class BatchValidationError(RuntimeError):
@@ -1002,6 +1150,376 @@ def live_vertical_structure_status(
     return "verified" if observed == expected[locator] else "mismatch"
 
 
+def _section_url(studio_url: str, locator: str) -> str:
+    if not locator:
+        return studio_url
+    parsed = urlsplit(studio_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return studio_url
+    return f"{parsed.scheme}://{parsed.netloc}/container/{locator}"
+
+
+def _audit_check_message(check_id: str, actual: Any, evidence: Any) -> str:
+    actual = actual if isinstance(actual, dict) else {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+    if check_id == "NLMCA-007":
+        stage = str(evidence.get("failure_stage") or "")
+        if stage == "course_identity":
+            return "无法识别课程身份，课程审核未能运行。"
+        if stage.startswith("auditor_"):
+            return "课程审核程序未能完成运行，暂时无法确认全课程审核结果。"
+        return "暂时无法读取课程结构，无法完成课程审核。"
+    if check_id == "NLMCA-013":
+        if actual.get("published") is False:
+            return "当前小节没有公开版本。"
+        if actual.get("has_changes") is True or actual.get("visibility_state") == "needs_attention":
+            return "当前仍有未发布改动，已有公开版本未包含最新编辑。"
+        return "暂时无法确认当前小节是否已发布最新编辑。"
+    affected_pages = evidence.get("affected_pages")
+    if isinstance(affected_pages, list) and affected_pages:
+        if check_id == "NLMCA-010":
+            details = [
+                f"第 {item['page']} 页出现 {item['marker_count']} 个开头为 `>` 的大于号"
+                for item in affected_pages if isinstance(item, dict) and isinstance(item.get("page"), int) and isinstance(item.get("marker_count"), int)
+            ]
+            if details:
+                return "；".join(details) + "。"
+        if check_id == "NLMCA-011":
+            pages = [str(item["page"]) for item in affected_pages if isinstance(item, dict) and isinstance(item.get("page"), int)]
+            if pages:
+                return f"第 {', '.join(pages)} 页出现正文段落先于 Markdown 标题的情况。"
+        if check_id == "NLMCA-012":
+            details = [
+                f"第 {item['page']} 页识别加粗失败 {item['unrecognized_bold_count']} 处"
+                for item in affected_pages if isinstance(item, dict) and isinstance(item.get("page"), int) and isinstance(item.get("unrecognized_bold_count"), int)
+            ]
+            if details:
+                return "；".join(details) + "。"
+    messages = {
+        "NLMCA-001": "“赋能内容”小节中的 imagegallery 数量不是一个。",
+        "NLMCA-002": "“赋能内容”小节中的“本节要点”组件数量不是一个。",
+        "NLMCA-003": "Studio 返回的 imagegallery 图片记录数量不一致。",
+        "NLMCA-004": "imagegallery 的字幕配置条目数与图片数量不一致。",
+        "NLMCA-005": "imagegallery 的音频绑定数量不是一个。",
+        "NLMCA-006": "课程结构中没有找到名称为“赋能内容”的小节，请核对课程和命名。",
+        "NLMCA-008": "imagegallery 没有位于小节的第一个组件。",
+        "NLMCA-009": "“本节要点”组件没有位于小节末尾。",
+        "NLMCA-010": "已保存字幕中存在开头为 `>` 的大于号。",
+        "NLMCA-011": "已保存字幕中出现正文段落先于 Markdown 标题的情况。",
+        "NLMCA-012": "已保存字幕中有加粗格式未被识别。",
+    }
+    message = messages.get(check_id, "课程审核发现需要复核的内容。")
+    hint = evidence.get("operator_hint")
+    if isinstance(hint, str) and hint.strip():
+        message += f"排查提示（不是已确认原因）：{hint.strip()}"
+    return message
+
+
+def _publish_step_message(step: Any) -> str:
+    step_name = str(step or "")
+    image_match = re.fullmatch(r"upload_image\[(\d+)\]", step_name)
+    if image_match:
+        return f"第 {image_match.group(1)} 页图片上传失败。"
+    messages = {
+        "create_block": "创建 imagegallery 组件失败。",
+        "delete_block": "替换原组件失败。",
+        "resolve_replacement_target": "无法确认要替换的原组件。",
+        "remove_old_html_summary": "替换原组件失败。",
+        "verify_vertical_before_create": "小节结构检查未通过，未创建 imagegallery。",
+        "verify_vertical_before_move": "小节结构检查未通过，未继续调整组件。",
+        "verify_vertical_before_delete": "小节结构检查未通过，未继续替换原组件。",
+        "verify_vertical_after_create": "imagegallery 创建后的小节结构检查未通过。",
+        "reorder_children": "调整小节组件顺序失败。",
+        "change_files_order": "调整 imagegallery 图片顺序失败。",
+        "upload_audio_prepare": "准备音频上传失败。",
+        "upload_audio_multipart": "音频文件上传失败。",
+        "upload_audio": "音频文件上传失败。",
+        "upload_audio_register": "注册音频失败。",
+        "save_audio_binding": "保存音频绑定失败。",
+        "submit_studio_edits": "保存 imagegallery 展示设置失败。",
+        "save_block": "保存 imagegallery 字幕配置失败。",
+        "publish_vertical": "发布小节失败。",
+    }
+    if step_name.startswith("upload_image["):
+        return "图片上传失败。"
+    if step_name.startswith("save_") or step_name.startswith("update_play_config"):
+        return "保存 imagegallery 的字幕或音频配置失败。"
+    if step_name in {"target_preflight", "create_block", "verify_vertical_after_create", "publish_structure"}:
+        return "imagegallery 替换或发布流程失败。"
+    return messages.get(step_name, "imagegallery 发布流程未完成。")
+
+
+def _validation_message(check_name: str, status: str) -> str:
+    if status == "unverified":
+        messages = {
+            "images": "暂时无法确认 imagegallery 图片是否完整。",
+            "image_count": "暂时无法确认 imagegallery 图片数量。",
+            "image_names": "暂时无法确认 imagegallery 图片是否与清单一致。",
+            "image_asset_ids": "暂时无法确认 imagegallery 图片资源。",
+            "image_order": "暂时无法确认 imagegallery 图片顺序。",
+            "play_config": "暂时无法确认已保存字幕配置。",
+            "audio_bindings": "暂时无法确认音频绑定。",
+        }
+        return messages.get(check_name, "暂时无法确认 imagegallery 的完整状态。")
+    messages = {
+        "images": "imagegallery 图片与本地清单不一致。",
+        "image_count": "imagegallery 图片数量与本地清单不一致。",
+        "image_names": "imagegallery 图片名称与本地清单不一致。",
+        "image_asset_ids": "imagegallery 图片资源与发布记录不一致。",
+        "image_order": "imagegallery 图片顺序与本地清单不一致。",
+        "play_config": "已保存字幕配置条目数与图片数量不一致。",
+        "audio_bindings": "imagegallery 的音频绑定数量不是一个。",
+    }
+    return messages.get(check_name, "imagegallery 内容与本地清单不一致。")
+
+
+def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
+    course_check = operation.get("course_structure_verification")
+    course_check = course_check if isinstance(course_check, dict) else {}
+    course_audit = operation.get("course_audit")
+    course_audit = course_audit if isinstance(course_audit, dict) else {}
+    section_records = course_check.get("subsections") if isinstance(course_check.get("subsections"), list) else []
+    audit_sections = course_audit.get("sequential_sections") if isinstance(course_audit.get("sequential_sections"), list) else []
+
+    groups: dict[str, dict[str, Any]] = {}
+    section_by_locator: dict[str, dict[str, Any]] = {}
+    vertical_owners: dict[str, str] = {}
+    for section in audit_sections:
+        if not isinstance(section, dict):
+            continue
+        locator = safe_locator(section.get("locator"))
+        if not locator:
+            continue
+        record = {
+            "name": str(section.get("name") or "课程小节"),
+            "locator": locator,
+            "studio_url": str(section.get("studio_url") or ""),
+            "findings": [],
+        }
+        section_by_locator[locator] = record
+    for subsection in section_records:
+        if not isinstance(subsection, dict):
+            continue
+        section_locator = safe_locator(subsection.get("section_locator"))
+        vertical_locator = safe_locator(subsection.get("vertical_locator"))
+        if not section_locator:
+            continue
+        route = section_by_locator.get(section_locator)
+        if route is None:
+            route = {
+                "name": str(subsection.get("section_title") or subsection.get("vertical_title") or "课程小节"),
+                "locator": section_locator,
+                "studio_url": _section_url(str(subsection.get("studio_url") or ""), section_locator),
+                "findings": [],
+            }
+            section_by_locator[section_locator] = route
+        if vertical_locator:
+            vertical_owners[vertical_locator] = section_locator
+
+    def ensure_group(locator: str, name: str, studio_url: str) -> dict[str, Any]:
+        locator = safe_locator(locator)
+        key = locator or studio_url or name or "course-section"
+        if key not in groups:
+            known = section_by_locator.get(locator)
+            groups[key] = {
+                "name": (known or {}).get("name") or name or "课程小节",
+                "locator": locator,
+                "studio_url": (known or {}).get("studio_url") or studio_url,
+                "findings": [],
+            }
+        return groups[key]
+
+    def add_section_finding(locator: str, fallback_name: str, fallback_url: str, status: str, source: str, message: str) -> None:
+        if status not in {"issue", "unverified"}:
+            return
+        route_locator = vertical_owners.get(safe_locator(locator), locator)
+        route = section_by_locator.get(route_locator)
+        group = ensure_group(
+            route_locator,
+            str((route or {}).get("name") or fallback_name),
+            str((route or {}).get("studio_url") or fallback_url),
+        )
+        finding = {"status": status, "source": source, "message": message}
+        if finding not in group["findings"]:
+            group["findings"].append(finding)
+
+    # Keep all sections in the report's coverage while displaying only problems.
+    for section in audit_sections:
+        if not isinstance(section, dict):
+            continue
+        locator = safe_locator(section.get("locator"))
+        if not locator:
+            continue
+        for check in section.get("checks", []) if isinstance(section.get("checks"), list) else []:
+            if not isinstance(check, dict):
+                continue
+            status = check.get("status")
+            if status in {"issue", "unverified"}:
+                add_section_finding(
+                    locator,
+                    str(section.get("name") or "课程小节"),
+                    str(section.get("studio_url") or ""),
+                    status,
+                    "course_audit",
+                    _audit_check_message(str(check.get("check_id") or ""), check.get("actual"), check.get("evidence")),
+                )
+
+    for target in course_audit.get("target_sections", []) if isinstance(course_audit.get("target_sections"), list) else []:
+        if not isinstance(target, dict):
+            continue
+        locator = safe_locator(target.get("locator"))
+        for check in target.get("checks", []) if isinstance(target.get("checks"), list) else []:
+            if not isinstance(check, dict):
+                continue
+            status = check.get("status")
+            if status in {"issue", "unverified"}:
+                add_section_finding(
+                    locator,
+                    str(target.get("name") or "课程小节"),
+                    str(target.get("studio_url") or ""),
+                    status,
+                    "course_audit",
+                    _audit_check_message(str(check.get("check_id") or ""), check.get("actual"), check.get("evidence")),
+                )
+
+    for subsection in section_records:
+        if not isinstance(subsection, dict):
+            continue
+        locator = safe_locator(subsection.get("vertical_locator"))
+        if subsection.get("status") == "issue":
+            issues = subsection.get("issues") if isinstance(subsection.get("issues"), list) else []
+            for issue in issues:
+                message = "小节组件结构与预期不一致。" if issue == "structure_mismatch" else "Studio 确认该小节尚未发布。" if issue == "published_false" else "小节发布前置检查未完成。"
+                add_section_finding(locator, str(subsection.get("section_title") or "课程小节"), str(subsection.get("studio_url") or ""), "issue", "publisher", message)
+        if subsection.get("status") == "unverified":
+            add_section_finding(locator, str(subsection.get("section_title") or "课程小节"), str(subsection.get("studio_url") or ""), "unverified", "publisher", "暂时无法确认小节组件结构和发布状态。")
+
+    for entry in operation.get("galleries", []):
+        if not isinstance(entry, dict):
+            continue
+        locator = safe_locator(entry.get("vertical_locator"))
+        fallback_url = ""
+        course_url = course_audit.get("course_url")
+        if isinstance(course_url, str) and course_url:
+            fallback_url = _section_url(course_url, locator)
+        publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
+        steps = publish.get("steps") if isinstance(publish.get("steps"), list) else []
+        failed_steps = [item.get("step") for item in steps if isinstance(item, dict) and item.get("status") in {"failed", "blocked"}]
+        if not failed_steps and publish.get("status") != "completed":
+            failed_steps = [publish.get("failed_step") or "publish"]
+        for step in failed_steps:
+            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", _publish_step_message(step))
+
+        initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
+        if not initial_vertical:
+            add_section_finding(locator, "课程小节", fallback_url, "unverified", "publisher", "暂时无法确认小节发布请求结果。")
+        elif initial_vertical.get("status") != "completed":
+            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", "发布小节的请求未成功。")
+
+        integrity = entry.get("vertical_integrity") if isinstance(entry.get("vertical_integrity"), dict) else {}
+        integrity_steps = integrity.get("steps") if isinstance(integrity.get("steps"), list) else []
+        integrity_failures = [
+            item.get("step") for item in integrity_steps
+            if isinstance(item, dict) and item.get("status") in {"failed", "blocked"}
+        ]
+        for step in integrity_failures:
+            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", _publish_step_message(step))
+        if integrity.get("status") in {"failed", "unresolved", "blocked"} and not integrity_failures:
+            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", "小节结构安全检查未完成，imagegallery 替换未完成。")
+
+        validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+        checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
+        if validation.get("status") == "mismatch":
+            mismatches = [key for key, value in checks.items() if value == "mismatch"]
+            for check_name in mismatches or ["gallery"]:
+                add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", _validation_message(str(check_name), "mismatch"))
+        elif validation.get("status") in {"unverified", "failed"}:
+            failed_step = str(validation.get("failed_step") or "")
+            related_check = {"get_files": "images", "get_play_config": "play_config", "get_audios": "audio_bindings"}.get(failed_step, "gallery")
+            add_section_finding(locator, "课程小节", fallback_url, "unverified", "publisher", _validation_message(related_check, "unverified"))
+
+        history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
+        for attempt in history:
+            if not isinstance(attempt, dict) or attempt.get("status") in {"completed", "verified"}:
+                continue
+            repair_step = attempt.get("failed_step") or "repair"
+            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", f"imagegallery 自动修复未完成：{_publish_step_message(repair_step)}")
+
+    course_url = course_audit.get("course_url")
+    if not isinstance(course_url, str) or not course_url:
+        course_id = str(course_audit.get("course_id") or "")
+        some_url = next((str(item.get("studio_url")) for item in section_records if isinstance(item, dict) and item.get("studio_url")), "")
+        parsed = urlsplit(some_url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and course_id:
+            course_url = f"{parsed.scheme}://{parsed.netloc}/course/{course_id}"
+        else:
+            course_url = ""
+    course_findings = []
+    for finding in course_audit.get("course_findings", []) if isinstance(course_audit.get("course_findings"), list) else []:
+        if not isinstance(finding, dict) or finding.get("status") not in {"issue", "unverified"}:
+            continue
+        message = _audit_check_message(str(finding.get("check_id") or ""), finding.get("actual"), finding.get("evidence"))
+        course_findings.append({"status": finding["status"], "source": "course_audit", "message": message, "studio_url": course_url})
+
+    if course_check.get("status") == "unverified" and not section_records:
+        course_findings.append({
+            "status": "unverified",
+            "source": "publisher",
+            "message": "暂时无法读取课程结构，无法确认本次发布状态。",
+            "studio_url": course_url,
+        })
+    if course_check.get("status") == "incomplete" and not any(group["findings"] for group in groups.values()):
+        course_findings.append({
+            "status": "issue",
+            "source": "publisher",
+            "message": "课程组件结构校验发现需要处理的问题。",
+            "studio_url": course_url,
+        })
+    if course_audit.get("status") in {"issue", "unverified"} and not course_findings and not any(group["findings"] for group in groups.values()):
+        course_findings.append({
+            "status": course_audit["status"],
+            "source": "course_audit",
+            "message": "课程审核报告未提供可确认的具体发现。",
+            "studio_url": course_url,
+        })
+
+    visible_groups = [group for group in groups.values() if group["findings"]]
+    issue_count = sum(finding["status"] == "issue" for group in visible_groups for finding in group["findings"])
+    issue_count += sum(finding["status"] == "issue" for finding in course_findings)
+    unverified_count = sum(finding["status"] == "unverified" for group in visible_groups for finding in group["findings"])
+    unverified_count += sum(finding["status"] == "unverified" for finding in course_findings)
+    status = "issue" if issue_count else "unverified" if unverified_count else "pass"
+    if status == "pass":
+        summary = "本次发布批次和全课程审核均通过，未发现需要处理的问题。"
+    else:
+        summary = f"发现 {issue_count} 项已确认问题，另有 {unverified_count} 项无法确认。请按下方 Studio 链接复核。"
+    lines = [summary]
+    for group in visible_groups:
+        name = str(group.get("name") or "课程小节")
+        url = str(group.get("studio_url") or "")
+        heading = f"### [{name}]({url})" if url else f"### {name}"
+        lines.extend(("", heading))
+        for finding in group["findings"]:
+            label = "已确认问题" if finding["status"] == "issue" else "无法确认"
+            lines.append(f"- {label}：{finding['message']}")
+    if course_findings:
+        lines.extend(("", "### 课程"))
+        if course_url:
+            lines[-1] = f"### [课程]({course_url})"
+        for finding in course_findings:
+            label = "已确认问题" if finding["status"] == "issue" else "无法确认"
+            lines.append(f"- {label}：{finding['message']}")
+    return {
+        "status": status,
+        "issue_count": issue_count,
+        "unverified_count": unverified_count,
+        "summary": summary,
+        "groups": visible_groups,
+        "course_findings": course_findings,
+        "text": "\n".join(lines),
+    }
+
+
 def verify_final_course_structure(
     client: StudioClient,
     *,
@@ -1291,15 +1809,24 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
     course_issues = course_check.get("issue_count", 0) if isinstance(course_check.get("issue_count"), int) else 0
     course_unverified = course_check.get("unverified_count", 0) if isinstance(course_check.get("unverified_count"), int) else 1
     all_verified = all_verified and course_check.get("status") == "verified" and course_issues == 0 and course_unverified == 0
+    course_audit = operation.get("course_audit") if isinstance(operation.get("course_audit"), dict) else _audit_unverified("", stage="auditor_missing")
+    audit_status = course_audit.get("status")
+    audit_issues = course_audit.get("issue_count", 0) if isinstance(course_audit.get("issue_count"), int) else 0
+    audit_unverified = course_audit.get("unverified_count", 1) if isinstance(course_audit.get("unverified_count"), int) else 1
+    all_verified = all_verified and audit_status == "pass" and audit_issues == 0 and audit_unverified == 0
+    operator_report = _operator_report({**operation, "course_audit": course_audit})
+    all_verified = all_verified and operator_report["status"] == "pass"
     result = {
         "status": "verified" if all_verified else "incomplete",
         "all_sections_verified": all_verified,
         "gallery_count": len(results),
         "verified_count": sum(item["status"] == "verified" for item in results),
-        "issue_count": gallery_issue_count + course_issues,
-        "unverified_count": gallery_unverified_count + course_unverified,
+        "issue_count": gallery_issue_count + course_issues + audit_issues,
+        "unverified_count": gallery_unverified_count + course_unverified + audit_unverified,
         "operation_issue_count": operation_issue_count,
         "course_structure_verification": course_check,
+        "course_audit": copy.deepcopy(course_audit),
+        "operator_report": operator_report,
         "galleries": results,
         "completed_at": utc_now(),
     }
@@ -1436,6 +1963,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         operation=operation,
     )
     store()
+    operation["course_audit"] = run_course_audit(studio_base=studio_base, course_key=course_key, args=args)
+    if isinstance(operation["course_audit"], dict):
+        operation["course_audit"].setdefault("course_url", f"{studio_base}/course/{course_key}")
+    store()
     operation["batch_result"] = summarize_batch(operation)
     store()
     return operation["batch_result"]
@@ -1476,6 +2007,22 @@ def main() -> int:
         error = {"status": "failed", "error_summary": safe_error(exc, getattr(exc, "step", "batch_validation"))}
         if safe_http_status(exc) is not None:
             error["http_status"] = safe_http_status(exc)
+        if isinstance(exc, BatchValidationError) and exc.step == "studio_url":
+            error["course_audit"] = _audit_unverified("", stage="course_identity")
+            error["operator_report"] = {
+                "status": "unverified",
+                "issue_count": 0,
+                "unverified_count": 1,
+                "summary": "无法识别课程身份，课程审核未能运行。",
+                "groups": [],
+                "course_findings": [{
+                    "status": "unverified",
+                    "source": "course_audit",
+                    "message": "无法识别课程身份，课程审核未能运行。",
+                    "studio_url": "",
+                }],
+                "text": "无法识别课程身份，课程审核未能运行。",
+            }
         print(json.dumps(error, ensure_ascii=False))
         return 2
 
