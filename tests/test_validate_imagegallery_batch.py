@@ -620,6 +620,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertFalse(state["batch_result"]["all_sections_verified"])
             self.assertEqual(0, state["galleries"][0]["repair_attempts"])
             self.assertFalse(any(call["method"] in {"DELETE", "PUT"} for call in studio.calls))
+            report = state["batch_result"]["operator_report"]
+            self.assertEqual("unverified", report["status"])
+            self.assertIn("https://studio.example.com/container/" + VERTICAL_1, report["text"])
+            self.assertIn("暂时无法读取", report["text"])
 
     def test_final_course_check_compares_targeted_vertical_with_publisher_expectation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1036,9 +1040,63 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(0, exit_code, stdout + stderr)
             report = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]["operator_report"]
             self.assertEqual("pass", report["status"])
+            self.assertEqual("sections", report["mode"])
             self.assertEqual([], report["groups"])
             self.assertEqual("", report["summary"])
             self.assertEqual("", report["text"])
+
+    def test_operator_report_shows_only_live_findings_with_subsection_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation = self._operation(manifest, galleries=(GALLERY_1, GALLERY_2))
+            first = operation["galleries"][0]
+            first["repair_attempts"] = 2
+            first["publish"].update({
+                "status": "failed",
+                "failed_step": "upload_audio_prepare",
+                "failure_http_status": 502,
+                "error_summary": "Studio request failed (HTTP 502); token=operation-secret",
+                "steps": [{"step": "upload_audio_prepare", "status": "failed"}],
+            })
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({
+                GALLERY_1: {
+                    "files": [
+                        {"id": "wrong-a", "asset_key": "wrong-a", "display_name": "wrong-a.png"},
+                        {"id": "wrong-b", "asset_key": "wrong-b", "display_name": "wrong-b.png"},
+                    ],
+                    "time_config": [{}, {}],
+                    "audios": [{}],
+                },
+                GALLERY_2: {
+                    "files": [
+                        {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": [{}, {}],
+                    "audios": [{}],
+                },
+            }, fail_get_files={GALLERY_2: 1})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            report = state["batch_result"]["operator_report"]
+            self.assertEqual("issue", report["status"])
+            self.assertIn("https://studio.example.com/container/" + VERTICAL_1, report["text"])
+            self.assertIn("https://studio.example.com/container/" + VERTICAL_2, report["text"])
+            self.assertIn("图片", report["text"])
+            self.assertIn("暂时无法", report["text"])
+            for internal_detail in ("upload_audio_prepare", "准备音频上传失败", "HTTP 502", "operation-secret", "raw-response-secret", "成功"):
+                self.assertNotIn(internal_detail, report["text"])
+            self.assertEqual("upload_audio_prepare", state["batch_result"]["galleries"][0]["publish"]["failed_step"])
+            self.assertEqual(502, state["batch_result"]["galleries"][0]["publish"]["failure_http_status"])
+            self.assertEqual("mismatch", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("unverified", state["galleries"][1]["validation"]["status"])
+            self.assertNotIn("operation-secret", json.dumps(state))
 
     def test_course_structure_completeness_rejects_a_missing_vertical_child_list(self):
         self.assertFalse(module.course_structure_payload_is_complete(make_incomplete_course_structure()))

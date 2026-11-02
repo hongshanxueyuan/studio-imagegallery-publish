@@ -1,203 +1,39 @@
 ---
 name: studio-imagegallery-publish
-description: 使用可配置的 API 适配器，将本地 imagesgallery 包发布到 Studio，创建为 imagegallery block，不依赖 fira-llms/fcs 运行时代码。
+description: 使用可配置的 API 适配器，将本地 imagesgallery 包发布到 Studio，并核实本批次的最终课程状态。
 ---
 
 # Studio ImageGallery 推送
 
-使用这个 skill，把本地 `imagesgallery` 产物（图片 + 音频 + 时间轴字幕）发布到 Studio。
+本 skill 负责从本地素材发布到 Studio，并完成目标小节的自审、必要修复和最终报告。用户明确启动真实批次后，按已有输入连续完成流程，不在中途询问处理选择。输入缺失、认证失败或安全前置条件未通过时，将受影响写入步骤记为失败并跳过依赖操作；Studio 读取失败、响应无效或证据不足时，将检查结果记为无法确认且不据此写入。两类情况都继续处理独立目标并完成批次报告。
 
-## 真实推送的凭据前置检查
-
-真实推送创建或编辑 block 之前，必须先完成认证。`--dry-run` 不访问 Studio 或 OSS，也不会登录；不需要认证输入，请求计划中的认证字段会显示为 `<redacted>`。
-
-优先使用的认证输入：
-
-1. 环境变量（固定变量，推荐）：
-   - `FIRA_SAAS_OP_ACCOUNT`
-   - `FIRA_SAAS_OP_PASSWORD`
-2. CLI 参数：
-   - `--account`
-   - `--password`
-3. 现有的 Studio Cookie：
-   - `--cookie`
-
-两阶段批量发布与审核优先使用 `FIRA_SAAS_OP_ACCOUNT` 和 `FIRA_SAAS_OP_PASSWORD`，让发布验证和审核子 agent 复用当前进程环境。batch validator 和 auditor 也支持 `FIRA_SAAS_OP_COOKIE` 与 `FIRA_SAAS_OP_CSRF_TOKEN` 环境变量。
-
-安全边界：
-
-- 不要要求用户提供阿里云 AK/SK。
-- 不要在 Codex 与用户的交互流程里要求 AK/SK。
-- 音频上传所需的 STS 数据，应来自 Studio `get_upload_info` 的返回结果。
-
-## 这个 Skill 会做什么
-
-- 将 Studio URL 解析为 `studio_base` 和 `vertical_block_id`
-- 读取本地 `imagesgallery.json`，并校验所需文件是否存在
-- 在目标 vertical 下创建一个新的 `imagesgallery` block
-- 按页面顺序通过 `handler/file_upload` 上传页面图片
-- 在调用 `handler/get_upload_info` 之后，走 OSS multipart 流程上传完整 MP3
-- 通过 `documents` API 注册音频并绑定到 block
-- 保存逐页字幕 / 时间轴配置
-
-这个 skill 是自包含的，不会导入 `fira-llms` 或 `fira-gpt-fcs` 的运行时代码。
+真实 Studio 写入前先通过认证检查。优先使用环境变量中的 Studio 运营账号密码，也可使用命令行账号密码或现有 Cookie。dry-run 不登录、不访问 Studio 或 OSS，也不需要认证。认证与敏感信息规则见 [发布和替换规则](references/publishing-and-replacement.md)。
 
 ## 必需输入
 
-- 一个 Studio 小节 URL（`/container/block-v1:...`）或显式的 `vertical_block_id`
-- `imagesgallery.json`（Stage-B schema，包含 `audio` 和 `items[].page/start/end/subtitle`）
-- 可选的 `--adapter` JSON（通常不需要；默认模板已适配大多数站点）
+- 一个 Studio 小节 URL，或显式 vertical locator。
+- 符合 Stage-B schema 的 ImageGallery manifest，包含页面、字幕时间轴和完整 MP3。
+- 批次发布可选用目标文件、报告文件和课程结构信息。完整输入约定见 [发布和替换规则](references/publishing-and-replacement.md)。
 
 ## 工作流
 
-用户明确启动真实推送或批次后，从开始执行到打印最终报告，全程不等待用户补充信息、确认版本、决定失败处理方式或批准单个步骤。直接使用已给输入和默认值；输入缺失、认证失败或安全前置检查不通过时，将受影响的发布步骤记为 `failed`，将无法读取或核实的结果记为 `unverified`，跳过依赖动作，继续独立目标和报告收尾。若没有可继续的工作，立即打印包含失败原因和未完成项的最终报告；不要在中途向用户发问或等待回复。
+### 1. 发布
 
-1. 仅在真实推送前运行凭据检查；dry-run 无需凭据
-2. 根据 URL + manifest 构建运行时上下文
-3. 先做 dry-run 请求渲染（推荐）
-4. 执行真实推送：
-   - 创建 block
-   - 上传图片
-   - 上传 / 注册 / 绑定音频
-   - 保存播放配置和展示名称
-   - 如提供课程结构信息，先核对来源 `block_type`，再按类型替换正文；独立的 `本节要点组件` 会保留
-5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
+按目标顺序推送每个 Gallery，使用来源 block_type 找到并替换对应正文组件，保留“本节要点”HTML，并发布小节。首次发布尝试全部结束后，operation 文件应记录每个目标的 locator 和安全操作证据。写入、重跑和恢复规则见 [发布和替换规则](references/publishing-and-replacement.md)。
 
-批量执行时，按目标顺序尝试全部章节。某一 target 的操作失败后，记录失败步骤和原因，跳过依赖该结果的后续步骤，并继续其他 target；不在批次中途要求用户决定如何处理。所有目标都处理完后，统一执行批量校验；随后按“批次结束后的整课审核和运营报告”完成审核子任务与最终报告。
+### 2. 自审
 
-## 就地替换与发布完整性
+调用批次验证器，读取 Studio 当前保存状态，只核对本批次目标。确认图片、字幕、MP3、最终小节组件结构和发布状态。自审标准、证据不足时的处理和安全边界见 [自审与修复规则](references/self-audit-and-repair.md)。
 
-- `block_type` 是每个 target 的来源契约。发布器核对 Gallery manifest、publish target 和可用的 `section-list.json`；缺失或冲突时，在 Studio 写入前停止该 target。不要依据 Studio 现有子组件推断来源类型。
-- `html` target 只在目标 vertical 中替换第一个直接 HTML 子组件 `文字讲解组件`。没有匹配项时停止该 target。`imagesgallery` target 只在目标 vertical 中替换唯一的 Gallery 替换目标组件；目标缺失或有多个候选时停止该 target。
-- 在第一次 Studio 写入前保存目标 vertical 的纵向组件快照，记录直接子组件数量、locator、类型和顺序。替换或删除前重新读取 Studio，确认目标和当前结构符合预期；安全前置检查失败时，跳过该 target 的依赖步骤，记录问题并继续其他 target。
-- API 写请求的响应状态、asset ID、步骤和错误摘要写入操作记录。常规发布不在每次写入后立即读取状态、重试该写请求或据此阻断整个批次；实际结构和图片结果由批次末尾的验证器核对。
-- 纵向组件快照中的数量、locator、类型或顺序不符合预期时，将该 target 标记为失败并跳过依赖该结构的写入。Studio 写入响应不等同于实际发布状态；最终以批次末尾实时读取到的 vertical 结构和发布状态为准。
-- 发布前检查 Gallery 页和 speech 输入中的独立 `本节要点组件` 内容。发现泄漏时，在创建 Gallery 前将该 target 标为失败并跳过 vertical 发布；Studio 原有的 `本节要点组件` 继续保留。
-- 结果报告记录前后快照、步骤状态、重试记录、发布状态和可验证的 skill / 输入 provenance。无法确认的 provenance 写作 `unknown`。单 Gallery operation 文件中的 `vertical_integrity` 证据供批次验证器核对。
+### 3. 修复与复审
 
-## 本节要点组件保留
+只对已确认且可安全重做的问题执行修复。每轮集中处理本批次全部可修复目标，然后重新审核整批；最多两轮，全部通过时提前结束。Studio 读取失败或证据不足时不写入。修复前先读取 [自审与修复规则](references/self-audit-and-repair.md)。
 
-- 普通发布、批量发布、失败重试和中断恢复都会按原流程替换小节正文，同时保留独立的 `本节要点组件`。
-- `本节要点组件` 的位置、数量、标题和可见内容不会触发删除，也不会阻止正文替换。发布器会将识别到的组件从替换目标候选中排除。
-- 旧的 `--cleanup-only` 参数仍可识别，但会在读取 Studio 课程结构、认证或发出请求前返回 `unsupported`（退出码 `2`）。
-- 批量 targets 中标记 `cleanup_only` 的目标返回 `unsupported`；批次继续处理其他目标，在汇总中统计该目标，并以退出码 `2` 返回。
+## 完成与报告
 
-## 批量推送安全规则
+所有目标都应有最终审核状态并写入 operation 文件。全部通过时，`batch_result.all_sections_verified` 为 `true`。否则从 `batch_result.operator_report.text` 取面向运营的说明；通过项和成功请求不逐条展示。报告规则见 [运营报告规则](references/operator-report.md)。详细步骤、资源 ID、HTTP 状态、修复历史和脱敏诊断留在独立的 `batch-operation.json` 记录中。
 
-如果这个 skill 是在更大的批量工作流里被调用：
-
-- 上游的本地准备工作可以并行，但真正的 Studio 推送阶段必须 **顺序执行**
-- **不要**在同一个运营会话里并发向 Studio 推送多个 deck
-- 原因：并发的 Studio 登录 / 会话刷新会互相打架，容易造成间歇性认证失败，例如 `401`、`Not Login yet`、csrf/session 失效，或者部分音频注册失败
-- 安全模式应当是：
-  - 如有需要，可以并行准备本地 `imagesgallery` 产物
-  - 先把 deck A 推到 Studio
-  - deck A 即使有失败步骤，也记录结果后继续推 deck B
-  - 然后继续处理 deck C 和其余目标，结束后统一验证并报告
-
-## 认证错误重试规则
-
-在 execute 模式下，如果某个推送步骤因认证 / 会话相关错误失败，脚本应当：
-
-- 将 `401`、`Not Login yet`、csrf/session 失效，以及类似登录/认证错误，视为可重试的认证失败
-- 刷新 Studio 登录 / 会话
-- 每次重试前等待几秒钟
-- 最多重试 **4** 次
-- 这个重试策略只适用于认证相关失败，不适用于普通业务 / 数据错误
-
-典型可重试场景包括：
-
-- `upload_audio_register` 返回 `401 Not Login yet`
-- 后续保存步骤因为 csrf/session 在运行中途过期而失败
-
-如果认证相关重试次数耗尽，将当前 target 标记失败，并清楚记录失败步骤；单 target 流程立即打印结果，批量流程继续其他目标并在最后汇总。
-
-批量执行时，此失败只结束当前 target 中依赖该认证步骤的操作；记录错误后继续其他 target。全部目标处理完后仍运行批次验证，并将该失败列入最终报告。
-
-## 命令接口
-
-```bash
-python scripts/publish_imagegallery_block.py \
-  --studio-url "https://studio.uat.firacademy.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
-  --manifest "/path/to/imagesgallery/imagesgallery.json" \
-  --dry-run
-```
-
-```bash
-python scripts/publish_imagegallery_block.py \
-  --studio-url "https://studio.uat.firacademy.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
-  --manifest "/path/to/imagesgallery/imagesgallery.json" \
-  --execute \
-  --courses-base "https://courses.uat.firacademy.com"
-```
-
-```bash
-python scripts/publish_imagegallery_block.py \
-  --studio-url "https://studio.uat.firacademy.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
-  --manifest "/path/to/imagesgallery/imagesgallery.json" \
-  --course-structure-json "/path/to/fira_course-....json" \
-  --source-vertical-block-id "block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
-  --execute
-```
-
-```bash
-python scripts/publish_imagegallery_block.py \
-  --targets-file "/path/to/imagegallery-push-studio-targets.json" \
-  --report-file "/path/to/imagegallery-publish-report.json" \
-  --execute
-```
-
-参数说明：
-
-- `--studio-url`：目标 Studio 容器 URL
-- `--manifest`：本地 `imagesgallery.json` 路径
-- `--adapter`：可选适配器配置路径（默认使用 `references/adapter.template.json`）
-- `--execute`：执行真实请求
-- `--dry-run`：离线打印渲染后的请求计划，不登录、不向 Studio 或 OSS 发请求；认证字段使用 `<redacted>` 占位符，也不要求认证输入
-- `--account` / `--password`：可选账号密码覆盖（默认取环境变量）
-- `--cookie`：可选的 Cookie 认证模式
-- `--csrf-token`：可选的 CSRF 覆盖值
-- `--skip-oss-multipart`：调试模式；拿到上传信息后跳过 OSS 上传
-- `--auth-retry-max-retries`：认证 / 会话错误的最大重试次数；默认 `4`
-- `--auth-retry-delay-seconds`：认证重试之间的等待秒数；默认 `3`
-- `--course-structure-json`：课程结构快照，用于就地替换小节正文
-- `--source-vertical-block-id`：当目标课是导入副本时，用源课 vertical locator 做课程结构匹配
-- `--section-id` / `--section-title` / `--block-type` / `--section-list-json`：target 类型和 section-list 来源元数据
-- `--cleanup-only`：兼容旧命令行调用；返回 `unsupported`，不访问 Studio
-- `--targets-file`：批量执行 `ppt-to-imagesgallery` 产出的 Studio targets 文件
-- `--report-file`：批量执行的逐 vertical 结果文件；重复执行时用于安全 rerun 判断，并在最终汇总里区分 `replaced`、`fallback_inserted`、`unsupported` 和失败项
-- `--report-mode`：运营摘要分组方式；`categories` 默认按检查结果分类，`sections` 按 sequential 小节归类
-
-每个 vertical 的结果会包含可点击的目标 vertical URL、新建或复用的 gallery URL、`本节要点组件` 保留状态、纵向组件快照、已完成和失败步骤，以及失败原因或人工跟进说明。
-
-## 单 Gallery 发布检查点
-
-批量调用方可在真实单 Gallery 发布时显式传入 `--operation-file` 和 `--gallery-key`。调用方先创建 operation 文件；发布器只更新它，不创建第二份报告。
-
-```bash
-python scripts/publish_imagegallery_block.py \
-  --studio-url "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
-  --manifest "/path/to/imagesgallery/imagesgallery.json" \
-  --execute \
-  --operation-file "/path/to/batch-operation.json" \
-  --gallery-key "stable-gallery-key"
-```
-
-operation 文件包含 `galleries[]`。发布器要求恰有一个 `gallery_key` 与参数相同的条目，并校验其中的 `manifest` 和 `vertical_locator`（如果提供）；未传这两个参数时，单 Gallery 命令保持原有行为，不写 operation 文件。发布器保留条目中的其他调用方字段，并原子更新 `gallery_locator` 和 `publish`：
-
-- `status`、`completed_stage`：状态为 `in_progress`、`failed` 或 `completed`；阶段依次为 `block_created`、`images_uploaded`、`images_ordered`、`audio_prepared`、`audio_uploaded`、`audio_registered`、`audio_binding_saved`、`audio_bound`、`saved`。
-- `images`、`asset_ids`：已确认的页码、图片文件名和 Studio asset ID。
-- `steps`、`active_step`、`failed_step`、`error_summary`：安全的步骤状态、HTTP 状态和脱敏错误摘要。
-
-Gallery 图片、音频和配置的每个远程步骤开始前、响应成功后或失败后都会原子更新检查点。图片上传响应没有返回可用 ID 时，执行一次异常恢复用的 `get_files` 对账；只有 Studio 文件总数、名称顺序和唯一 asset ID 与 manifest 完全匹配时，才从后续步骤继续。对账不完整或有歧义时，保留现场，将该 target 记为失败，并继续其他 target。正常发布不在每次写入后读取状态；全部 target 结束后仍统一运行批量校验。显式恢复旧检查点时，也可对已开始但记录不完整的图片执行一次相同的对账。创建 Gallery 的 API 响应不确定时，可用创建前快照作一次定位恢复，避免重复创建；无法唯一确认 locator 时将 target 记入报告。响应正文、Cookie、CSRF 值、Authorization、STS 凭据和 token 不进入输出或 operation 文件。
-
-## 批量发布后的验证与修复
-
-外部批量工作流负责创建 `batch-operation.json`，按顺序尝试所有目标 Gallery 和 vertical，并在所有 target 都完成或记录失败后调用一次验证器。即使部分 target 的初始发布失败，只要 operation 文件中有可用的 Gallery locator，验证器仍要读取其 Gallery 和课程结构；不得因 `publish.status` 未完成而跳过诊断。它继续负责本地素材准备；验证器读取 manifest、操作记录与 Studio 实时状态。
-
-每个 `galleries[]` 条目包含 `gallery_key`、`manifest`、`vertical_locator`、`gallery_locator`、`publish` 操作检查点，以及 `initial_vertical_publish` 的响应状态。只要 Gallery 和 vertical locator 可用，验证器就读取实时 Gallery 内容，即使初始 publish 检查点或 vertical 发布响应失败也不跳过诊断。最终是否 verified 以实际 Gallery 内容和实时课程结构为准；初始操作状态仍单独保留在报告。发布器保留调用方字段。验证器原子更新同一文件中的 `validation`、`repair_attempts`、`repair_history` 和 `batch_result`；修复后的 vertical 发布响应记录在对应的 `repair_history[].vertical_publish` 中。
-
-所有 target 的初始发布均已尝试后执行一次：
+验证器命令：
 
 ```bash
 python scripts/validate_imagegallery_batch.py \
@@ -205,68 +41,9 @@ python scripts/validate_imagegallery_batch.py \
   --operation-file "/path/to/batch-operation.json" \
   --execute
 ```
-
-真实执行优先使用环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`；也可使用 `FIRA_SAAS_OP_COOKIE` / `FIRA_SAAS_OP_CSRF_TOKEN`、`--account` / `--password` 或 `--cookie`。验证器读取操作记录、manifest 和 Studio 实时状态；通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容，并最终重新读取 Studio `format=concise` 课程结构。使用结构树前，验证器会递归确认 `course`、`chapter`、`sequential`、`vertical` 都返回子节点列表；任一容器缺少子树时将结果标为 `unverified`，不据此修复或扫描可删除资产。图片核对有效文件记录数、`total_count`、manifest 页数、逐图文件名、asset ID 和顺序；期望 asset ID 来自发布操作检查点。配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不检查 learner-side LMS 或远端音频播放。
-
-任一可确认的图片、播放配置或音频绑定不匹配会记为 `mismatch`，最多触发一次完整修复；Studio 请求失败、响应结构无效或 operation 缺少逐图预期 ID 时记为 `unverified`，不修改该 Gallery，并继续检查其他目标。图片 ID、文件名和顺序必须逐项与 operation 检查点及 manifest 一致；数量相同不能单独证明图片正确。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时记录结果，不开始第二次完整修复，也不要求用户在批次中途决定下一步。
-
-若进程在修复记录完成最终校验前中断，可用同一 operation 文件重跑验证器：Gallery 状态仍可读时续跑现有修复尝试并复用各阶段检查点；已确认完成的步骤不会重复执行，完整修复次数仍为一次。读取状态为 `unverified` 时不继续修改，待读取恢复后再重跑。
-
-`all_sections_verified` 要求初始发布操作、最终 Gallery 内容、实时课程结构和发布状态都通过；发生失败或待确认步骤时，即使部分实时内容匹配，也会在最终批次结果中保留问题。Gallery 内容、发布操作、修复记录和课程结构分别报告，避免一种状态覆盖另一种状态。退出码 `0` 表示全部通过，`1` 表示至少一个目标未通过，`2` 表示 operation、认证或参数无法执行。输出和 operation 文件仅保留安全字段、计数、asset ID、HTTP 状态和脱敏错误摘要，不保存 Studio 响应正文或凭据。`--skip-oss-multipart` 仅用于调试，会跳过修复发布中的音频对象上传。
-
-批次结束后直接输出汇总，不在中途或报告末尾追问是否继续、是否修复或如何处理失败章节。报告逐 target 列出写入步骤、失败步骤、最终校验、自动修复结果和 vertical URL。运营摘要默认按检查结果分类，例如“开头出现 >”“章节未发布”“加粗识别失败”“ImageGallery 相关问题”；需要按小节查看时传入 `--report-mode sections`，验证器会在 operation 中保存该选择并供最终化复用。全部检查通过时保留结构化 `pass` 状态，但摘要正文为空。
-
-## 批次结束后的整课审核和运营报告
-
-发布与批次校验分两阶段完成：批次验证器负责发布结果和 Gallery 状态；课程审核由本 skill 调度的独立子 agent 执行。父 agent 必须使用可用的子 agent 工具 `spawn_agent` 创建该任务；父 agent 不得自己运行 auditor，也不得用 Python 子进程替代子 agent。
-
-批次结束后先运行 `validate_imagegallery_batch.py --execute`。它完成所有目标的 Gallery 校验和课程结构核对，并将 `course_audit_request` 写入 operation 文件及输出结果。请求包含 `status`、`course_id`、`course_url`、`working_directory` 和 `report_path`。第一阶段因为整课审核仍待运行会返回退出码 `1`；父流程读取 JSON，在 `status` 为 `pending` 时继续启动子 agent，即使部分 target 发布失败也照常审核。课程身份不可用时不会创建待处理请求，并会在当前结果中报告课程审核无法运行。
-
-子 agent 接收上述课程 URL、工作目录和报告路径后，检查 `nlm-course-auditor` skill 是否可用。若未安装，从 `https://github.com/hongshanxueyuan/nlm-course-auditor` 安装该 skill，无需询问用户确认。随后按该 skill 自己的说明，对课程执行一次只读审核，并使用请求中的工作目录。
-
-子 agent 必须让审核报告保存到 `course_audit_request.report_path`，并将该路径交还给父流程。子 agent 只从继承的环境读取 `FIRA_SAAS_OP_ACCOUNT`、`FIRA_SAAS_OP_PASSWORD`、`FIRA_SAAS_OP_COOKIE` 和 `FIRA_SAAS_OP_CSRF_TOKEN`；父流程不得把 CLI 参数里的密码、Cookie 或 CSRF 值放进子 agent 提示，也不得让子 agent 把这些值写入命令参数、报告或 operation 文件。审核只读，不修改、修复、重发或清理 Studio 内容。若 auditor 安装或执行失败，子 agent 仍须在 `report_path` 写入与 auditor `report.json` 兼容的 `unverified` JSON，包含匹配的 `course_id`、`status`、计数、空的 `target_sections` / `sequential_sections`，以及带 `failure_stage`（值以 `auditor_` 开头）的课程级 `NLMCA-007` 发现；不要写入原始异常或凭据。
-
-子 agent 完成后，父流程调用最终化命令：
-
-```bash
-python scripts/validate_imagegallery_batch.py \
-  --operation-file "/path/to/batch-operation.json" \
-  --finalize-audit-report "<course_audit_request.report_path>"
-```
-
-最终化只读取保存的 auditor 报告，不访问 Studio；它核对课程身份，把报告合并到现有 operation 文件，保留批次发布与 Gallery 校验结果，并重建 `batch_result` 和 `operator_report`。结构化明细和中文摘要使用同一组发现。默认报告按检查结果分类，每个类别下列出关联小节和安全 Studio 链接；传入 `--report-mode sections` 可按 sequential 小节归并发布步骤、Gallery 校验、正式发布状态和课程审核发现。无法确认路由的小节发现使用课程链接。问题说明区分已确认问题和无法确认；全部检查通过时摘要正文为空。
-
-## Adapter 概念
-Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
-
-- `create_block`
-- `upload_image`
-- `reorder_children`
-- `delete_block`
-- `publish_vertical`
-- `upload_audio`
-- `save_block`
-
-每个模板支持：
-
-- `method`、`url`
-- `headers`、`params`、`json`、`data`
-- `files`（multipart 文件上传）
-- `extract`（把响应中的值提取到运行时上下文，例如 `block_locator`）
 
 ## 资源
 
-- `scripts/publish_imagegallery_block.py`：端到端发布脚本
-- `scripts/validate_imagegallery_batch.py`：批量发布后的 Studio 校验与单次安全修复
-- `references/adapter.template.json`：默认通用 adapter
-
-## 说明
-
-- 自定义 adapter 时，请保持 adapter 里的 URL 为完整 URL
-- 第一次接入新站点时，务必先跑 `--dry-run`
-- 如果本机缺少 `oss2`，脚本会自动安装
-- block category 固定为 `imagesgallery`
-- execute 成功后，必须向用户**优先返回目标 vertical URL**，因为运营复核和细调通常要回到小节页面；不能只给原始 `block_locator`
-- 如果需要补充技术细节，可以附带新建的 `imagesgallery` block URL，但它不应作为默认主链接
-- 在批量完成总结里，要把每一个目标 `vertical` URL 分开列出，方便运营逐个点进去做人工微调
-- 批量 rerun 时，脚本会在每个目标开始前重新读取 `course_structure_json`，避免整轮都沿用同一份旧快照
+- `scripts/publish_imagegallery_block.py`：单 Gallery 和批次发布
+- `scripts/validate_imagegallery_batch.py`：批次自审与安全修复
+- `references/adapter.template.json`：默认 API adapter

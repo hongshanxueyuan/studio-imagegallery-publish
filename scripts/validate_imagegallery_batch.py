@@ -1065,339 +1065,197 @@ def live_vertical_structure_status(
     return "verified" if observed == expected[locator] else "mismatch"
 
 
-def _section_url(studio_url: str, locator: str) -> str:
-    if not locator:
-        return studio_url
-    parsed = urlsplit(studio_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return studio_url
-    return f"{parsed.scheme}://{parsed.netloc}/container/{locator}"
-
-
-def _publish_step_message(step: Any) -> str:
-    step_name = str(step or "")
-    image_match = re.fullmatch(r"upload_image\[(\d+)\]", step_name)
-    if image_match:
-        return f"第 {image_match.group(1)} 页图片上传失败。"
-    messages = {
-        "create_block": "创建 imagegallery 组件失败。",
-        "delete_block": "替换原组件失败。",
-        "resolve_replacement_target": "无法确认要替换的原组件。",
-        "remove_old_html_summary": "替换原组件失败。",
-        "verify_vertical_before_create": "小节结构检查未通过，未创建 imagegallery。",
-        "verify_vertical_before_move": "小节结构检查未通过，未继续调整组件。",
-        "verify_vertical_before_delete": "小节结构检查未通过，未继续替换原组件。",
-        "verify_vertical_after_create": "imagegallery 创建后的小节结构检查未通过。",
-        "reorder_children": "调整小节组件顺序失败。",
-        "change_files_order": "调整 imagegallery 图片顺序失败。",
-        "upload_audio_prepare": "准备音频上传失败。",
-        "upload_audio_multipart": "音频文件上传失败。",
-        "upload_audio": "音频文件上传失败。",
-        "upload_audio_register": "注册音频失败。",
-        "save_audio_binding": "保存音频绑定失败。",
-        "submit_studio_edits": "保存 imagegallery 展示设置失败。",
-        "save_block": "保存 imagegallery 字幕配置失败。",
-        "publish_vertical": "发布小节失败。",
-    }
-    if step_name.startswith("upload_image["):
-        return "图片上传失败。"
-    if step_name.startswith("save_") or step_name.startswith("update_play_config"):
-        return "保存 imagegallery 的字幕或音频配置失败。"
-    if step_name in {"target_preflight", "create_block", "verify_vertical_after_create", "publish_structure"}:
-        return "imagegallery 替换或发布流程失败。"
-    return messages.get(step_name, "imagegallery 发布流程未完成。")
-
-
-def _validation_message(check_name: str, status: str) -> str:
-    if status == "unverified":
-        messages = {
-            "images": "暂时无法确认 imagegallery 图片是否完整。",
-            "image_count": "暂时无法确认 imagegallery 图片数量。",
-            "image_names": "暂时无法确认 imagegallery 图片是否与清单一致。",
-            "image_asset_ids": "暂时无法确认 imagegallery 图片资源。",
-            "image_order": "暂时无法确认 imagegallery 图片顺序。",
-            "play_config": "暂时无法确认已保存字幕配置。",
-            "audio_bindings": "暂时无法确认音频绑定。",
-        }
-        return messages.get(check_name, "暂时无法确认 imagegallery 的完整状态。")
-    messages = {
-        "images": "imagegallery 图片与本地清单不一致。",
-        "image_count": "imagegallery 图片数量与本地清单不一致。",
-        "image_names": "imagegallery 图片名称与本地清单不一致。",
-        "image_asset_ids": "imagegallery 图片资源与发布记录不一致。",
-        "image_order": "imagegallery 图片顺序与本地清单不一致。",
-        "play_config": "已保存字幕配置条目数与图片数量不一致。",
-        "audio_bindings": "imagegallery 的音频绑定数量不是一个。",
-    }
-    return messages.get(check_name, "imagegallery 内容与本地清单不一致。")
-
-
 OPERATOR_REPORT_MODES = {"categories", "sections"}
-OPERATOR_REPORT_CATEGORY_ORDER = (
-    "开头出现 >",
-    "章节未发布",
-    "加粗识别失败",
-    "正文与 Markdown 标题顺序",
-    "ImageGallery 相关问题",
-    "小节组件结构",
-    "课程级问题",
-    "其他问题",
-)
 
 
-def _category_grouped_findings(
-    section_groups: list[dict[str, Any]],
-    course_findings: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
-
-    def add(category: str, finding: dict[str, Any]) -> None:
-        group = grouped.setdefault(category, {"name": category, "findings": []})
-        if finding not in group["findings"]:
-            group["findings"].append(finding)
-
-    for section in section_groups:
-        for finding in section["findings"]:
-            add(finding.get("category") or "其他问题", {
-                "name": section["name"],
-                "locator": section["locator"],
-                "studio_url": section["studio_url"],
-                "element_name": finding.get("element_name") or section["name"],
-                "element_locator": finding.get("element_locator") or section["locator"],
-                "element_studio_url": finding.get("element_studio_url") or section["studio_url"],
-                "status": finding["status"],
-                "source": finding["source"],
-                "message": finding["message"],
-            })
-    for finding in course_findings:
-        add(finding.get("category") or "课程级问题", {
-            "name": "课程",
-            "locator": "",
-            "studio_url": finding["studio_url"],
-            "status": finding["status"],
-            "source": finding["source"],
-            "message": finding["message"],
-        })
-
-    order = {name: index for index, name in enumerate(OPERATOR_REPORT_CATEGORY_ORDER)}
-    return sorted(grouped.values(), key=lambda group: (order.get(group["name"], len(order)), group["name"]))
-
-
-def _operator_report(operation: dict[str, Any], *, report_mode: str = "categories") -> dict[str, Any]:
+def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report_mode: str = "sections") -> dict[str, Any]:
     if report_mode not in OPERATOR_REPORT_MODES:
         raise ValueError("Unsupported operator report mode")
     course_check = operation.get("course_structure_verification")
     course_check = course_check if isinstance(course_check, dict) else {}
     section_records = course_check.get("subsections") if isinstance(course_check.get("subsections"), list) else []
+    sections_by_vertical = {
+        safe_locator(item.get("vertical_locator")): item
+        for item in section_records
+        if isinstance(item, dict) and safe_locator(item.get("vertical_locator"))
+    }
+    groups_by_key: dict[str, dict[str, Any]] = {}
 
-    groups: dict[str, dict[str, Any]] = {}
-    section_by_locator: dict[str, dict[str, Any]] = {}
-    vertical_owners: dict[str, str] = {}
-    vertical_details: dict[str, dict[str, str]] = {}
-    for subsection in section_records:
-        if not isinstance(subsection, dict):
-            continue
-        section_locator = safe_locator(subsection.get("section_locator"))
-        vertical_locator = safe_locator(subsection.get("vertical_locator"))
-        if not section_locator:
-            continue
-        route = section_by_locator.get(section_locator)
-        if route is None:
-            route = {
-                "name": str(subsection.get("section_title") or subsection.get("vertical_title") or "课程小节"),
-                "locator": section_locator,
-                "studio_url": _section_url(str(subsection.get("studio_url") or ""), section_locator),
-                "findings": [],
-            }
-            section_by_locator[section_locator] = route
-        if vertical_locator:
-            vertical_owners[vertical_locator] = section_locator
-            vertical_details[vertical_locator] = {
-                "name": str(subsection.get("vertical_title") or subsection.get("section_title") or "赋能内容"),
-                "locator": vertical_locator,
-                "studio_url": str(subsection.get("studio_url") or ""),
-            }
-
-    def ensure_group(locator: str, name: str, studio_url: str) -> dict[str, Any]:
-        locator = safe_locator(locator)
-        key = locator or studio_url or name or "course-section"
-        if key not in groups:
-            known = section_by_locator.get(locator)
-            groups[key] = {
-                "name": (known or {}).get("name") or name or "课程小节",
+    def ensure_group(entry: dict[str, Any]) -> dict[str, Any]:
+        locator = safe_locator(entry.get("vertical_locator"))
+        key = locator or str(entry.get("gallery_key") or f"target-{len(groups_by_key) + 1}")
+        if key not in groups_by_key:
+            subsection = sections_by_vertical.get(locator, {})
+            name = str(
+                entry.get("section_title")
+                or subsection.get("section_title")
+                or subsection.get("vertical_title")
+                or "目标小节"
+            )
+            url = str(subsection.get("studio_url") or "")
+            if not url and locator and studio_base:
+                url = publisher.build_container_block_url(studio_base, locator)
+            groups_by_key[key] = {
+                "name": name,
                 "locator": locator,
-                "studio_url": (known or {}).get("studio_url") or studio_url,
+                "studio_url": url,
                 "findings": [],
             }
-        return groups[key]
+        return groups_by_key[key]
 
-    def add_section_finding(
-        locator: str,
-        fallback_name: str,
-        fallback_url: str,
-        status: str,
-        source: str,
-        message: str,
-        category: str,
-    ) -> None:
+    def add_finding(entry: dict[str, Any], status: str, category: str, message: str) -> None:
         if status not in {"issue", "unverified"}:
             return
-        route_locator = vertical_owners.get(safe_locator(locator), locator)
-        route = section_by_locator.get(route_locator)
-        group = ensure_group(
-            route_locator,
-            str((route or {}).get("name") or fallback_name),
-            str((route or {}).get("studio_url") or fallback_url),
-        )
-        element = vertical_details.get(safe_locator(locator))
-        if element:
-            element_name = element["name"]
-            element_locator = element["locator"]
-            element_studio_url = element["studio_url"]
-        else:
-            element_name = str((route or {}).get("name") or fallback_name or "课程小节")
-            element_locator = safe_locator(locator) or route_locator
-            element_studio_url = str((route or {}).get("studio_url") or fallback_url)
-        finding = {
-            "status": status,
-            "source": source,
-            "category": category,
-            "element_name": element_name,
-            "element_locator": element_locator,
-            "element_studio_url": element_studio_url,
-            "message": message,
-        }
+        group = ensure_group(entry)
+        finding = {"status": status, "category": category, "message": message}
         if finding not in group["findings"]:
             group["findings"].append(finding)
-
-    for subsection in section_records:
-        if not isinstance(subsection, dict):
-            continue
-        locator = safe_locator(subsection.get("vertical_locator"))
-        if subsection.get("status") == "issue":
-            issues = subsection.get("issues") if isinstance(subsection.get("issues"), list) else []
-            for issue in issues:
-                message = "小节组件结构与预期不一致。" if issue == "structure_mismatch" else "Studio 确认该小节尚未发布。" if issue == "published_false" else "小节发布前置检查未完成。"
-                category = "小节组件结构" if issue == "structure_mismatch" else "章节未发布"
-                add_section_finding(locator, str(subsection.get("section_title") or "课程小节"), str(subsection.get("studio_url") or ""), "issue", "publisher", message, category)
-        if subsection.get("status") == "unverified":
-            add_section_finding(locator, str(subsection.get("section_title") or "课程小节"), str(subsection.get("studio_url") or ""), "unverified", "publisher", "暂时无法确认小节组件结构和发布状态。", "小节结构校验")
 
     for entry in operation.get("galleries", []):
         if not isinstance(entry, dict):
             continue
-        locator = safe_locator(entry.get("vertical_locator"))
-        fallback_url = vertical_details.get(locator, {}).get("studio_url", "")
-        publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
-        steps = publish.get("steps") if isinstance(publish.get("steps"), list) else []
-        failed_steps = [item.get("step") for item in steps if isinstance(item, dict) and item.get("status") in {"failed", "blocked"}]
-        if not failed_steps and publish.get("status") != "completed":
-            failed_steps = [publish.get("failed_step") or "publish"]
-        for step in failed_steps:
-            category = "章节未发布" if str(step) == "publish_vertical" else "小节组件结构" if str(step).startswith("verify_vertical") else "ImageGallery 相关问题"
-            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", _publish_step_message(step), category)
-
-        initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
-        if not initial_vertical:
-            add_section_finding(locator, "课程小节", fallback_url, "unverified", "publisher", "暂时无法确认小节发布请求结果。", "章节未发布")
-        elif initial_vertical.get("status") != "completed":
-            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", "发布小节的请求未成功。", "章节未发布")
-
-        integrity = entry.get("vertical_integrity") if isinstance(entry.get("vertical_integrity"), dict) else {}
-        integrity_steps = integrity.get("steps") if isinstance(integrity.get("steps"), list) else []
-        integrity_failures = [
-            item.get("step") for item in integrity_steps
-            if isinstance(item, dict) and item.get("status") in {"failed", "blocked"}
-        ]
-        for step in integrity_failures:
-            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", _publish_step_message(step), "小节组件结构")
-        if integrity.get("status") in {"failed", "unresolved", "blocked"} and not integrity_failures:
-            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", "小节结构安全检查未完成，imagegallery 替换未完成。", "小节组件结构")
-
         validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
         checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
-        if validation.get("status") == "mismatch":
-            mismatches = [key for key, value in checks.items() if value == "mismatch"]
-            for check_name in mismatches or ["gallery"]:
-                add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", _validation_message(str(check_name), "mismatch"), "ImageGallery 相关问题")
-        elif validation.get("status") in {"unverified", "failed"}:
+        image_mismatch = any(
+            checks.get(name) == "mismatch"
+            for name in ("images", "image_count", "image_names", "image_asset_ids", "image_order")
+        )
+        if image_mismatch:
+            add_finding(
+                entry,
+                "issue",
+                "图片内容",
+                "Studio 中的 Gallery 图片与本地素材存在不一致，请核对页数、名称、顺序和图片对应关系。",
+            )
+        if checks.get("play_config") == "mismatch":
+            add_finding(entry, "issue", "字幕设置", "Studio 保存的字幕页数与 Gallery 页面数不一致。")
+        if checks.get("audio_bindings") == "mismatch":
+            add_finding(entry, "issue", "音频关联", "这节的 MP3 没有正确关联到图片页，请在 Studio 中核对音频。")
+        if checks.get("gallery_owner") == "mismatch":
+            add_finding(entry, "issue", "组件结构", "Gallery 没有唯一关联到目标小节，无法确认它属于哪节内容。")
+        if validation.get("status") == "mismatch" and not image_mismatch and not any(
+            checks.get(name) == "mismatch"
+            for name in ("play_config", "audio_bindings", "gallery_owner", "vertical_structure", "vertical_publication")
+        ):
+            add_finding(entry, "issue", "ImageGallery 内容", "Studio 中保存的 Gallery 内容与本地素材预期不一致。")
+
+        if validation.get("status") in {"unverified", "failed"}:
             failed_step = str(validation.get("failed_step") or "")
-            related_check = {"get_files": "images", "get_play_config": "play_config", "get_audios": "audio_bindings"}.get(failed_step, "gallery")
-            add_section_finding(locator, "课程小节", fallback_url, "unverified", "publisher", _validation_message(related_check, "unverified"), "ImageGallery 相关问题")
+            if validation.get("pre_repair_structure_failed_step"):
+                add_finding(entry, "unverified", "组件结构", "暂时无法读取 Studio 保存的小节结构，因此无法确认图片页是否位于正确位置。")
+            elif failed_step == "get_files":
+                add_finding(entry, "unverified", "图片内容", "暂时无法读取 Studio 中的图片信息，因此无法确认图片是否齐全。")
+            elif failed_step == "get_play_config":
+                add_finding(entry, "unverified", "字幕设置", "暂时无法读取 Studio 保存的字幕设置，因此无法确认字幕页数是否与图片数量一致。")
+            elif failed_step == "get_audios":
+                add_finding(entry, "unverified", "音频关联", "暂时无法读取 Gallery 的音频信息，因此无法确认 MP3 是否已正确关联。")
+            elif failed_step == "manifest":
+                add_finding(entry, "unverified", "本地素材", "本地素材清单暂时无法读取，因此无法核对图片和字幕页数。")
+            elif failed_step == "operation_file":
+                add_finding(entry, "unverified", "目标小节", "目标地址或 Gallery 记录不完整，暂时无法确认这节的发布结果。")
+            elif failed_step == "load_live_course_structure":
+                add_finding(entry, "unverified", "组件结构", "暂时无法读取 Studio 保存的小节结构，因此无法确认图片页是否位于正确位置。")
+            else:
+                gallery_checks = (
+                    ("images", "暂时无法读取 Studio 中的图片信息，因此无法确认图片是否齐全。", "图片内容"),
+                    ("play_config", "暂时无法读取 Studio 保存的字幕设置，因此无法确认字幕页数是否与图片数量一致。", "字幕设置"),
+                    ("audio_bindings", "暂时无法读取 Gallery 的音频信息，因此无法确认 MP3 是否已正确关联。", "音频关联"),
+                )
+                found_gallery_read = False
+                for check_name, message, category in gallery_checks:
+                    if checks.get(check_name) == "unverified":
+                        add_finding(entry, "unverified", category, message)
+                        found_gallery_read = True
+                structure_checks = {"vertical_structure", "gallery_owner", "vertical_publication"}
+                structure_unverified = any(checks.get(name) == "unverified" for name in structure_checks)
+                if not found_gallery_read and not structure_unverified and not sections_by_vertical.get(safe_locator(entry.get("vertical_locator"))):
+                    add_finding(entry, "unverified", "ImageGallery 内容", "暂时无法读取 Studio 中这节的保存状态，无法确认 Gallery 是否正确发布。")
 
-        history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
-        for attempt in history:
-            if not isinstance(attempt, dict) or attempt.get("status") in {"completed", "verified"}:
-                continue
-            repair_step = attempt.get("failed_step") or "repair"
-            add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", f"imagegallery 自动修复未完成：{_publish_step_message(repair_step)}", "ImageGallery 相关问题")
-
-    course_findings: list[dict[str, Any]] = []
+        locator = safe_locator(entry.get("vertical_locator"))
+        subsection = sections_by_vertical.get(locator)
+        if isinstance(subsection, dict):
+            if subsection.get("status") == "issue":
+                issue_messages = {
+                    "structure_mismatch": ("组件结构", "这节的 Gallery 与“本节要点”组件数量或顺序不符合要求。"),
+                    "published_false": ("发布状态", "Studio 中这节的当前内容尚未正式发布。"),
+                    "publisher_vertical_integrity_unresolved": ("组件结构", "这节发布前的组件结构无法确认，不能保证 Gallery 替换结果正确。"),
+                    "target_vertical_missing": ("目标小节", "Studio 中找不到本次目标小节，无法确认发布结果。"),
+                }
+                for issue in subsection.get("issues", []) if isinstance(subsection.get("issues"), list) else []:
+                    category, message = issue_messages.get(
+                        issue,
+                        ("组件结构", "Studio 中的小节组件结构与本次发布预期不一致。"),
+                    )
+                    add_finding(entry, "issue", category, message)
+            elif subsection.get("status") == "unverified":
+                reasons = subsection.get("unverified_reasons") if isinstance(subsection.get("unverified_reasons"), list) else []
+                if "published_state_missing" in reasons:
+                    message = "Studio 未返回这节当前发布状态，暂时无法确认本次内容是否已正式发布。"
+                elif "expected_structure_ambiguous" in reasons or "expected_structure_missing" in reasons:
+                    message = "发布记录不足以唯一确认目标组件，暂时无法核对这节的课程结构。"
+                else:
+                    message = "Studio 返回的小节结构信息不完整，暂时无法确认 Gallery 与“本节要点”的排列是否正确。"
+                add_finding(entry, "unverified", "暂时无法确认", message)
 
     if course_check.get("status") == "unverified" and not section_records:
-        course_findings.append({
-            "status": "unverified",
-            "source": "publisher",
-            "category": "课程级问题",
-            "message": "暂时无法读取课程结构，无法确认本次发布状态。",
-            "studio_url": "",
-        })
-    if course_check.get("status") == "incomplete" and not any(group["findings"] for group in groups.values()):
-        course_findings.append({
-            "status": "issue",
-            "source": "publisher",
-            "category": "课程级问题",
-            "message": "课程组件结构校验发现需要处理的问题。",
-            "studio_url": "",
-        })
-    visible_section_groups = [group for group in groups.values() if group["findings"]]
-    issue_count = sum(finding["status"] == "issue" for group in visible_section_groups for finding in group["findings"])
-    issue_count += sum(finding["status"] == "issue" for finding in course_findings)
-    unverified_count = sum(finding["status"] == "unverified" for group in visible_section_groups for finding in group["findings"])
-    unverified_count += sum(finding["status"] == "unverified" for finding in course_findings)
+        for entry in operation.get("galleries", []):
+            if isinstance(entry, dict):
+                add_finding(
+                    entry,
+                    "unverified",
+                    "暂时无法确认",
+                    "暂时无法读取 Studio 中这节已保存的结构和发布状态。",
+                )
+
+    section_groups = [group for group in groups_by_key.values() if group["findings"]]
+    issue_count = sum(
+        finding["status"] == "issue"
+        for group in section_groups
+        for finding in group["findings"]
+    )
+    unverified_count = sum(
+        finding["status"] == "unverified"
+        for group in section_groups
+        for finding in group["findings"]
+    )
     status = "issue" if issue_count else "unverified" if unverified_count else "pass"
     summary = (
-        f"发现 {issue_count} 项已确认问题，另有 {unverified_count} 项无法确认。请按下方 Studio 链接复核。"
+        f"发现 {issue_count} 项需要处理，另有 {unverified_count} 项暂时无法确认。请打开对应小节查看。"
         if status != "pass"
         else ""
     )
     if report_mode == "categories":
-        visible_groups = _category_grouped_findings(visible_section_groups, course_findings)
+        visible_groups: list[dict[str, Any]] = []
+        by_category: dict[str, dict[str, Any]] = {}
+        for section in section_groups:
+            for finding in section["findings"]:
+                category = finding["category"]
+                grouped = by_category.setdefault(category, {"name": category, "findings": []})
+                grouped["findings"].append({
+                    **finding,
+                    "section_name": section["name"],
+                    "studio_url": section["studio_url"],
+                })
+        visible_groups = list(by_category.values())
     else:
-        visible_groups = visible_section_groups
+        visible_groups = section_groups
+
     lines = [summary] if summary else []
     if report_mode == "categories":
         for group in visible_groups:
             lines.extend(("", f"### {group['name']}"))
             for finding in group["findings"]:
-                name = str(finding.get("name") or "课程小节")
-                url = str(finding.get("studio_url") or "")
-                element_name = str(finding.get("element_name") or name)
-                element_locator = safe_locator(finding.get("element_locator"))
-                element_url = str(finding.get("element_studio_url") or url)
-                if element_locator and element_locator != safe_locator(finding.get("locator")) and element_url:
-                    section_link = f"[{name}]({url})" if url else name
-                    route = f"{section_link}：[查看“{element_name}”]({element_url})"
-                else:
-                    route = f"[{element_name}]({element_url})" if element_url else name
-                label = "已确认" if finding["status"] == "issue" else "无法确认"
-                lines.append(f"- {route}（{label}）：{finding['message']}")
+                link = f"[{finding['section_name']}]({finding['studio_url']})" if finding["studio_url"] else finding["section_name"]
+                label = "需要处理" if finding["status"] == "issue" else "暂时无法确认"
+                lines.append(f"- {link}：{label}，{finding['message']}")
     else:
         for group in visible_groups:
-            name = str(group.get("name") or "课程小节")
-            url = str(group.get("studio_url") or "")
-            heading = f"### [{name}]({url})" if url else f"### {name}"
-            lines.extend(("", heading))
+            link = f"[{group['name']}]({group['studio_url']})" if group["studio_url"] else group["name"]
+            lines.extend(("", f"### {link}"))
             for finding in group["findings"]:
-                label = "已确认问题" if finding["status"] == "issue" else "无法确认"
+                label = "需要处理" if finding["status"] == "issue" else "暂时无法确认"
                 lines.append(f"- {label}：{finding['message']}")
-        if course_findings:
-            lines.extend(("", "### 课程"))
-            if course_url:
-                lines[-1] = f"### [课程]({course_url})"
-            for finding in course_findings:
-                label = "已确认问题" if finding["status"] == "issue" else "无法确认"
-                lines.append(f"- {label}：{finding['message']}")
+
     return {
         "status": status,
         "mode": report_mode,
@@ -1405,7 +1263,7 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
         "unverified_count": unverified_count,
         "summary": summary,
         "groups": visible_groups,
-        "course_findings": course_findings,
+        "course_findings": [],
         "text": "\n".join(lines),
     }
 
@@ -1620,7 +1478,7 @@ def verify_final_course_structure(
     }
 
 
-def summarize_batch(operation: dict[str, Any], *, report_mode: str = "categories") -> dict[str, Any]:
+def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_mode: str = "sections") -> dict[str, Any]:
     entries = operation["galleries"]
     course_check = operation.get("course_structure_verification")
     if not isinstance(course_check, dict):
@@ -1742,7 +1600,7 @@ def summarize_batch(operation: dict[str, Any], *, report_mode: str = "categories
     course_issues = course_check.get("issue_count", 0) if isinstance(course_check.get("issue_count"), int) else 0
     course_unverified = course_check.get("unverified_count", 0) if isinstance(course_check.get("unverified_count"), int) else 1
     all_verified = all_verified and course_check.get("status") == "verified" and course_issues == 0 and course_unverified == 0
-    operator_report = _operator_report(operation, report_mode=report_mode)
+    operator_report = _operator_report(operation, studio_base=studio_base, report_mode=report_mode)
     result = {
         "status": "verified" if all_verified else "incomplete",
         "all_sections_verified": all_verified,
@@ -1769,7 +1627,7 @@ def summarize_batch(operation: dict[str, Any], *, report_mode: str = "categories
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     operation_path = Path(args.operation_file).expanduser().resolve()
     operation = load_operation(operation_path)
-    report_mode = args.report_mode or "categories"
+    report_mode = args.report_mode or "sections"
     operation["operator_report_mode"] = report_mode
     store = lambda: publisher.atomic_write_json(operation_path, operation)
     parsed_studio_url = urlsplit(args.studio_url)
@@ -1955,7 +1813,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         operation=operation,
     )
     store()
-    operation["batch_result"] = summarize_batch(operation, report_mode=report_mode)
+    operation["batch_result"] = summarize_batch(operation, studio_base=studio_base, report_mode=report_mode)
     store()
     return operation["batch_result"]
 
@@ -1969,7 +1827,7 @@ def parse_args() -> argparse.Namespace:
         "--report-mode",
         choices=sorted(OPERATOR_REPORT_MODES),
         default=None,
-        help="group operator findings by check category (default) or by subsection",
+        help="group findings by target subsection (default) or by check category",
     )
     parser.add_argument("--adapter", default=str(DEFAULT_ADAPTER), help="request template adapter JSON")
     parser.add_argument("--account", default="")
