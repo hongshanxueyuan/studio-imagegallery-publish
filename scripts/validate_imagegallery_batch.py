@@ -5,13 +5,10 @@ from __future__ import annotations
 
 import argparse
 import copy
-import importlib.util
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -23,89 +20,9 @@ import publish_imagegallery_block as publisher
 DEFAULT_ADAPTER = Path(__file__).resolve().parents[1] / "references" / "adapter.template.json"
 DEFAULT_TIMEOUT = 30
 IMAGE_PAGE_SIZE = 50
-AUDITOR_REPOSITORY_URL = "https://github.com/hongshanxueyuan/nlm-course-auditor"
-AUDITOR_SCRIPT_NAME = "nlm_course_auditor.py"
-
-
-def _auditor_script_in(path: Path) -> Path | None:
-    script = path / "scripts" / AUDITOR_SCRIPT_NAME if path.is_dir() else path
-    return script if script.is_file() and script.name == AUDITOR_SCRIPT_NAME else None
-
-
-def locate_auditor_script() -> Path | None:
-    configured = os.environ.get("NLM_COURSE_AUDITOR_PATH", "").strip()
-    candidates = [Path(configured).expanduser()] if configured else []
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-    candidates.extend((
-        codex_home / "skills" / "nlm-course-auditor",
-        Path.home() / ".agents" / "skills" / "nlm-course-auditor",
-    ))
-    publisher_root = Path(__file__).resolve().parents[1]
-    candidates.extend((
-        publisher_root.parent / "nlm-course-auditor",
-        publisher_root.parent.parent / "nlm-course-auditor",
-        publisher_root.parent.parent / "skills" / "nlm-course-auditor",
-    ))
-    for candidate in candidates:
-        script = _auditor_script_in(candidate)
-        if script is not None:
-            return script
-    return None
-
-
-def install_auditor(destination: Path) -> Path:
-    installed_script = _auditor_script_in(destination)
-    if installed_script is not None:
-        return installed_script
-    if destination.exists():
-        raise RuntimeError("auditor installation directory is unavailable")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "clone", "--depth", "1", AUDITOR_REPOSITORY_URL, str(destination)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    script = _auditor_script_in(destination)
-    if script is None:
-        raise RuntimeError("auditor repository does not contain the expected entry point")
-    return script
-
-
-def install_auditor_requirements(script: Path) -> None:
-    requirements = script.parents[1] / "requirements.txt"
-    if requirements.is_file() and importlib.util.find_spec("markdown_it") is None:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-def _auditor_working_directory() -> Path:
-    cache_base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".cache")
-    cache_root = Path(cache_base).expanduser() / "studio-imagegallery-publish" / "nlm-course-auditor"
-    return cache_root
-
-
 def _auditor_report_path(working_directory: Path, course_key: str) -> Path:
     safe_course_key = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", course_key).rstrip(" .")
     return working_directory / "auditor" / safe_course_key / "report.json"
-
-
-def _auditor_environment(args: argparse.Namespace) -> dict[str, str]:
-    environment = os.environ.copy()
-    for argument, variable in (
-        ("account", "FIRA_SAAS_OP_ACCOUNT"),
-        ("password", "FIRA_SAAS_OP_PASSWORD"),
-        ("cookie", "FIRA_SAAS_OP_COOKIE"),
-        ("csrf_token", "FIRA_SAAS_OP_CSRF_TOKEN"),
-    ):
-        value = getattr(args, argument, "")
-        if isinstance(value, str) and value:
-            environment[variable] = value
-    return environment
 
 
 def _audit_unverified(course_key: str, *, stage: str) -> dict[str, Any]:
@@ -130,44 +47,24 @@ def _audit_unverified(course_key: str, *, stage: str) -> dict[str, Any]:
     }
 
 
-def run_course_audit(*, studio_base: str, course_key: str, args: argparse.Namespace) -> dict[str, Any]:
-    """Run the read-only auditor after batch validation and load its structured report."""
-    try:
-        script = locate_auditor_script()
-        if script is None:
-            script = install_auditor(_auditor_working_directory())
-        install_auditor_requirements(script)
-        with tempfile.TemporaryDirectory(prefix="imagegallery-audit-") as temporary:
-            working_directory = Path(temporary)
-            command = [
-                sys.executable,
-                str(script),
-                "--studio-url",
-                f"{studio_base.rstrip('/')}/course/{course_key}",
-                "--working-directory",
-                str(working_directory),
-            ]
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=_auditor_environment(args),
-            )
-            report_path = _auditor_report_path(working_directory, course_key)
-            if completed.returncode not in {0, 1} or not report_path.is_file():
-                return _audit_unverified(course_key, stage="auditor_execution")
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(report, dict)
-                or report.get("status") not in {"pass", "issue", "unverified"}
-                or not isinstance(report.get("sequential_sections"), list)
-            ):
-                return _audit_unverified(course_key, stage="auditor_report")
-            report["course_url"] = f"{studio_base.rstrip('/')}/course/{course_key}"
-            return report
-    except Exception:
-        return _audit_unverified(course_key, stage="auditor_install_or_read")
+def _audit_pending(course_key: str, course_url: str) -> dict[str, Any]:
+    report = _audit_unverified(course_key, stage="audit_pending")
+    report["status"] = "pending"
+    report["course_url"] = course_url
+    report["course_findings"][0]["name"] = "课程审核等待运行"
+    return report
+
+
+def _course_audit_request(operation_path: Path, course_key: str, course_url: str) -> dict[str, str]:
+    working_directory = operation_path.with_name(f"{operation_path.stem}.course-audit")
+    report_path = _auditor_report_path(working_directory, course_key)
+    return {
+        "status": "pending",
+        "course_id": course_key,
+        "course_url": course_url,
+        "working_directory": str(working_directory),
+        "report_path": str(report_path),
+    }
 
 
 class BatchValidationError(RuntimeError):
@@ -1166,6 +1063,8 @@ def _audit_check_message(check_id: str, actual: Any, evidence: Any) -> str:
         stage = str(evidence.get("failure_stage") or "")
         if stage == "course_identity":
             return "无法识别课程身份，课程审核未能运行。"
+        if stage == "audit_pending":
+            return "整课课程审核待运行。"
         if stage.startswith("auditor_"):
             return "课程审核程序未能完成运行，暂时无法确认全课程审核结果。"
         return "暂时无法读取课程结构，无法完成课程审核。"
@@ -1284,6 +1183,7 @@ def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
     groups: dict[str, dict[str, Any]] = {}
     section_by_locator: dict[str, dict[str, Any]] = {}
     vertical_owners: dict[str, str] = {}
+    unrouteable_audit_findings: list[dict[str, str]] = []
     for section in audit_sections:
         if not isinstance(section, dict):
             continue
@@ -1348,21 +1248,28 @@ def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(section, dict):
             continue
         locator = safe_locator(section.get("locator"))
-        if not locator:
-            continue
+        section_name = str(section.get("name") or "课程小节")
         for check in section.get("checks", []) if isinstance(section.get("checks"), list) else []:
             if not isinstance(check, dict):
                 continue
             status = check.get("status")
             if status in {"issue", "unverified"}:
-                add_section_finding(
-                    locator,
-                    str(section.get("name") or "课程小节"),
-                    str(section.get("studio_url") or ""),
-                    status,
-                    "course_audit",
-                    _audit_check_message(str(check.get("check_id") or ""), check.get("actual"), check.get("evidence")),
-                )
+                message = _audit_check_message(str(check.get("check_id") or ""), check.get("actual"), check.get("evidence"))
+                if locator:
+                    add_section_finding(
+                        locator,
+                        section_name,
+                        str(section.get("studio_url") or ""),
+                        status,
+                        "course_audit",
+                        message,
+                    )
+                else:
+                    unrouteable_audit_findings.append({
+                        "status": status,
+                        "section_name": section_name,
+                        "message": message,
+                    })
 
     for target in course_audit.get("target_sections", []) if isinstance(course_audit.get("target_sections"), list) else []:
         if not isinstance(target, dict):
@@ -1454,7 +1361,16 @@ def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
             course_url = f"{parsed.scheme}://{parsed.netloc}/course/{course_id}"
         else:
             course_url = ""
-    course_findings = []
+    course_findings = [
+        {
+            "status": finding["status"],
+            "source": "course_audit",
+            "section_name": finding["section_name"],
+            "message": f"{finding['section_name']} 小节：{finding['message']}当前没有可用的小节路由，请从课程链接复核。",
+            "studio_url": course_url,
+        }
+        for finding in unrouteable_audit_findings
+    ]
     for finding in course_audit.get("course_findings", []) if isinstance(course_audit.get("course_findings"), list) else []:
         if not isinstance(finding, dict) or finding.get("status") not in {"issue", "unverified"}:
             continue
@@ -1809,7 +1725,11 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
     course_issues = course_check.get("issue_count", 0) if isinstance(course_check.get("issue_count"), int) else 0
     course_unverified = course_check.get("unverified_count", 0) if isinstance(course_check.get("unverified_count"), int) else 1
     all_verified = all_verified and course_check.get("status") == "verified" and course_issues == 0 and course_unverified == 0
-    course_audit = operation.get("course_audit") if isinstance(operation.get("course_audit"), dict) else _audit_unverified("", stage="auditor_missing")
+    audit_request = operation.get("course_audit_request") if isinstance(operation.get("course_audit_request"), dict) else {}
+    course_audit = operation.get("course_audit") if isinstance(operation.get("course_audit"), dict) else _audit_pending(
+        str(audit_request.get("course_id") or ""),
+        str(audit_request.get("course_url") or ""),
+    )
     audit_status = course_audit.get("status")
     audit_issues = course_audit.get("issue_count", 0) if isinstance(course_audit.get("issue_count"), int) else 0
     audit_unverified = course_audit.get("unverified_count", 1) if isinstance(course_audit.get("unverified_count"), int) else 1
@@ -1826,6 +1746,7 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
         "operation_issue_count": operation_issue_count,
         "course_structure_verification": course_check,
         "course_audit": copy.deepcopy(course_audit),
+        "course_audit_request": copy.deepcopy(audit_request),
         "operator_report": operator_report,
         "galleries": results,
         "completed_at": utc_now(),
@@ -1838,6 +1759,50 @@ def summarize_batch(operation: dict[str, Any]) -> dict[str, Any]:
     if isinstance(provenance, dict):
         result["provenance"] = copy.deepcopy(provenance)
     return result
+
+
+def finalize_audit_report(operation_file: str | Path, audit_report_file: str | Path) -> dict[str, Any]:
+    operation_path = Path(operation_file).expanduser().resolve()
+    operation = load_operation(operation_path)
+    request = operation.get("course_audit_request")
+    if not isinstance(request, dict):
+        raise BatchValidationError("course_audit_request", "The operation file has no course-audit request")
+
+    course_key = str(request.get("course_id") or "")
+    course_url = str(request.get("course_url") or "")
+    expected_report_value = str(request.get("report_path") or "").strip()
+    report_path = Path(audit_report_file).expanduser().resolve()
+    if not expected_report_value or report_path != Path(expected_report_value).expanduser().resolve():
+        report = _audit_unverified(course_key, stage="auditor_report_path")
+    else:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            report = _audit_unverified(course_key, stage="auditor_report_read")
+
+    if not isinstance(report, dict) or report.get("status") not in {"pass", "issue", "unverified"}:
+        report = _audit_unverified(course_key, stage="auditor_report_invalid")
+    elif report.get("course_id") != course_key or not isinstance(report.get("sequential_sections"), list):
+        report = _audit_unverified(course_key, stage="auditor_report_invalid")
+    else:
+        report = copy.deepcopy(report)
+        report["course_url"] = course_url
+        for key in ("target_sections", "course_findings"):
+            if not isinstance(report.get(key), list):
+                report = _audit_unverified(course_key, stage="auditor_report_invalid")
+                break
+        report["course_url"] = course_url
+
+    operation["course_audit"] = report
+    request["status"] = "unverified" if report.get("status") == "unverified" else "completed"
+    request["audit_status"] = report.get("status")
+    request["completed_at"] = utc_now()
+    operation["course_audit_request"] = request
+    store = lambda: publisher.atomic_write_json(operation_path, operation)
+    store()
+    operation["batch_result"] = summarize_batch(operation)
+    store()
+    return operation["batch_result"]
 
 
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
@@ -1963,9 +1928,9 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         operation=operation,
     )
     store()
-    operation["course_audit"] = run_course_audit(studio_base=studio_base, course_key=course_key, args=args)
-    if isinstance(operation["course_audit"], dict):
-        operation["course_audit"].setdefault("course_url", f"{studio_base}/course/{course_key}")
+    course_url = f"{studio_base}/course/{course_key}"
+    operation["course_audit_request"] = _course_audit_request(operation_path, course_key, course_url)
+    operation["course_audit"] = _audit_pending(course_key, course_url)
     store()
     operation["batch_result"] = summarize_batch(operation)
     store()
@@ -1974,9 +1939,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate and safely repair a published Studio ImageGallery batch")
-    parser.add_argument("--studio-url", required=True, help="Studio URL for a target vertical in this course")
+    parser.add_argument("--studio-url", help="Studio URL for a target vertical in this course")
     parser.add_argument("--operation-file", required=True, help="shared batch-operation.json owned by the batch caller")
     parser.add_argument("--execute", action="store_true", help="read Studio and perform one safe repair for confirmed mismatches")
+    parser.add_argument("--finalize-audit-report", help="merge a saved course-auditor report into a validated batch")
     parser.add_argument("--adapter", default=str(DEFAULT_ADAPTER), help="request template adapter JSON")
     parser.add_argument("--account", default="")
     parser.add_argument("--password", default="")
@@ -1988,6 +1954,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-retry-delay-seconds", type=float, default=publisher.DEFAULT_AUTH_RETRY_DELAY_SECONDS)
     parser.add_argument("--skip-oss-multipart", action="store_true", help="debug only: skip the Gallery publisher's OSS audio upload")
     args = parser.parse_args()
+    args.cookie = args.cookie or os.environ.get("FIRA_SAAS_OP_COOKIE", "")
+    args.csrf_token = args.csrf_token or os.environ.get("FIRA_SAAS_OP_CSRF_TOKEN", "")
+    if args.finalize_audit_report:
+        if args.studio_url or args.execute:
+            parser.error("--finalize-audit-report cannot be combined with --studio-url or --execute")
+        return args
+    if not args.studio_url:
+        parser.error("--studio-url is required unless --finalize-audit-report is used")
     if not args.execute:
         parser.error("--execute is required because a confirmed mismatch can trigger repair")
     if args.timeout <= 0:
@@ -1998,7 +1972,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     try:
         args = parse_args()
-        result = run_validation(args)
+        result = (
+            finalize_audit_report(args.operation_file, args.finalize_audit_report)
+            if args.finalize_audit_report
+            else run_validation(args)
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["all_sections_verified"] else 1
     except SystemExit:
