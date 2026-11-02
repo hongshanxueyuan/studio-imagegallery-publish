@@ -22,6 +22,8 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 3. 现有的 Studio Cookie：
    - `--cookie`
 
+两阶段批量发布与审核优先使用 `FIRA_SAAS_OP_ACCOUNT` 和 `FIRA_SAAS_OP_PASSWORD`，让发布验证和审核子 agent 复用当前进程环境。batch validator 和 auditor 也支持 `FIRA_SAAS_OP_COOKIE` 与 `FIRA_SAAS_OP_CSRF_TOKEN` 环境变量。
+
 如果执行真实推送时以上方式都没有提供，这个 skill 必须停下，并明确提醒用户配置：
 
 - `FIRA_SAAS_OP_ACCOUNT`
@@ -64,7 +66,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
    - 如提供课程结构信息，先核对来源 `block_type`，再按类型替换正文；独立的 `本节要点组件` 会保留
 5. 返回目标 `vertical` 的可点击 Studio URL（运营复核入口）、创建出的 `block_locator`、新建的 `imagesgallery` block URL，以及推送摘要
 
-批量执行时，按目标顺序尝试全部章节。某一 target 的操作失败后，记录失败步骤和原因，跳过依赖该结果的后续步骤，并继续其他 target；不在批次中途要求用户决定如何处理。所有目标都处理完后，统一执行批量校验并输出每章节操作结果、实时校验结果和修复结果。
+批量执行时，按目标顺序尝试全部章节。某一 target 的操作失败后，记录失败步骤和原因，跳过依赖该结果的后续步骤，并继续其他 target；不在批次中途要求用户决定如何处理。所有目标都处理完后，统一执行批量校验；随后按“批次结束后的整课审核和运营报告”完成审核子任务与最终报告。
 
 ## 就地替换与发布完整性
 
@@ -206,7 +208,7 @@ python scripts/validate_imagegallery_batch.py \
   --execute
 ```
 
-真实执行使用现有 Studio 认证输入：`--account` / `--password`、环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`，或 `--cookie`。验证器读取操作记录、manifest 和 Studio 实时状态；通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容，并最终重新读取 Studio `format=concise` 课程结构。图片核对有效文件记录数、`total_count`、manifest 页数、逐图文件名、asset ID 和顺序；期望 asset ID 来自发布操作检查点。配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不检查 learner-side LMS 或远端音频播放。
+真实执行优先使用环境变量 `FIRA_SAAS_OP_ACCOUNT` / `FIRA_SAAS_OP_PASSWORD`；也可使用 `FIRA_SAAS_OP_COOKIE` / `FIRA_SAAS_OP_CSRF_TOKEN`、`--account` / `--password` 或 `--cookie`。验证器读取操作记录、manifest 和 Studio 实时状态；通过 Gallery preview 的 `get_files`、`get_play_config` 和 `get_audios` 检查作者态内容，并最终重新读取 Studio `format=concise` 课程结构。图片核对有效文件记录数、`total_count`、manifest 页数、逐图文件名、asset ID 和顺序；期望 asset ID 来自发布操作检查点。配置条目数须等于 Studio 图片数，音频绑定数须为 1。它不检查 learner-side LMS 或远端音频播放。
 
 任一可确认的图片、播放配置或音频绑定不匹配会记为 `mismatch`，最多触发一次完整修复；Studio 请求失败、响应结构无效或 operation 缺少逐图预期 ID 时记为 `unverified`，不修改该 Gallery，并继续检查其他目标。图片 ID、文件名和顺序必须逐项与 operation 检查点及 manifest 一致；数量相同不能单独证明图片正确。修复先移除目标 Gallery 的图片引用，再扫描课程中所有 Gallery 的当前引用和完整图片资产清单。仅对确认无引用的原资产执行精确删除；每次删除前都会重新扫描全部 Gallery 引用。随后用本地 package 恢复图片、音频绑定和播放配置，发布所属 vertical，并重新验证。资产扫描或删除前引用检查不完整时跳过对应删除。修复后仍不匹配时记录结果，不开始第二次完整修复，也不要求用户在批次中途决定下一步。
 
@@ -218,11 +220,29 @@ python scripts/validate_imagegallery_batch.py \
 
 ## 批次结束后的整课审核和运营报告
 
-所有 target 的发布与批次校验完成后，发布器会只读运行一次 `nlm-course-auditor`。审核扫描课程中的全部 sequential 小节，核对当前保存内容是否已发布，并保留“赋能内容” vertical 的组件、图片和字幕检查。发布请求成功本身不作为小节状态确认；只有 `published=true` 且 `has_changes=false` 才能确认当前改动已发布。
+发布与批次校验分两阶段完成：批次验证器负责发布结果和 Gallery 状态；课程审核由本 skill 调度的独立子 agent 执行。父 agent 必须使用可用的子 agent 工具 `spawn_agent` 创建该任务；父 agent 不得自己运行 auditor，也不得用 Python 子进程替代子 agent。
 
-发布器会先查找已安装的 auditor。找不到时，会从 `https://github.com/hongshanxueyuan/nlm-course-auditor` 自动克隆，并在当前 Python 环境缺少 auditor 的 Markdown 依赖时安装它。安装或审核读取失败会列为“无法确认”，同时保留已有发布和 Gallery 校验结果。即使批次中有 target 发布失败，只要课程身份已知，仍会运行整课审核。
+批次结束后先运行 `validate_imagegallery_batch.py --execute`。它完成所有目标的 Gallery 校验和课程结构核对，并将 `course_audit_request` 写入 operation 文件及输出结果。请求包含 `status`、`course_id`、`course_url`、`working_directory` 和 `report_path`。第一阶段因为整课审核仍待运行会返回退出码 `1`；父流程读取 JSON，在 `status` 为 `pending` 时继续启动子 agent，即使部分 target 发布失败也照常审核。课程身份不可用时不会创建待处理请求，并会在当前结果中报告课程审核无法运行。
 
-最终结果同时包含结构化明细和面向运营的中文汇总。报告按 sequential 小节的 Studio 路由归并发布步骤、Gallery 校验、正式发布状态和课程审核发现；课程级发现使用课程链接。问题说明区分已确认问题和无法确认，所有检查通过时显示简短的通过结论。该审核不会修改或重新发布课程。
+子 agent 接收上述课程 URL、工作目录和报告路径后，先检查 `nlm-course-auditor` skill 是否已安装。找不到时，在 Codex skill 目录（`$CODEX_HOME/skills`；未设置时使用 `~/.codex/skills`）克隆 `https://github.com/hongshanxueyuan/nlm-course-auditor`，并按该仓库的 `requirements.txt` 自动准备运行依赖，不询问用户确认。随后子 agent 必须明确运行 `nlm-course-auditor` skill，对课程执行一次只读审核：
+
+```bash
+python scripts/nlm_course_auditor.py \
+  --studio-url "<course_audit_request.course_url>" \
+  --working-directory "<course_audit_request.working_directory>"
+```
+
+子 agent 必须让审核报告保存到 `course_audit_request.report_path`，并将该路径交还给父流程。子 agent 只从继承的环境读取 `FIRA_SAAS_OP_ACCOUNT`、`FIRA_SAAS_OP_PASSWORD`、`FIRA_SAAS_OP_COOKIE` 和 `FIRA_SAAS_OP_CSRF_TOKEN`；父流程不得把 CLI 参数里的密码、Cookie 或 CSRF 值放进子 agent 提示，也不得让子 agent 把这些值写入命令参数、报告或 operation 文件。审核只读，不修改、修复、重发或清理 Studio 内容。若 auditor 安装或执行失败，子 agent 仍须在 `report_path` 写入与 auditor `report.json` 兼容的 `unverified` JSON，包含匹配的 `course_id`、`status`、计数、空的 `target_sections` / `sequential_sections`，以及带 `failure_stage`（值以 `auditor_` 开头）的课程级 `NLMCA-007` 发现；不要写入原始异常或凭据。
+
+子 agent 完成后，父流程调用最终化命令：
+
+```bash
+python scripts/validate_imagegallery_batch.py \
+  --operation-file "/path/to/batch-operation.json" \
+  --finalize-audit-report "<course_audit_request.report_path>"
+```
+
+最终化只读取保存的 auditor 报告，不访问 Studio；它核对课程身份，把报告合并到现有 operation 文件，保留批次发布与 Gallery 校验结果，并重建 `batch_result` 和 `operator_report`。结构化明细和中文摘要使用同一组发现。报告按 sequential 小节的安全 Studio 路由归并发布步骤、Gallery 校验、正式发布状态和课程审核发现；无法确认路由的小节发现使用课程链接。问题说明区分已确认问题和无法确认，所有检查通过时显示简短结论。
 
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
