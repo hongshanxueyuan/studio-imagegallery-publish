@@ -216,6 +216,14 @@ python scripts/validate_imagegallery_batch.py \
 
 批次结束后直接输出汇总，不在中途或报告末尾追问是否继续、是否修复或如何处理失败章节。报告逐 target 列出写入步骤、失败步骤、最终校验、自动修复结果和 vertical URL。
 
+## 批次结束后的整课审核和运营报告
+
+所有 target 的发布与批次校验完成后，发布器会只读运行一次 `nlm-course-auditor`。审核扫描课程中的全部 sequential 小节，核对当前保存内容是否已发布，并保留“赋能内容” vertical 的组件、图片和字幕检查。发布请求成功本身不作为小节状态确认；只有 `published=true` 且 `has_changes=false` 才能确认当前改动已发布。
+
+发布器会先查找已安装的 auditor。找不到时，会从 `https://github.com/hongshanxueyuan/nlm-course-auditor` 自动克隆，并在当前 Python 环境缺少 auditor 的 Markdown 依赖时安装它。安装或审核读取失败会列为“无法确认”，同时保留已有发布和 Gallery 校验结果。即使批次中有 target 发布失败，只要课程身份已知，仍会运行整课审核。
+
+最终结果同时包含结构化明细和面向运营的中文汇总。报告按 sequential 小节的 Studio 路由归并发布步骤、Gallery 校验、正式发布状态和课程审核发现；课程级发现使用课程链接。问题说明区分已确认问题和无法确认，所有检查通过时显示简短的通过结论。该审核不会修改或重新发布课程。
+
 ## Adapter 概念
 Adapter 用来定义请求模板。对大多数 FIRAcademy 站点，一个通用 adapter 就够用了，因为 `studio_base` / `courses_base` 和 block locator 都会在运行时解析出来：
 
