@@ -1284,6 +1284,7 @@ def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
     groups: dict[str, dict[str, Any]] = {}
     section_by_locator: dict[str, dict[str, Any]] = {}
     vertical_owners: dict[str, str] = {}
+    unrouteable_audit_findings: list[dict[str, str]] = []
     for section in audit_sections:
         if not isinstance(section, dict):
             continue
@@ -1348,21 +1349,28 @@ def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(section, dict):
             continue
         locator = safe_locator(section.get("locator"))
-        if not locator:
-            continue
+        section_name = str(section.get("name") or "课程小节")
         for check in section.get("checks", []) if isinstance(section.get("checks"), list) else []:
             if not isinstance(check, dict):
                 continue
             status = check.get("status")
             if status in {"issue", "unverified"}:
-                add_section_finding(
-                    locator,
-                    str(section.get("name") or "课程小节"),
-                    str(section.get("studio_url") or ""),
-                    status,
-                    "course_audit",
-                    _audit_check_message(str(check.get("check_id") or ""), check.get("actual"), check.get("evidence")),
-                )
+                message = _audit_check_message(str(check.get("check_id") or ""), check.get("actual"), check.get("evidence"))
+                if locator:
+                    add_section_finding(
+                        locator,
+                        section_name,
+                        str(section.get("studio_url") or ""),
+                        status,
+                        "course_audit",
+                        message,
+                    )
+                else:
+                    unrouteable_audit_findings.append({
+                        "status": status,
+                        "section_name": section_name,
+                        "message": message,
+                    })
 
     for target in course_audit.get("target_sections", []) if isinstance(course_audit.get("target_sections"), list) else []:
         if not isinstance(target, dict):
@@ -1454,7 +1462,16 @@ def _operator_report(operation: dict[str, Any]) -> dict[str, Any]:
             course_url = f"{parsed.scheme}://{parsed.netloc}/course/{course_id}"
         else:
             course_url = ""
-    course_findings = []
+    course_findings = [
+        {
+            "status": finding["status"],
+            "source": "course_audit",
+            "section_name": finding["section_name"],
+            "message": f"{finding['section_name']} 小节：{finding['message']}当前没有可用的小节路由，请从课程链接复核。",
+            "studio_url": course_url,
+        }
+        for finding in unrouteable_audit_findings
+    ]
     for finding in course_audit.get("course_findings", []) if isinstance(course_audit.get("course_findings"), list) else []:
         if not isinstance(finding, dict) or finding.get("status") not in {"issue", "unverified"}:
             continue

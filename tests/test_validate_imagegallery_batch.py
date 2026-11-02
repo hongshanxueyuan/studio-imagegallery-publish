@@ -912,6 +912,63 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertTrue(any("替换" in item["message"] for item in group["findings"]))
             self.assertTrue(any("未发布改动" in item["message"] for item in group["findings"]))
 
+    def test_unrouteable_auditor_finding_uses_course_link_alongside_section_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+            unsafe_url = "https://untrusted.example/container/not-a-locator"
+            auditor_report = {
+                "status": "issue",
+                "pass_count": 0,
+                "issue_count": 2,
+                "unverified_count": 0,
+                "sequential_sections": [
+                    {
+                        "name": "1.2",
+                        "locator": "not a valid Studio locator",
+                        "studio_url": unsafe_url,
+                        "checks": [{
+                            "check_id": "NLMCA-013",
+                            "status": "issue",
+                            "actual": {"published": False, "has_changes": False},
+                        }],
+                    },
+                    {
+                        "name": "1.3",
+                        "locator": "block-v1:ORG+COURSE+RUN+type@sequential+block@section3",
+                        "studio_url": "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section3",
+                        "checks": [{
+                            "check_id": "NLMCA-013",
+                            "status": "issue",
+                            "actual": {"published": False, "has_changes": False},
+                        }],
+                    },
+                ],
+                "target_sections": [],
+                "course_findings": [],
+            }
+
+            self._run_cli(operation_path, studio, audit_report=auditor_report)
+
+            report = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]["operator_report"]
+            self.assertEqual(1, len(report["groups"]))
+            self.assertEqual("1.3", report["groups"][0]["name"])
+            self.assertEqual(1, len(report["course_findings"]))
+            course_finding = report["course_findings"][0]
+            self.assertEqual("issue", course_finding["status"])
+            self.assertEqual("https://studio.example.com/course/" + COURSE_KEY, course_finding["studio_url"])
+            self.assertIn("1.2", course_finding["message"])
+            self.assertIn("没有公开版本", course_finding["message"])
+            self.assertNotIn("untrusted.example", report["text"])
+            self.assertIn("[课程]", report["text"])
+
     def test_course_audit_installs_missing_auditor_and_keeps_credentials_out_of_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "nlm-course-auditor" / "scripts" / "nlm_course_auditor.py"
