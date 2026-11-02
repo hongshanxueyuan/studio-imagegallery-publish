@@ -224,10 +224,10 @@ python scripts/validate_imagegallery_batch.py \
 
 批次结束后先运行 `validate_imagegallery_batch.py --execute`。它完成所有目标的 Gallery 校验和课程结构核对，并将 `course_audit_request` 写入 operation 文件及输出结果。请求包含 `status`、`course_id`、`course_url`、`working_directory` 和 `report_path`。第一阶段因为整课审核仍待运行会返回退出码 `1`；父流程读取 JSON，在 `status` 为 `pending` 时继续启动子 agent，即使部分 target 发布失败也照常审核。课程身份不可用时不会创建待处理请求，并会在当前结果中报告课程审核无法运行。
 
-子 agent 接收上述课程 URL、工作目录和报告路径后，先检查 `nlm-course-auditor` skill 是否已安装。找不到时，在 Codex skill 目录（`$CODEX_HOME/skills`；未设置时使用 `~/.codex/skills`）克隆 `https://github.com/hongshanxueyuan/nlm-course-auditor`，并按该仓库的 `requirements.txt` 自动准备运行依赖，不询问用户确认。随后子 agent 必须明确运行 `nlm-course-auditor` skill，对课程执行一次只读审核：
+子 agent 接收上述课程 URL、工作目录和报告路径后，先检查 `nlm-course-auditor` skill 是否已安装。找不到时，在 Codex skill 目录（`$CODEX_HOME/skills`；未设置时使用 `~/.codex/skills`）克隆 `https://github.com/hongshanxueyuan/nlm-course-auditor`，并按该仓库的 `requirements.txt` 自动准备运行依赖，不询问用户确认。无论使用已安装副本还是新克隆的仓库，都将 `<auditor-root>` 设为包含 `SKILL.md` 和 `scripts/` 的目录绝对路径。随后子 agent 必须明确运行 `nlm-course-auditor` skill，对课程执行一次只读审核：
 
 ```bash
-python scripts/nlm_course_auditor.py \
+python "<auditor-root>/scripts/nlm_course_auditor.py" \
   --studio-url "<course_audit_request.course_url>" \
   --working-directory "<course_audit_request.working_directory>"
 ```
