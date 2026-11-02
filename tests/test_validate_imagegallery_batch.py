@@ -6,6 +6,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -200,6 +201,13 @@ def make_course_structure(galleries, vertical_overrides=None):
     section = {"id": "block-v1:ORG+COURSE+RUN+type@sequential+block@section", "category": "sequential", "child_info": {"children": vertical_nodes}}
     chapter = {"id": "block-v1:ORG+COURSE+RUN+type@chapter+block@chapter", "category": "chapter", "child_info": {"children": [section]}}
     return {"id": COURSE_KEY, "category": "course", "display_name": "Test Course", "child_info": {"children": [chapter]}}
+
+
+def make_incomplete_course_structure():
+    payload = make_course_structure({GALLERY_1: {}, GALLERY_2: {}})
+    section = payload["child_info"]["children"][0]["child_info"]["children"][0]
+    section["child_info"]["children"][1].pop("child_info")
+    return payload
 
 
 class ValidateImageGalleryBatchTests(unittest.TestCase):
@@ -1045,13 +1053,140 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertFalse(result["all_sections_verified"])
             report = result["operator_report"]
             self.assertEqual("issue", report["status"])
-            self.assertEqual(1, len(report["groups"]))
-            group = report["groups"][0]
-            self.assertEqual("https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section", group["studio_url"])
-            self.assertGreaterEqual(len(group["findings"]), 2)
-            self.assertTrue(any("图片" in item["message"] for item in group["findings"]))
-            self.assertTrue(any("替换" in item["message"] for item in group["findings"]))
-            self.assertTrue(any("未发布改动" in item["message"] for item in group["findings"]))
+            self.assertEqual("categories", report["mode"])
+            groups_by_name = {group["name"]: group for group in report["groups"]}
+            self.assertIn("ImageGallery 相关问题", groups_by_name)
+            self.assertIn("章节未发布", groups_by_name)
+            imagegallery_finding = groups_by_name["ImageGallery 相关问题"]["findings"][0]
+            self.assertEqual("1.2", imagegallery_finding["name"])
+            self.assertEqual(
+                "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                imagegallery_finding["studio_url"],
+            )
+            self.assertEqual(VERTICAL_1, imagegallery_finding["element_locator"])
+            self.assertEqual("小节", imagegallery_finding["element_name"])
+            self.assertTrue(any("图片" in item["message"] for item in groups_by_name["ImageGallery 相关问题"]["findings"]))
+            self.assertTrue(any("替换" in item["message"] for item in groups_by_name["小节组件结构"]["findings"]))
+            self.assertTrue(any("未发布改动" in item["message"] for item in groups_by_name["章节未发布"]["findings"]))
+
+    def test_operator_report_can_keep_the_section_grouped_layout(self):
+        report = module._operator_report({
+            "course_structure_verification": {"status": "verified", "subsections": []},
+            "course_audit": {
+                "status": "issue",
+                "sequential_sections": [{
+                    "name": "1.2",
+                    "locator": "block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                    "studio_url": "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                    "checks": [{
+                        "check_id": "NLMCA-013",
+                        "status": "issue",
+                        "actual": {"published": False, "has_changes": False},
+                    }],
+                }],
+                "target_sections": [],
+                "course_findings": [],
+            },
+            "galleries": [],
+        }, report_mode="sections")
+
+        self.assertEqual("sections", report["mode"])
+        self.assertEqual("1.2", report["groups"][0]["name"])
+        self.assertIn("没有公开版本", report["text"])
+
+    def test_cli_report_mode_can_select_the_section_grouped_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": [{}, {}],
+                "audios": [{}],
+            }})
+            audit_report = {
+                "course_id": COURSE_KEY,
+                "status": "issue",
+                "issue_count": 1,
+                "unverified_count": 0,
+                "sequential_sections": [{
+                    "name": "1.2",
+                    "locator": "block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                    "studio_url": "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@sequential+block@section",
+                    "checks": [{
+                        "check_id": "NLMCA-013",
+                        "status": "issue",
+                        "actual": {"published": False, "has_changes": False},
+                    }],
+                }],
+                "target_sections": [],
+                "course_findings": [],
+            }
+
+            self._run_cli(
+                operation_path,
+                studio,
+                extra_args=("--report-mode", "sections"),
+                audit_report=audit_report,
+            )
+
+            report = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]["operator_report"]
+            self.assertEqual("sections", report["mode"])
+            self.assertEqual("1.2", report["groups"][0]["name"])
+
+    def test_operator_report_groups_subtitle_findings_and_links_the_target_vertical(self):
+        sequential_locator = "block-v1:ORG+COURSE+RUN+type@sequential+block@section"
+        sequential_url = "https://studio.example.com/container/" + sequential_locator
+        vertical_url = "https://studio.example.com/container/" + VERTICAL_1
+        report = module._operator_report({
+            "course_structure_verification": {
+                "status": "verified",
+                "subsections": [{
+                    "section_title": "1.2 课程小节",
+                    "section_locator": sequential_locator,
+                    "vertical_title": "赋能内容",
+                    "vertical_locator": VERTICAL_1,
+                    "studio_url": vertical_url,
+                }],
+            },
+            "course_audit": {
+                "status": "issue",
+                "sequential_sections": [],
+                "target_sections": [{
+                    "name": "赋能内容",
+                    "locator": VERTICAL_1,
+                    "studio_url": vertical_url,
+                    "checks": [
+                        {
+                            "check_id": "NLMCA-010",
+                            "status": "issue",
+                            "evidence": {"affected_pages": [{"page": 9, "marker_count": 1}]},
+                        },
+                        {
+                            "check_id": "NLMCA-012",
+                            "status": "issue",
+                            "evidence": {"affected_pages": [{"page": 2, "unrecognized_bold_count": 2}]},
+                        },
+                    ],
+                }],
+                "course_findings": [],
+            },
+            "galleries": [],
+        })
+
+        groups_by_name = {group["name"]: group for group in report["groups"]}
+        quote_finding = groups_by_name["开头出现 >"]["findings"][0]
+        bold_finding = groups_by_name["加粗识别失败"]["findings"][0]
+        self.assertEqual("1.2 课程小节", quote_finding["name"])
+        self.assertEqual(sequential_url, quote_finding["studio_url"])
+        self.assertEqual("赋能内容", quote_finding["element_name"])
+        self.assertEqual(VERTICAL_1, quote_finding["element_locator"])
+        self.assertEqual(vertical_url, quote_finding["element_studio_url"])
+        self.assertIn("查看“赋能内容”", report["text"])
+        self.assertIn("第 9 页出现 1 个开头为 `>` 的大于号", report["text"])
+        self.assertIn("第 2 页识别加粗失败 2 处", report["text"])
+        self.assertEqual("赋能内容", bold_finding["element_name"])
 
     def test_unrouteable_auditor_finding_uses_course_link_alongside_section_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1100,7 +1235,16 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             report = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]["operator_report"]
             self.assertEqual(1, len(report["groups"]))
-            self.assertEqual("1.3", report["groups"][0]["name"])
+            self.assertEqual("categories", report["mode"])
+            self.assertEqual("章节未发布", report["groups"][0]["name"])
+            routed_finding = next(
+                finding for finding in report["groups"][0]["findings"]
+                if finding["name"] == "1.3"
+            )
+            self.assertEqual(
+                "block-v1:ORG+COURSE+RUN+type@sequential+block@section3",
+                routed_finding["locator"],
+            )
             self.assertEqual(1, len(report["course_findings"]))
             course_finding = report["course_findings"][0]
             self.assertEqual("issue", course_finding["status"])
@@ -1177,8 +1321,43 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             report = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]["operator_report"]
             self.assertEqual("pass", report["status"])
             self.assertEqual([], report["groups"])
-            self.assertEqual("本次发布批次和全课程审核均通过，未发现需要处理的问题。", report["summary"])
-            self.assertEqual(report["summary"], report["text"])
+            self.assertEqual("", report["summary"])
+            self.assertEqual("", report["text"])
+
+    def test_course_structure_completeness_rejects_a_missing_vertical_child_list(self):
+        self.assertFalse(module.course_structure_payload_is_complete(make_incomplete_course_structure()))
+
+    def test_reference_scan_fails_closed_for_an_incomplete_unrelated_gallery_subtree(self):
+        payload = make_incomplete_course_structure()
+        with patch.object(module, "read_json_call", return_value=(payload, {"status": "ok"})) as read:
+            references, locators, error = module.scan_course_gallery_references(
+                SimpleNamespace(
+                    studio_base="https://studio.example.com",
+                    course_key=COURSE_KEY,
+                    studio_url="https://studio.example.com/course/" + COURSE_KEY,
+                ),
+                expected_gallery_locators={GALLERY_1},
+            )
+
+        self.assertIsNone(references)
+        self.assertEqual([], locators)
+        self.assertIn("incomplete", error.lower())
+        read.assert_called_once()
+
+    def test_final_course_structure_verification_rejects_a_partial_tree(self):
+        payload = make_incomplete_course_structure()
+        with patch.object(module, "read_json_call", return_value=(payload, {"status": "ok"})):
+            result = module.verify_final_course_structure(
+                object(),
+                studio_base="https://studio.example.com",
+                course_key=COURSE_KEY,
+                studio_url="https://studio.example.com/container/" + VERTICAL_1,
+                operation={"galleries": []},
+            )
+
+        self.assertEqual("unverified", result["status"])
+        self.assertEqual(0, result["subsection_count"])
+        self.assertIn("incomplete", result["error_summary"].lower())
 
 if __name__ == "__main__":
     unittest.main()
