@@ -20,53 +20,7 @@ import publish_imagegallery_block as publisher
 DEFAULT_ADAPTER = Path(__file__).resolve().parents[1] / "references" / "adapter.template.json"
 DEFAULT_TIMEOUT = 30
 IMAGE_PAGE_SIZE = 50
-def _auditor_report_path(working_directory: Path, course_key: str) -> Path:
-    safe_course_key = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", course_key).rstrip(" .")
-    return working_directory / "auditor" / safe_course_key / "report.json"
-
-
-def _audit_unverified(course_key: str, *, stage: str) -> dict[str, Any]:
-    course_finding = {
-        "check_id": "NLMCA-007",
-        "category": "课程读取",
-        "name": "课程审核无法确认",
-        "status": "unverified",
-        "expected": {"audit": "complete"},
-        "actual": {"audit": "unavailable"},
-        "evidence": {"failure_stage": stage, "failure_category": "auditor_unavailable"},
-    }
-    return {
-        "course_id": course_key,
-        "status": "unverified",
-        "pass_count": 0,
-        "issue_count": 0,
-        "unverified_count": 1,
-        "sequential_sections": [],
-        "target_sections": [],
-        "course_findings": [course_finding],
-    }
-
-
-def _audit_pending(course_key: str, course_url: str) -> dict[str, Any]:
-    report = _audit_unverified(course_key, stage="audit_pending")
-    report["status"] = "pending"
-    report["course_url"] = course_url
-    report["course_findings"][0]["name"] = "课程审核等待运行"
-    return report
-
-
-def _course_audit_request(operation_path: Path, course_key: str, course_url: str) -> dict[str, str]:
-    working_directory = operation_path.with_name(f"{operation_path.stem}.course-audit")
-    report_path = _auditor_report_path(working_directory, course_key)
-    return {
-        "status": "pending",
-        "course_id": course_key,
-        "course_url": course_url,
-        "working_directory": str(working_directory),
-        "report_path": str(report_path),
-    }
-
-
+MAX_REPAIR_CYCLES = 2
 class BatchValidationError(RuntimeError):
     def __init__(self, step: str, summary: str, *, http_status: int | None = None):
         self.step = step
@@ -690,7 +644,7 @@ def repair_gallery(
         attempt["resumed_at"] = utc_now()
         for key in ("finished_at", "failed_step", "error_summary", "http_status"):
             attempt.pop(key, None)
-    entry["repair_attempts"] = max(1, int(entry.get("repair_attempts", 0)))
+    entry["repair_attempts"] = max(int(entry.get("repair_attempts", 0)), int(attempt.get("attempt", 1)))
     store()
 
     locator = safe_locator(entry.get("gallery_locator"))
@@ -1068,16 +1022,33 @@ def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, di
     return expected, missing, ambiguous, unresolved
 
 
+def final_vertical_snapshot_contract(snapshot: dict[str, Any], gallery_locator: str) -> bool:
+    children = snapshot.get("children") if isinstance(snapshot, dict) else None
+    return bool(
+        snapshot.get("direct_child_count") == 2
+        and isinstance(children, list)
+        and len(children) == 2
+        and children[0].get("locator") == gallery_locator
+        and children[0].get("type") == "imagesgallery"
+        and children[0].get("order") == 1
+        and children[1].get("type") == "html"
+        and children[1].get("order") == 2
+    )
+
+
 def live_vertical_structure_status(
     structure: dict[str, Any],
     locator: str,
     *,
+    gallery_locator: str,
     expected: dict[str, dict[str, Any]],
     missing: set[str],
     ambiguous: set[str],
 ) -> str:
     if locator not in expected or locator in missing or locator in ambiguous:
         return "unverified"
+    if not final_vertical_snapshot_contract(expected[locator], gallery_locator):
+        return "mismatch"
     matches = [
         record.get("vertical")
         for record in publisher.iter_section_vertical_records(structure)
@@ -1101,64 +1072,6 @@ def _section_url(studio_url: str, locator: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return studio_url
     return f"{parsed.scheme}://{parsed.netloc}/container/{locator}"
-
-
-def _audit_check_message(check_id: str, actual: Any, evidence: Any) -> str:
-    actual = actual if isinstance(actual, dict) else {}
-    evidence = evidence if isinstance(evidence, dict) else {}
-    if check_id == "NLMCA-007":
-        stage = str(evidence.get("failure_stage") or "")
-        if stage == "course_identity":
-            return "无法识别课程身份，课程审核未能运行。"
-        if stage == "audit_pending":
-            return "整课课程审核待运行。"
-        if stage.startswith("auditor_"):
-            return "课程审核程序未能完成运行，暂时无法确认全课程审核结果。"
-        return "暂时无法读取课程结构，无法完成课程审核。"
-    if check_id == "NLMCA-013":
-        if actual.get("published") is False:
-            return "当前小节没有公开版本。"
-        if actual.get("has_changes") is True or actual.get("visibility_state") == "needs_attention":
-            return "当前仍有未发布改动，已有公开版本未包含最新编辑。"
-        return "暂时无法确认当前小节是否已发布最新编辑。"
-    affected_pages = evidence.get("affected_pages")
-    if isinstance(affected_pages, list) and affected_pages:
-        if check_id == "NLMCA-010":
-            details = [
-                f"第 {item['page']} 页出现 {item['marker_count']} 个开头为 `>` 的大于号"
-                for item in affected_pages if isinstance(item, dict) and isinstance(item.get("page"), int) and isinstance(item.get("marker_count"), int)
-            ]
-            if details:
-                return "；".join(details) + "。"
-        if check_id == "NLMCA-011":
-            pages = [str(item["page"]) for item in affected_pages if isinstance(item, dict) and isinstance(item.get("page"), int)]
-            if pages:
-                return f"第 {', '.join(pages)} 页出现正文段落先于 Markdown 标题的情况。"
-        if check_id == "NLMCA-012":
-            details = [
-                f"第 {item['page']} 页识别加粗失败 {item['unrecognized_bold_count']} 处"
-                for item in affected_pages if isinstance(item, dict) and isinstance(item.get("page"), int) and isinstance(item.get("unrecognized_bold_count"), int)
-            ]
-            if details:
-                return "；".join(details) + "。"
-    messages = {
-        "NLMCA-001": "“赋能内容”小节中的 imagegallery 数量不是一个。",
-        "NLMCA-002": "“赋能内容”小节中的“本节要点”组件数量不是一个。",
-        "NLMCA-003": "Studio 返回的 imagegallery 图片记录数量不一致。",
-        "NLMCA-004": "imagegallery 的字幕配置条目数与图片数量不一致。",
-        "NLMCA-005": "imagegallery 的音频绑定数量不是一个。",
-        "NLMCA-006": "课程结构中没有找到名称为“赋能内容”的小节，请核对课程和命名。",
-        "NLMCA-008": "imagegallery 没有位于小节的第一个组件。",
-        "NLMCA-009": "“本节要点”组件没有位于小节末尾。",
-        "NLMCA-010": "已保存字幕中存在开头为 `>` 的大于号。",
-        "NLMCA-011": "已保存字幕中出现正文段落先于 Markdown 标题的情况。",
-        "NLMCA-012": "已保存字幕中有加粗格式未被识别。",
-    }
-    message = messages.get(check_id, "课程审核发现需要复核的内容。")
-    hint = evidence.get("operator_hint")
-    if isinstance(hint, str) and hint.strip():
-        message += f"排查提示（不是已确认原因）：{hint.strip()}"
-    return message
 
 
 def _publish_step_message(step: Any) -> str:
@@ -1232,24 +1145,6 @@ OPERATOR_REPORT_CATEGORY_ORDER = (
 )
 
 
-def _audit_finding_category(check_id: str) -> str:
-    if check_id == "NLMCA-010":
-        return "开头出现 >"
-    if check_id == "NLMCA-013":
-        return "章节未发布"
-    if check_id == "NLMCA-012":
-        return "加粗识别失败"
-    if check_id == "NLMCA-011":
-        return "正文与 Markdown 标题顺序"
-    if check_id in {"NLMCA-003", "NLMCA-004", "NLMCA-005"}:
-        return "ImageGallery 相关问题"
-    if check_id in {"NLMCA-001", "NLMCA-002", "NLMCA-008", "NLMCA-009"}:
-        return "小节组件结构"
-    if check_id in {"NLMCA-006", "NLMCA-007"}:
-        return "课程级问题"
-    return "其他问题"
-
-
 def _category_grouped_findings(
     section_groups: list[dict[str, Any]],
     course_findings: list[dict[str, Any]],
@@ -1293,29 +1188,12 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
         raise ValueError("Unsupported operator report mode")
     course_check = operation.get("course_structure_verification")
     course_check = course_check if isinstance(course_check, dict) else {}
-    course_audit = operation.get("course_audit")
-    course_audit = course_audit if isinstance(course_audit, dict) else {}
     section_records = course_check.get("subsections") if isinstance(course_check.get("subsections"), list) else []
-    audit_sections = course_audit.get("sequential_sections") if isinstance(course_audit.get("sequential_sections"), list) else []
 
     groups: dict[str, dict[str, Any]] = {}
     section_by_locator: dict[str, dict[str, Any]] = {}
     vertical_owners: dict[str, str] = {}
     vertical_details: dict[str, dict[str, str]] = {}
-    unrouteable_audit_findings: list[dict[str, str]] = []
-    for section in audit_sections:
-        if not isinstance(section, dict):
-            continue
-        locator = safe_locator(section.get("locator"))
-        if not locator:
-            continue
-        record = {
-            "name": str(section.get("name") or "课程小节"),
-            "locator": locator,
-            "studio_url": str(section.get("studio_url") or ""),
-            "findings": [],
-        }
-        section_by_locator[locator] = record
     for subsection in section_records:
         if not isinstance(subsection, dict):
             continue
@@ -1338,17 +1216,6 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
                 "name": str(subsection.get("vertical_title") or subsection.get("section_title") or "赋能内容"),
                 "locator": vertical_locator,
                 "studio_url": str(subsection.get("studio_url") or ""),
-            }
-
-    for target in course_audit.get("target_sections", []) if isinstance(course_audit.get("target_sections"), list) else []:
-        if not isinstance(target, dict):
-            continue
-        locator = safe_locator(target.get("locator"))
-        if locator:
-            vertical_details[locator] = {
-                "name": str(target.get("name") or "赋能内容"),
-                "locator": locator,
-                "studio_url": str(target.get("studio_url") or ""),
             }
 
     def ensure_group(locator: str, name: str, studio_url: str) -> dict[str, Any]:
@@ -1403,57 +1270,6 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
         if finding not in group["findings"]:
             group["findings"].append(finding)
 
-    # Keep all sections in the report's coverage while displaying only problems.
-    for section in audit_sections:
-        if not isinstance(section, dict):
-            continue
-        locator = safe_locator(section.get("locator"))
-        section_name = str(section.get("name") or "课程小节")
-        for check in section.get("checks", []) if isinstance(section.get("checks"), list) else []:
-            if not isinstance(check, dict):
-                continue
-            status = check.get("status")
-            if status in {"issue", "unverified"}:
-                check_id = str(check.get("check_id") or "")
-                message = _audit_check_message(check_id, check.get("actual"), check.get("evidence"))
-                if locator:
-                    add_section_finding(
-                        locator,
-                        section_name,
-                        str(section.get("studio_url") or ""),
-                        status,
-                        "course_audit",
-                        message,
-                        _audit_finding_category(check_id),
-                    )
-                else:
-                    unrouteable_audit_findings.append({
-                        "status": status,
-                        "section_name": section_name,
-                        "message": message,
-                        "category": _audit_finding_category(check_id),
-                    })
-
-    for target in course_audit.get("target_sections", []) if isinstance(course_audit.get("target_sections"), list) else []:
-        if not isinstance(target, dict):
-            continue
-        locator = safe_locator(target.get("locator"))
-        for check in target.get("checks", []) if isinstance(target.get("checks"), list) else []:
-            if not isinstance(check, dict):
-                continue
-            status = check.get("status")
-            if status in {"issue", "unverified"}:
-                check_id = str(check.get("check_id") or "")
-                add_section_finding(
-                    locator,
-                    str(target.get("name") or "课程小节"),
-                    str(target.get("studio_url") or ""),
-                    status,
-                    "course_audit",
-                    _audit_check_message(check_id, check.get("actual"), check.get("evidence")),
-                    _audit_finding_category(check_id),
-                )
-
     for subsection in section_records:
         if not isinstance(subsection, dict):
             continue
@@ -1471,10 +1287,7 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
         if not isinstance(entry, dict):
             continue
         locator = safe_locator(entry.get("vertical_locator"))
-        fallback_url = ""
-        course_url = course_audit.get("course_url")
-        if isinstance(course_url, str) and course_url:
-            fallback_url = _section_url(course_url, locator)
+        fallback_url = vertical_details.get(locator, {}).get("studio_url", "")
         publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
         steps = publish.get("steps") if isinstance(publish.get("steps"), list) else []
         failed_steps = [item.get("step") for item in steps if isinstance(item, dict) and item.get("status") in {"failed", "blocked"}]
@@ -1519,37 +1332,7 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
             repair_step = attempt.get("failed_step") or "repair"
             add_section_finding(locator, "课程小节", fallback_url, "issue", "publisher", f"imagegallery 自动修复未完成：{_publish_step_message(repair_step)}", "ImageGallery 相关问题")
 
-    course_url = course_audit.get("course_url")
-    if not isinstance(course_url, str) or not course_url:
-        course_id = str(course_audit.get("course_id") or "")
-        some_url = next((str(item.get("studio_url")) for item in section_records if isinstance(item, dict) and item.get("studio_url")), "")
-        parsed = urlsplit(some_url)
-        if parsed.scheme in {"http", "https"} and parsed.netloc and course_id:
-            course_url = f"{parsed.scheme}://{parsed.netloc}/course/{course_id}"
-        else:
-            course_url = ""
-    course_findings = [
-        {
-            "status": finding["status"],
-            "source": "course_audit",
-            "section_name": finding["section_name"],
-            "category": finding.get("category") or "课程级问题",
-            "message": f"{finding['section_name']} 小节：{finding['message']}当前没有可用的小节路由，请从课程链接复核。",
-            "studio_url": course_url,
-        }
-        for finding in unrouteable_audit_findings
-    ]
-    for finding in course_audit.get("course_findings", []) if isinstance(course_audit.get("course_findings"), list) else []:
-        if not isinstance(finding, dict) or finding.get("status") not in {"issue", "unverified"}:
-            continue
-        message = _audit_check_message(str(finding.get("check_id") or ""), finding.get("actual"), finding.get("evidence"))
-        course_findings.append({
-            "status": finding["status"],
-            "source": "course_audit",
-            "category": _audit_finding_category(str(finding.get("check_id") or "")),
-            "message": message,
-            "studio_url": course_url,
-        })
+    course_findings: list[dict[str, Any]] = []
 
     if course_check.get("status") == "unverified" and not section_records:
         course_findings.append({
@@ -1557,7 +1340,7 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
             "source": "publisher",
             "category": "课程级问题",
             "message": "暂时无法读取课程结构，无法确认本次发布状态。",
-            "studio_url": course_url,
+            "studio_url": "",
         })
     if course_check.get("status") == "incomplete" and not any(group["findings"] for group in groups.values()):
         course_findings.append({
@@ -1565,17 +1348,8 @@ def _operator_report(operation: dict[str, Any], *, report_mode: str = "categorie
             "source": "publisher",
             "category": "课程级问题",
             "message": "课程组件结构校验发现需要处理的问题。",
-            "studio_url": course_url,
+            "studio_url": "",
         })
-    if course_audit.get("status") in {"issue", "unverified"} and not course_findings and not any(group["findings"] for group in groups.values()):
-        course_findings.append({
-            "status": course_audit["status"],
-            "source": "course_audit",
-            "category": "课程级问题",
-            "message": "课程审核报告未提供可确认的具体发现。",
-            "studio_url": course_url,
-        })
-
     visible_section_groups = [group for group in groups.values() if group["findings"]]
     issue_count = sum(finding["status"] == "issue" for group in visible_section_groups for finding in group["findings"])
     issue_count += sum(finding["status"] == "issue" for finding in course_findings)
@@ -1698,6 +1472,21 @@ def verify_final_course_structure(
         }
 
     expected_by_vertical, missing_expectations, ambiguous_expectations, unresolved_operations = expected_vertical_snapshots(operation)
+    target_verticals = {
+        safe_locator(entry.get("vertical_locator"))
+        for entry in operation.get("galleries", [])
+        if isinstance(entry, dict) and safe_locator(entry.get("vertical_locator"))
+    }
+    target_verticals |= set(expected_by_vertical) | missing_expectations | ambiguous_expectations | unresolved_operations
+    gallery_by_vertical: dict[str, str] = {}
+    for entry in operation.get("galleries", []):
+        if not isinstance(entry, dict):
+            continue
+        locator = safe_locator(entry.get("vertical_locator"))
+        gallery_locator = safe_locator(entry.get("gallery_locator"))
+        if locator and gallery_locator:
+            prior = gallery_by_vertical.get(locator)
+            gallery_by_vertical[locator] = gallery_locator if prior in {None, gallery_locator} else ""
     integrity_statuses: dict[str, set[str]] = {}
     for entry in operation.get("galleries", []):
         if not isinstance(entry, dict):
@@ -1714,6 +1503,8 @@ def verify_final_course_structure(
         section = record.get("section") if isinstance(record.get("section"), dict) else {}
         vertical = record.get("vertical") if isinstance(record.get("vertical"), dict) else {}
         locator = safe_locator(vertical.get("block_location"))
+        if locator not in target_verticals:
+            continue
         if locator:
             observed_verticals.add(locator)
         observed = observed_child_snapshot(vertical)
@@ -1732,6 +1523,9 @@ def verify_final_course_structure(
         elif locator in missing_expectations:
             structure_status = "unverified"
             unverified_reasons.append("expected_structure_missing")
+        elif expected is not None and not final_vertical_snapshot_contract(expected, gallery_by_vertical.get(locator, "")):
+            structure_status = "issue"
+            issues.append("expected_structure_contract_invalid")
         elif expected is not None and observed != expected:
             structure_status = "issue"
             issues.append("structure_mismatch")
@@ -1743,8 +1537,6 @@ def verify_final_course_structure(
 
         published_value = vertical.get("published")
         published = published_value if isinstance(published_value, bool) else None
-        if locator in unresolved_operations:
-            issues.append("publisher_vertical_integrity_unresolved")
         if published is False:
             issues.append("published_false")
         elif published is None:
@@ -1779,7 +1571,19 @@ def verify_final_course_structure(
         }
         subsection_results.append(subsection)
 
-    for locator in sorted((set(expected_by_vertical) | missing_expectations | ambiguous_expectations | unresolved_operations) - observed_verticals):
+    owners = map_gallery_owners(structure)
+    for item in subsection_results:
+        locator = safe_locator(item.get("vertical_locator"))
+        gallery_locator = gallery_by_vertical.get(locator, "")
+        if not gallery_locator or not locator:
+            continue
+        owner_matches = owners.get(gallery_locator, [])
+        if len(owner_matches) != 1 or owner_matches[0] != locator:
+            item["issues"].append("gallery_owner_mismatch")
+            item["status"] = "issue"
+            issue_count += 1
+
+    for locator in sorted(target_verticals - observed_verticals):
         issues = ["target_vertical_missing"]
         if locator in unresolved_operations:
             issues.append("publisher_vertical_integrity_unresolved")
@@ -1863,7 +1667,8 @@ def summarize_batch(operation: dict[str, Any], *, report_mode: str = "categories
                 and repair_vertical.get("status") == "completed"
                 and repair_validation.get("status") == "verified"
             )
-        all_verified = all_verified and gallery_ok and operation_ok and repair_ok
+        # Studio's current saved state is authoritative; earlier write responses are diagnostics only.
+        all_verified = all_verified and gallery_ok
         if validation.get("status") in {"mismatch", "failed"} or (validation.get("status") == "verified" and not vertical_ok):
             gallery_issue_count += 1
         elif validation.get("status") != "verified":
@@ -1937,28 +1742,16 @@ def summarize_batch(operation: dict[str, Any], *, report_mode: str = "categories
     course_issues = course_check.get("issue_count", 0) if isinstance(course_check.get("issue_count"), int) else 0
     course_unverified = course_check.get("unverified_count", 0) if isinstance(course_check.get("unverified_count"), int) else 1
     all_verified = all_verified and course_check.get("status") == "verified" and course_issues == 0 and course_unverified == 0
-    audit_request = operation.get("course_audit_request") if isinstance(operation.get("course_audit_request"), dict) else {}
-    course_audit = operation.get("course_audit") if isinstance(operation.get("course_audit"), dict) else _audit_pending(
-        str(audit_request.get("course_id") or ""),
-        str(audit_request.get("course_url") or ""),
-    )
-    audit_status = course_audit.get("status")
-    audit_issues = course_audit.get("issue_count", 0) if isinstance(course_audit.get("issue_count"), int) else 0
-    audit_unverified = course_audit.get("unverified_count", 1) if isinstance(course_audit.get("unverified_count"), int) else 1
-    all_verified = all_verified and audit_status == "pass" and audit_issues == 0 and audit_unverified == 0
-    operator_report = _operator_report({**operation, "course_audit": course_audit}, report_mode=report_mode)
-    all_verified = all_verified and operator_report["status"] == "pass"
+    operator_report = _operator_report(operation, report_mode=report_mode)
     result = {
         "status": "verified" if all_verified else "incomplete",
         "all_sections_verified": all_verified,
         "gallery_count": len(results),
         "verified_count": sum(item["status"] == "verified" for item in results),
-        "issue_count": gallery_issue_count + course_issues + audit_issues,
-        "unverified_count": gallery_unverified_count + course_unverified + audit_unverified,
+        "issue_count": gallery_issue_count + course_issues,
+        "unverified_count": gallery_unverified_count + course_unverified,
         "operation_issue_count": operation_issue_count,
         "course_structure_verification": course_check,
-        "course_audit": copy.deepcopy(course_audit),
-        "course_audit_request": copy.deepcopy(audit_request),
         "operator_report": operator_report,
         "galleries": results,
         "completed_at": utc_now(),
@@ -1971,56 +1764,6 @@ def summarize_batch(operation: dict[str, Any], *, report_mode: str = "categories
     if isinstance(provenance, dict):
         result["provenance"] = copy.deepcopy(provenance)
     return result
-
-
-def finalize_audit_report(
-    operation_file: str | Path,
-    audit_report_file: str | Path,
-    *,
-    report_mode: str | None = None,
-) -> dict[str, Any]:
-    operation_path = Path(operation_file).expanduser().resolve()
-    operation = load_operation(operation_path)
-    report_mode = report_mode or str(operation.get("operator_report_mode") or "categories")
-    request = operation.get("course_audit_request")
-    if not isinstance(request, dict):
-        raise BatchValidationError("course_audit_request", "The operation file has no course-audit request")
-
-    course_key = str(request.get("course_id") or "")
-    course_url = str(request.get("course_url") or "")
-    expected_report_value = str(request.get("report_path") or "").strip()
-    report_path = Path(audit_report_file).expanduser().resolve()
-    if not expected_report_value or report_path != Path(expected_report_value).expanduser().resolve():
-        report = _audit_unverified(course_key, stage="auditor_report_path")
-    else:
-        try:
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-        except Exception:
-            report = _audit_unverified(course_key, stage="auditor_report_read")
-
-    if not isinstance(report, dict) or report.get("status") not in {"pass", "issue", "unverified"}:
-        report = _audit_unverified(course_key, stage="auditor_report_invalid")
-    elif report.get("course_id") != course_key or not isinstance(report.get("sequential_sections"), list):
-        report = _audit_unverified(course_key, stage="auditor_report_invalid")
-    else:
-        report = copy.deepcopy(report)
-        report["course_url"] = course_url
-        for key in ("target_sections", "course_findings"):
-            if not isinstance(report.get(key), list):
-                report = _audit_unverified(course_key, stage="auditor_report_invalid")
-                break
-        report["course_url"] = course_url
-
-    operation["course_audit"] = report
-    request["status"] = "unverified" if report.get("status") == "unverified" else "completed"
-    request["audit_status"] = report.get("status")
-    request["completed_at"] = utc_now()
-    operation["course_audit_request"] = request
-    store = lambda: publisher.atomic_write_json(operation_path, operation)
-    store()
-    operation["batch_result"] = summarize_batch(operation, report_mode=report_mode)
-    store()
-    return operation["batch_result"]
 
 
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
@@ -2049,99 +1792,160 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(adapter, dict) or not isinstance(adapter.get("publish_vertical"), dict):
         raise BatchValidationError("adapter", "adapter does not define publish_vertical")
 
-    structure_payload, structure_diagnostic = read_json_call(
-        client,
-        "load_live_course_structure",
-        "GET",
-        f"{studio_base}/course/{course_key}",
-        params={"format": "concise"},
-        referer=args.studio_url,
-    )
-    structure = None
-    structure_error = ""
-    if structure_diagnostic and structure_diagnostic["status"] != "ok":
-        structure_error = str(structure_diagnostic.get("error_summary") or "Studio course structure could not be read")
-    else:
-        if not course_structure_payload_is_complete(structure_payload):
-            structure_error = "Studio course structure is incomplete"
-        else:
-            try:
-                structure = publisher.normalize_course_structure_payload(structure_payload)
-                if not isinstance(structure.get("chapters"), list):
-                    structure_error = "Studio course structure has an invalid shape"
-            except Exception:
-                structure_error = "Studio course structure could not be normalized"
-    owners = map_gallery_owners(structure) if structure is not None and not structure_error else {}
-    expected_verticals, missing_verticals, ambiguous_verticals, _unresolved_verticals = expected_vertical_snapshots(operation)
-
-    for entry in operation["galleries"]:
-        if not entry.get("gallery_locator") or not entry.get("vertical_locator"):
-            store()
-            continue
-        manifest_path = Path(str(entry.get("manifest", ""))).expanduser().resolve()
-        try:
-            manifest = publisher.ensure_manifest(manifest_path)
-            expected_count = manifest_image_count(manifest)
-        except Exception:
-            entry["validation"] = invalid_gallery_result(entry, None, step="manifest", summary="Local Gallery manifest or package could not be validated")
-            store()
-            continue
-        publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
-        entry["validation"] = validate_gallery(client, entry, manifest)
-        entry["validation"]["publish_status"] = publish.get("status", "not_started")
-        if publish.get("failed_step"):
-            entry["validation"]["publish_failed_step"] = publish["failed_step"]
-        store()
-        if structure_error:
-            entry["validation"]["pre_repair_structure_status"] = "unverified"
-            entry["validation"]["pre_repair_structure_failed_step"] = "load_live_course_structure"
-            entry["validation"]["pre_repair_structure_error"] = structure_error[:240]
-            if isinstance((structure_diagnostic or {}).get("http_status"), int):
-                entry["validation"]["pre_repair_structure_http_status"] = structure_diagnostic["http_status"]
-            store()
-            continue
-        gallery_owners = owners.get(entry["gallery_locator"], [])
-        if len(gallery_owners) != 1 or gallery_owners[0] != entry["vertical_locator"]:
-            entry["validation"]["pre_repair_structure_status"] = "issue"
-            entry["validation"]["pre_repair_structure_error"] = "Gallery locator is missing, ambiguous, or owned by a different vertical"
-            store()
-            continue
-        attempts = entry.get("repair_attempts", 0)
-        resume_attempt = resumable_repair_attempt(entry) if attempts >= 1 else None
-        if resume_attempt is not None and entry["validation"]["status"] == "unverified":
-            continue
-        if resume_attempt is None and entry["validation"]["status"] != "mismatch":
-            continue
-        if attempts >= 1 and resume_attempt is None:
-            entry["validation"]["repair_limit_reached"] = True
-            store()
-            continue
-        structure_status = live_vertical_structure_status(
-            structure,
-            entry["vertical_locator"],
-            expected=expected_verticals,
-            missing=missing_verticals,
-            ambiguous=ambiguous_verticals,
+    def read_live_structure() -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+        payload, diagnostic = read_json_call(
+            client,
+            "load_live_course_structure",
+            "GET",
+            f"{studio_base}/course/{course_key}",
+            params={"format": "concise"},
+            referer=args.studio_url,
         )
-        if structure_status != "verified":
-            entry["validation"]["repair_status"] = "skipped"
-            entry["validation"]["repair_skip_reason"] = f"vertical_structure_{structure_status}"
-            store()
-            continue
+        if diagnostic and diagnostic["status"] != "ok":
+            return None, diagnostic, str(diagnostic.get("error_summary") or "Studio course structure could not be read")
+        if not course_structure_payload_is_complete(payload):
+            return None, diagnostic, "Studio course structure is incomplete"
         try:
-            repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store, attempt=resume_attempt)
-        except Exception as exc:
-            history = entry.setdefault("repair_history", [])
-            attempt = history[-1] if history and isinstance(history[-1], dict) else {"attempt": 1, "steps": []}
-            attempt["status"] = "failed"
-            attempt["failed_step"] = publisher.safe_step_name(getattr(exc, "step", getattr(exc, "step_name", "repair")))
-            attempt["error_summary"] = safe_error(exc, attempt["failed_step"])
-            if safe_http_status(exc) is not None:
-                attempt["http_status"] = safe_http_status(exc)
-            attempt["finished_at"] = utc_now()
-            if entry.get("validation", {}).get("status") != "unverified":
-                entry["validation"]["repair_status"] = "failed"
+            structure = publisher.normalize_course_structure_payload(payload)
+        except Exception:
+            return None, diagnostic, "Studio course structure could not be normalized"
+        if not isinstance(structure.get("chapters"), list):
+            return None, diagnostic, "Studio course structure has an invalid shape"
+        return structure, diagnostic, ""
+
+    def audit_batch_round(round_number: int) -> dict[str, list[str]]:
+        structure, structure_diagnostic, structure_error = read_live_structure()
+        owners = map_gallery_owners(structure) if structure is not None else {}
+        expected_verticals, missing_verticals, ambiguous_verticals, _ = expected_vertical_snapshots(operation)
+        vertical_records = []
+        if structure is not None:
+            try:
+                vertical_records = [
+                    record["vertical"] for record in publisher.iter_section_vertical_records(structure)
+                    if isinstance(record.get("vertical"), dict)
+                ]
+            except Exception:
+                structure_error = "Studio course structure could not be inspected"
+                structure = None
+                owners = {}
+                vertical_records = []
+        for entry in operation["galleries"]:
+            gallery_locator = safe_locator(entry.get("gallery_locator"))
+            vertical_locator = safe_locator(entry.get("vertical_locator"))
+            if not gallery_locator or not vertical_locator:
+                validation = invalid_gallery_result(entry, None, step="operation_file", summary="Gallery or vertical locator is invalid")
+            else:
+                manifest_path = Path(str(entry.get("manifest", ""))).expanduser().resolve()
+                try:
+                    manifest = publisher.ensure_manifest(manifest_path)
+                    validation = validate_gallery(client, entry, manifest)
+                except Exception:
+                    validation = invalid_gallery_result(entry, None, step="manifest", summary="Local Gallery manifest or package could not be validated")
+
+            checks = validation.setdefault("checks", {})
+            vertical_matches = [
+                item for item in vertical_records
+                if safe_locator(item.get("block_location")) == vertical_locator
+            ]
+            if structure_error:
+                vertical_structure_status = "unverified"
+                owner_status = "unverified"
+                publication_status = "unverified"
+                validation["pre_repair_structure_failed_step"] = "load_live_course_structure"
+                validation["pre_repair_structure_error"] = structure_error[:240]
+                if isinstance((structure_diagnostic or {}).get("http_status"), int):
+                    validation["pre_repair_structure_http_status"] = structure_diagnostic["http_status"]
+            else:
+                vertical_structure_status = live_vertical_structure_status(
+                    structure,
+                    vertical_locator,
+                    gallery_locator=gallery_locator,
+                    expected=expected_verticals,
+                    missing=missing_verticals,
+                    ambiguous=ambiguous_verticals,
+                ) if len(vertical_matches) == 1 else "mismatch"
+                owner_matches = owners.get(gallery_locator, [])
+                owner_status = "pass" if len(owner_matches) == 1 and owner_matches[0] == vertical_locator else "mismatch"
+                published_value = vertical_matches[0].get("published") if len(vertical_matches) == 1 else False
+                publication_status = "unverified" if not isinstance(published_value, bool) else "pass" if published_value else "mismatch"
+                validation["observed_vertical"] = {
+                    "published": published_value if isinstance(published_value, bool) else None,
+                    "child_snapshot": observed_child_snapshot(vertical_matches[0]) if len(vertical_matches) == 1 else None,
+                }
+            checks["vertical_structure"] = "pass" if vertical_structure_status == "verified" else vertical_structure_status
+            checks["gallery_owner"] = owner_status
+            checks["vertical_publication"] = publication_status
+            validation["audit_round"] = round_number
+            publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
+            validation["publish_status"] = publish.get("status", "not_started")
+            if publish.get("failed_step"):
+                validation["publish_failed_step"] = publish["failed_step"]
+            states = list(checks.values())
+            if "unverified" in states:
+                validation["status"] = "unverified"
+            elif "mismatch" in states:
+                validation["status"] = "mismatch"
+            else:
+                validation["status"] = "verified"
+            content_mismatches = any(
+                checks.get(name) == "mismatch"
+                for name in ("images", "play_config", "audio_bindings")
+            )
+            publication_mismatch = checks.get("vertical_publication") == "mismatch"
+            validation["repairable"] = bool(
+                validation["status"] == "mismatch"
+                and checks.get("vertical_structure") == "pass"
+                and owner_status == "pass"
+                and all(state in {"pass", "mismatch"} for state in states)
+                and (content_mismatches or publication_mismatch)
+            )
+            if validation["status"] == "mismatch" and not validation["repairable"]:
+                validation["repair_skip_reason"] = "The current section structure or Gallery ownership is not safe to change automatically"
+            entry["validation"] = validation
             store()
+        return owners
+
+    owners = audit_batch_round(0)
+    for cycle in range(1, MAX_REPAIR_CYCLES + 1):
+        repair_targets = []
+        for entry in operation["galleries"]:
+            validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+            if validation.get("status") != "mismatch" or not validation.get("repairable"):
+                continue
+            attempts = entry.get("repair_attempts", 0)
+            resume_attempt = resumable_repair_attempt(entry) if attempts else None
+            if resume_attempt is None and attempts >= MAX_REPAIR_CYCLES:
+                validation["repair_limit_reached"] = True
+                store()
+                continue
+            try:
+                manifest = publisher.ensure_manifest(Path(str(entry.get("manifest", ""))).expanduser().resolve())
+            except Exception:
+                validation["repairable"] = False
+                validation["repair_skip_reason"] = "The local Gallery package could not be checked before repair"
+                store()
+                continue
+            repair_targets.append((entry, manifest, resume_attempt))
+        if not repair_targets:
+            break
+        for entry, manifest, resume_attempt in repair_targets:
+            try:
+                repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store, attempt=resume_attempt)
+            except Exception as exc:
+                history = entry.setdefault("repair_history", [])
+                attempt = history[-1] if history and isinstance(history[-1], dict) else {"attempt": len(history) + 1, "steps": []}
+                attempt["status"] = "failed"
+                attempt["failed_step"] = publisher.safe_step_name(getattr(exc, "step", getattr(exc, "step_name", "repair")))
+                attempt["error_summary"] = safe_error(exc, attempt["failed_step"])
+                if safe_http_status(exc) is not None:
+                    attempt["http_status"] = safe_http_status(exc)
+                attempt["finished_at"] = utc_now()
+                entry["repair_attempts"] = max(entry.get("repair_attempts", 0), attempt.get("attempt", 1))
+                validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+                validation["repair_status"] = "failed"
+                entry["validation"] = validation
+                store()
+        owners = audit_batch_round(cycle)
 
     operation["course_structure_verification"] = verify_final_course_structure(
         client,
@@ -2150,10 +1954,6 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         studio_url=args.studio_url,
         operation=operation,
     )
-    store()
-    course_url = f"{studio_base}/course/{course_key}"
-    operation["course_audit_request"] = _course_audit_request(operation_path, course_key, course_url)
-    operation["course_audit"] = _audit_pending(course_key, course_url)
     store()
     operation["batch_result"] = summarize_batch(operation, report_mode=report_mode)
     store()
@@ -2164,8 +1964,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate and safely repair a published Studio ImageGallery batch")
     parser.add_argument("--studio-url", help="Studio URL for a target vertical in this course")
     parser.add_argument("--operation-file", required=True, help="shared batch-operation.json owned by the batch caller")
-    parser.add_argument("--execute", action="store_true", help="read Studio and perform one safe repair for confirmed mismatches")
-    parser.add_argument("--finalize-audit-report", help="merge a saved course-auditor report into a validated batch")
+    parser.add_argument("--execute", action="store_true", help="read Studio and perform up to two safe repair cycles for confirmed mismatches")
     parser.add_argument(
         "--report-mode",
         choices=sorted(OPERATOR_REPORT_MODES),
@@ -2185,12 +1984,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.cookie = args.cookie or os.environ.get("FIRA_SAAS_OP_COOKIE", "")
     args.csrf_token = args.csrf_token or os.environ.get("FIRA_SAAS_OP_CSRF_TOKEN", "")
-    if args.finalize_audit_report:
-        if args.studio_url or args.execute:
-            parser.error("--finalize-audit-report cannot be combined with --studio-url or --execute")
-        return args
     if not args.studio_url:
-        parser.error("--studio-url is required unless --finalize-audit-report is used")
+        parser.error("--studio-url is required")
     if not args.execute:
         parser.error("--execute is required because a confirmed mismatch can trigger repair")
     if args.timeout <= 0:
@@ -2202,15 +1997,7 @@ def main() -> int:
     args = None
     try:
         args = parse_args()
-        result = (
-            finalize_audit_report(
-                args.operation_file,
-                args.finalize_audit_report,
-                report_mode=args.report_mode,
-            )
-            if args.finalize_audit_report
-            else run_validation(args)
-        )
+        result = run_validation(args)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["all_sections_verified"] else 1
     except SystemExit:
@@ -2219,23 +2006,6 @@ def main() -> int:
         error = {"status": "failed", "error_summary": safe_error(exc, getattr(exc, "step", "batch_validation"))}
         if safe_http_status(exc) is not None:
             error["http_status"] = safe_http_status(exc)
-        if isinstance(exc, BatchValidationError) and exc.step == "studio_url":
-            error["course_audit"] = _audit_unverified("", stage="course_identity")
-            error["operator_report"] = {
-                "status": "unverified",
-                "mode": getattr(args, "report_mode", None) or "categories",
-                "issue_count": 0,
-                "unverified_count": 1,
-                "summary": "无法识别课程身份，课程审核未能运行。",
-                "groups": [],
-                "course_findings": [{
-                    "status": "unverified",
-                    "source": "course_audit",
-                    "message": "无法识别课程身份，课程审核未能运行。",
-                    "studio_url": "",
-                }],
-                "text": "无法识别课程身份，课程审核未能运行。",
-            }
         print(json.dumps(error, ensure_ascii=False))
         return 2
 
