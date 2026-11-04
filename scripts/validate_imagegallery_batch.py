@@ -569,7 +569,22 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
             diagnostics.append({"step": "get_play_config", "status": "invalid_response", "error_summary": "Studio play_config.time_config is not a list"})
     else:
         observed["time_config_count"] = len(time_config)
-        checks["play_config"] = "pass" if files is not None and len(time_config) == len(files) else "mismatch" if files is not None else "unverified"
+        timing_entries_valid = publisher.valid_time_config_entries(time_config)
+        observed["time_config_entries_valid"] = timing_entries_valid
+        show_subtitles = play_config.get("show_subtitles") if isinstance(play_config, dict) else None
+        show_subtitles_present = isinstance(play_config, dict) and "show_subtitles" in play_config
+        show_subtitles_invalid = show_subtitles_present and not isinstance(show_subtitles, bool)
+        if isinstance(show_subtitles, bool):
+            observed["show_subtitles"] = show_subtitles
+        subtitles_enabled = not show_subtitles_present or show_subtitles is True
+        if files is None or show_subtitles_invalid:
+            checks["play_config"] = "unverified"
+        else:
+            checks["play_config"] = (
+                "pass"
+                if len(time_config) == len(files) and timing_entries_valid and subtitles_enabled
+                else "mismatch"
+            )
 
     audio_payload, audio_diagnostic = read_json_call(
         client,
@@ -1051,13 +1066,17 @@ def repair_gallery(
 
 
 def resumable_repair_attempt(entry: dict[str, Any]) -> dict[str, Any] | None:
-    if entry.get("repair_attempts") != 1:
-        return None
     history = entry.get("repair_history")
-    if not isinstance(history, list) or len(history) != 1:
+    attempts = entry.get("repair_attempts")
+    if (
+        not isinstance(history, list)
+        or not history
+        or not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+    ):
         return None
-    attempt = history[0]
-    if not isinstance(attempt, dict) or attempt.get("attempt") != 1:
+    attempt = history[-1]
+    if not isinstance(attempt, dict) or attempt.get("attempt") != attempts:
         return None
     if attempt.get("status") not in {"running", "failed"} or "final_validation" in attempt:
         return None
@@ -1090,7 +1109,8 @@ def republish_vertical_for_pending_changes(
     else:
         attempt["status"] = "running"
         attempt["repair_mode"] = "publish_vertical"
-        attempt["repair_round"] = repair_round
+        if not isinstance(attempt.get("repair_round"), int) or isinstance(attempt.get("repair_round"), bool):
+            attempt["repair_round"] = repair_round
         attempt["resumed_at"] = utc_now()
         attempt.pop("finished_at", None)
         attempt.pop("failed_step", None)
@@ -1300,7 +1320,7 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
                 "Studio 中的 Gallery 图片与本地素材存在不一致，请核对页数、名称、顺序和图片对应关系。",
             )
         if checks.get("play_config") == "mismatch":
-            add_finding(entry, "issue", "字幕设置", "Studio 保存的字幕页数与 Gallery 页面数不一致。")
+            add_finding(entry, "issue", "字幕设置", "Studio 保存的字幕未启用、配置页数不符，或页码、时间边界、字幕字段无效。")
         if checks.get("audio_bindings") == "mismatch":
             add_finding(entry, "issue", "音频关联", "这节的 MP3 没有正确关联到图片页，请在 Studio 中核对音频。")
         if checks.get("gallery_owner") == "mismatch":
@@ -1318,7 +1338,7 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
             elif failed_step == "get_files":
                 add_finding(entry, "unverified", "图片内容", "暂时无法读取 Studio 中的图片信息，因此无法确认图片是否齐全。")
             elif failed_step == "get_play_config":
-                add_finding(entry, "unverified", "字幕设置", "暂时无法读取 Studio 保存的字幕设置，因此无法确认字幕页数是否与图片数量一致。")
+                add_finding(entry, "unverified", "字幕设置", "Studio 返回的字幕配置无法确认页数或字段完整性。")
             elif failed_step == "get_audios":
                 add_finding(entry, "unverified", "音频关联", "暂时无法读取 Gallery 的音频信息，因此无法确认 MP3 是否已正确关联。")
             elif failed_step == "manifest":
@@ -1330,7 +1350,7 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
             else:
                 gallery_checks = (
                     ("images", "暂时无法读取 Studio 中的图片信息，因此无法确认图片是否齐全。", "图片内容"),
-                    ("play_config", "暂时无法读取 Studio 保存的字幕设置，因此无法确认字幕页数是否与图片数量一致。", "字幕设置"),
+                    ("play_config", "Studio 返回的字幕配置无法确认页数或字段完整性。", "字幕设置"),
                     ("audio_bindings", "暂时无法读取 Gallery 的音频信息，因此无法确认 MP3 是否已正确关联。", "音频关联"),
                 )
                 found_gallery_read = False

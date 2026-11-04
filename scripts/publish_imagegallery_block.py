@@ -1137,24 +1137,53 @@ def resolve_rerun_action(previous_result: dict[str, Any] | None, *, current_stru
     }
 
 
+def valid_time_config_entries(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+
+    pages: set[int] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        page = item.get("page")
+        start = item.get("start")
+        end = item.get("end")
+        subtitle = item.get("subtitle")
+        if (
+            not isinstance(page, int)
+            or isinstance(page, bool)
+            or page <= 0
+            or page in pages
+            or not isinstance(start, int)
+            or isinstance(start, bool)
+            or start < 0
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or end < start
+            or not isinstance(subtitle, str)
+            or not subtitle.strip()
+        ):
+            return False
+        pages.add(page)
+    return True
+
+
 def ensure_manifest(manifest_path: Path) -> dict[str, Any]:
     data = read_json(manifest_path)
     if not isinstance(data.get("items"), list) or not data["items"]:
         raise ValueError("manifest.items 不能为空")
+    if not valid_time_config_entries(data["items"]):
+        raise ValueError("manifest.items must contain unique positive pages, valid start/end bounds, and non-empty subtitles")
     if not isinstance(data.get("audio"), dict):
         raise ValueError("manifest.audio 缺失（需要 stage-B schema）")
     audio = data["audio"]
-    if not audio.get("full_audio"):
+    if not isinstance(audio.get("full_audio"), str) or not audio["full_audio"].strip():
         raise ValueError("manifest.audio.full_audio 缺失")
 
     root = manifest_path.parent
     for item in data["items"]:
-        page = item.get("page")
-        if page is None:
-            raise ValueError("manifest.items[].page 缺失")
-        for key in ("image", "subtitle", "start", "end"):
-            if key not in item:
-                raise ValueError(f"manifest.items[] 缺失字段: {key}")
+        if not isinstance(item.get("image"), str) or not item["image"].strip():
+            raise ValueError("manifest.items[].image must be a non-empty path")
         img = Path(str(item["image"]))
         if not img.is_absolute():
             img = (root / img).resolve()
