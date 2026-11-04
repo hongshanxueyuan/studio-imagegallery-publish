@@ -25,6 +25,18 @@ GALLERY_2 = "block-v1:ORG+COURSE+RUN+type@imagesgallery+block@gallery456"
 COURSE_KEY = "course-v1:ORG+COURSE+RUN"
 
 
+def valid_time_config(page_count):
+    return [
+        {
+            "page": page,
+            "start": (page - 1) * 1000,
+            "end": page * 1000,
+            "subtitle": f"第{page}页",
+        }
+        for page in range(1, page_count + 1)
+    ]
+
+
 class FakeResponse:
     def __init__(self, payload, status_code=200):
         self.status_code = status_code
@@ -126,7 +138,10 @@ class FakeStudio:
                 })
             if method == "POST" and path == preview_prefix + "get_play_config":
                 override = self.payload_overrides.get((gallery_locator, "get_play_config"))
-                return FakeResponse(override if override is not None else {"play_config": {"time_config": gallery["time_config"]}})
+                play_config = {"time_config": gallery["time_config"]}
+                if "show_subtitles" in gallery:
+                    play_config["show_subtitles"] = gallery["show_subtitles"]
+                return FakeResponse(override if override is not None else {"play_config": play_config})
             if method == "POST" and path == preview_prefix + "get_audios":
                 override = self.payload_overrides.get((gallery_locator, "get_audios"))
                 return FakeResponse(override if override is not None else {"audios": gallery["audios"]})
@@ -164,7 +179,10 @@ class FakeStudio:
                 return FakeResponse({"ok": True, "Authorization": "Bearer raw-secret"})
             if method == "POST" and path == author_prefix + "update_play_config":
                 if not self.keep_mismatch_after_repair:
-                    gallery["time_config"] = (kwargs.get("json") or {}).get("play_config", {}).get("time_config", [])
+                    config = (kwargs.get("json") or {}).get("play_config", {})
+                    gallery["time_config"] = config.get("time_config", [])
+                    if "show_subtitles" in config:
+                        gallery["show_subtitles"] = config["show_subtitles"]
                 return FakeResponse({"ok": True})
 
         if method == "POST" and path == "/api/edxdal/v1/documents/":
@@ -234,6 +252,22 @@ def make_incomplete_course_structure():
 
 
 class ValidateImageGalleryBatchTests(unittest.TestCase):
+    def test_valid_time_config_entries_rejects_malformed_or_duplicate_pages(self):
+        self.assertTrue(publisher.valid_time_config_entries(valid_time_config(2)))
+        invalid_configs = (
+            [{"page": True, "start": 0, "end": 1, "subtitle": "第一页"}],
+            [{"page": 1, "start": -1, "end": 1, "subtitle": "第一页"}],
+            [{"page": 1, "start": 2, "end": 1, "subtitle": "第一页"}],
+            [{"page": 1, "start": 0, "end": 1, "subtitle": "  "}],
+            [
+                {"page": 1, "start": 0, "end": 1, "subtitle": "第一页"},
+                {"page": 1, "start": 1, "end": 2, "subtitle": "重复页"},
+            ],
+        )
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                self.assertFalse(publisher.valid_time_config_entries(config))
+
     def _write_bundle(self, root, page_count=2):
         items = []
         for page in range(1, page_count + 1):
@@ -320,7 +354,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "wrong-a", "asset_key": "wrong-a", "display_name": "first-wrong.png"},
                         {"id": "wrong-b", "asset_key": "wrong-b", "display_name": "second-wrong.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
                 GALLERY_2: {
@@ -328,7 +362,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                         {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [],
                 },
             })
@@ -357,7 +391,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                     {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                 ],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [],
             }}, keep_mismatch_after_repair=True)
 
@@ -375,6 +409,43 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual([1, 2], [item["attempt"] for item in gallery["repair_history"]])
             self.assertEqual("mismatch", gallery["validation"]["status"])
 
+    def test_cli_resumes_an_incomplete_second_repair_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            operation = self._operation(manifest)
+            gallery = operation["galleries"][0]
+            gallery["repair_attempts"] = 2
+            gallery["repair_history"] = [
+                {"attempt": 1, "status": "mismatch", "final_validation": {"status": "mismatch"}},
+                {"attempt": 2, "status": "failed", "initial_publish": dict(gallery["publish"]), "steps": []},
+            ]
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(
+                operation_path,
+                studio,
+                extra_args=("--skip-oss-multipart",),
+            )
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual(2, gallery["repair_attempts"])
+            self.assertEqual([1, 2], [item["attempt"] for item in gallery["repair_history"]])
+            self.assertEqual("completed", gallery["repair_history"][1]["status"])
+            self.assertIn("resumed_at", gallery["repair_history"][1])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+
     def test_cli_repairs_safe_targets_while_leaving_unverified_targets_unwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -387,7 +458,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "old-a", "asset_key": "old-a", "display_name": "wrong-1.png"},
                         {"id": "old-b", "asset_key": "old-b", "display_name": "wrong-2.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
                 GALLERY_2: {
@@ -395,7 +466,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "peer-a", "asset_key": "peer-a", "display_name": "page-001.png"},
                         {"id": "peer-b", "asset_key": "peer-b", "display_name": "page-002.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
             }, payload_overrides={(GALLERY_2, "get_audios"): {"audios": "unreadable"}})
@@ -422,7 +493,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             unrelated_vertical = "block-v1:ORG+COURSE+RUN+type@vertical+block@outside-batch"
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }}, vertical_overrides={unrelated_vertical: {
                 "published": False,
@@ -458,7 +529,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
 
@@ -495,7 +566,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a", "display_name": "renamed-a.png"}, {"id": "asset-b", "display_name": "renamed-b.png"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }})
 
@@ -528,7 +599,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }}, vertical_overrides={VERTICAL_2: {
                 "blocks": [{"id": "block-v1:ORG+COURSE+RUN+type@html+block@untargeted", "category": "html"}],
@@ -552,7 +623,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }}, vertical_overrides={VERTICAL_2: {
                 "blocks": [{
@@ -577,7 +648,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }}, vertical_overrides={VERTICAL_2: {
                 "blocks": [{"id": "block-v1:ORG+COURSE+RUN+type@html+block@untargeted", "category": "html"}],
@@ -601,7 +672,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }}, fail_course_reads={2})
 
@@ -623,7 +694,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }}, fail_course_reads={1})
 
@@ -651,7 +722,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }})
 
@@ -674,7 +745,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{"page": 1}, {"page": 2}],
+                "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }})
 
@@ -701,7 +772,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({
                 GALLERY_1: {"files": [], "time_config": [], "audios": []},
-                GALLERY_2: {"files": [{"id": "b1"}, {"id": "b2"}], "time_config": [{}, {}], "audios": [{}]},
+                GALLERY_2: {"files": [{"id": "b1"}, {"id": "b2"}], "time_config": valid_time_config(2), "audios": [{}]},
             }, fail_get_files={GALLERY_1: 1})
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
@@ -743,7 +814,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-old", "asset_key": "asset-old", "display_name": "old-page.png"}],
-                "time_config": [{"page": 1}],
+                "time_config": valid_time_config(1),
                 "audios": [{"id": "old-binding"}],
             }}, extra_assets=[{"id": "asset-checkpoint-orphan", "display_name": "unreferenced-old.png"}])
 
@@ -782,7 +853,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-old", "asset_key": "asset-old", "display_name": "old-page.png"}],
-                "time_config": [{"page": 1}],
+                "time_config": valid_time_config(1),
                 "audios": [{"id": "old-binding"}],
             }}, keep_mismatch_after_repair=True)
 
@@ -806,7 +877,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-old", "asset_key": "asset-old"}],
-                "time_config": [{}],
+                "time_config": valid_time_config(1),
                 "audios": [{}],
             }}, fail_vertical_publish=True)
 
@@ -822,9 +893,14 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
     def test_cli_repairs_play_config_and_zero_or_multiple_audio_binding_mismatches(self):
         cases = (
-            ("play_config", {"time_config": [{"page": 1}], "audios": [{"id": "audio-1"}]}),
-            ("zero_audios", {"time_config": [{"page": 1}, {"page": 2}], "audios": []}),
-            ("multiple_audios", {"time_config": [{"page": 1}, {"page": 2}], "audios": [{"id": "a1"}, {"id": "a2"}]}),
+            ("play_config", {"time_config": valid_time_config(1), "audios": [{"id": "audio-1"}]}),
+            ("disabled_subtitles", {"time_config": valid_time_config(2), "audios": [{"id": "audio-1"}], "show_subtitles": False}),
+            ("invalid_time_entry", {"time_config": [
+                {"page": 1, "start": 10, "end": 5, "subtitle": "第一页"},
+                {"page": 2, "start": 1000, "end": 2000, "subtitle": "第二页"},
+            ], "audios": [{"id": "audio-1"}]}),
+            ("zero_audios", {"time_config": valid_time_config(2), "audios": []}),
+            ("multiple_audios", {"time_config": valid_time_config(2), "audios": [{"id": "a1"}, {"id": "a2"}]}),
         )
         for label, state in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
@@ -838,11 +914,14 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     {"page": 2, "image": "page-002.png", "asset_id": "asset-2"},
                 ]
                 self._write_operation_file(operation_path, operation)
-                studio = FakeStudio({GALLERY_1: {
+                gallery_state = {
                     "files": [{"id": "asset-1"}, {"id": "asset-2"}],
                     "time_config": state["time_config"],
                     "audios": state["audios"],
-                }})
+                }
+                if "show_subtitles" in state:
+                    gallery_state["show_subtitles"] = state["show_subtitles"]
+                studio = FakeStudio({GALLERY_1: gallery_state})
 
                 exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
@@ -871,12 +950,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "asset-shared", "asset_key": "asset-shared"},
                         {"id": "asset-orphan", "asset_key": "asset-orphan"},
                     ],
-                    "time_config": [{"page": 1}, {"page": 2}],
+                    "time_config": valid_time_config(2),
                     "audios": [],
                 },
                 GALLERY_2: {
                     "files": [{"id": "asset-shared", "asset_key": "asset-shared"}],
-                    "time_config": [{}],
+                    "time_config": valid_time_config(1),
                     "audios": [{}],
                 },
             })
@@ -905,7 +984,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-old", "asset_key": "asset-old"}],
-                "time_config": [{}],
+                "time_config": valid_time_config(1),
                 "audios": [{}],
             }}, fail_get_files={GALLERY_1: 5})
 
@@ -923,6 +1002,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
         cases = (
             ("get_files", {"files": [{"name": "no-id"}], "total_count": 1}),
             ("get_play_config", {"play_config": {"time_config": "not-a-list"}}),
+            ("get_play_config", {"play_config": {"time_config": valid_time_config(2), "show_subtitles": "true"}}),
             ("get_audios", {"audios": [{"id": "audio"}, None]}),
         )
         for handler, response in cases:
@@ -933,7 +1013,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self._write_operation_file(operation_path, self._operation(manifest))
                 studio = FakeStudio({GALLERY_1: {
                     "files": [{"id": "a"}, {"id": "b"}],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 }}, payload_overrides={(GALLERY_1, handler): response})
 
@@ -953,7 +1033,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest, initial_vertical_status="failed"))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
 
@@ -975,7 +1055,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                     {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                 ],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }}, vertical_overrides={VERTICAL_1: {
                 "has_changes": True,
@@ -1004,7 +1084,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                     {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                 ],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }}, vertical_overrides={VERTICAL_1: {
                 "has_changes": False,
@@ -1033,7 +1113,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                     {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                 ],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
 
@@ -1070,7 +1150,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                         {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 }}, vertical_overrides={VERTICAL_1: override})
 
@@ -1099,7 +1179,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                     {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                 ],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }}, fail_publication_reads={1, 2})
 
@@ -1138,7 +1218,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
 
@@ -1161,7 +1241,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
             args = [
@@ -1199,7 +1279,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest))
             studio = FakeStudio({GALLERY_1: {
                 "files": [{"id": "asset-a"}, {"id": "asset-b"}],
-                "time_config": [{}, {}],
+                "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
 
@@ -1235,7 +1315,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "wrong-a", "asset_key": "wrong-a", "display_name": "wrong-a.png"},
                         {"id": "wrong-b", "asset_key": "wrong-b", "display_name": "wrong-b.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
                 GALLERY_2: {
@@ -1243,7 +1323,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
                         {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
                     ],
-                    "time_config": [{}, {}],
+                    "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
             }, fail_get_files={GALLERY_2: 1})
