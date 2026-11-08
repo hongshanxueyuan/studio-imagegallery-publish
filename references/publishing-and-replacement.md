@@ -16,23 +16,15 @@ dry-run 不访问 Studio 或 OSS、不登录，也不要求认证。真实执行
 
 ## 来源组件和小节结构
 
-发布器使用显式 `block_type` 契约识别替换目标，不从 Studio 现有组件猜测来源：
-
-- `html` target 替换目标 vertical 下第一个直接 HTML “文字讲解组件”。
-- `imagesgallery` target 替换唯一的 Gallery 替换目标。
-- 缺少来源类型、来源冲突、目标缺失或目标不唯一时，在 Studio 写入前停止该目标。
-
-首次 Studio 写入前保存 vertical 子组件快照。替换或删除前重新读取 Studio，核对 locator、类型、顺序和数量。最终 vertical 只有两个直接子组件：首位是本批次 ImageGallery，末位是独立的“本节要点” HTML；旧替换目标已移除。
-
-“本节要点”独立 HTML 不属于替换目标。普通发布、失败重跑和中断恢复都保留它。课程包中的总结内容仍按当前发布契约处理。
+先写入本批 Gallery，再读取完整 vertical 结构。以 operation 中本次 Gallery locator 确认 Gallery；`本节要点组件` 必须是直接 HTML 子组件，其名称或标题恰好等于“本节要点”，或可见内容首行恰好等于该短语。只有两者均唯一且所有直接子组件可识别时，才删除其他直接组件，并将本批 Gallery 和要点依次排在第一、第二。结构不可读、响应不完整或组件有歧义时保留现有组件，不删除、不移动，仍尝试发布所属小节。
 
 ## 批次顺序和请求恢复
 
 对 Studio 的写入必须按 target 顺序执行。不要并发发布多个 target，以免登录会话和认证状态互相干扰。独立 target 失败后记录失败原因，继续后续 target。
 
-请求状态、asset ID、步骤和安全错误摘要写入 operation 文件。响应正文、Cookie、CSRF、Authorization、STS 凭据和 token 不写入输出或记录。
+请求状态、asset ID、失败步骤和安全错误摘要写入 operation 文件。响应正文、Cookie、CSRF、Authorization、STS 凭据和 token 不写入输出或记录。
 
-单 Gallery checkpoint 可通过 `--operation-file` 与 `--gallery-key` 启用。调用方创建 operation 文件；发布器只更新匹配的 gallery 条目中的 `gallery_locator` 和 `publish`。逐步记录上传状态、页面及 asset ID、失败步骤和脱敏诊断。图片上传没有可用 ID 时，才进行一次 `get_files` 对账；只有数量、名称、顺序和唯一 asset ID 与 manifest 完全匹配才继续。创建 Gallery 的响应不确定时，用创建前快照尝试唯一恢复 locator；不能唯一确认时保留现场，避免重复创建。
+调用方创建 operation 文件。单 Gallery 通过 `--operation-file` 与 `--gallery-key` 指定条目；批次目标可各自提供 `gallery_key`。发布器记录 Gallery locator、首次写入、小节发布、结构证据、部分步骤和安全错误摘要。图片上传没有可用 ID 时，在尝试其余图片后进行一次 `get_files` 对账；只有数量、名称、顺序和唯一 asset ID 与 manifest 完全匹配才执行依赖 ID 的排序。对账不完整时不重传或删除不确定的图片，跳过排序并继续音频、播放配置、保存和小节发布。创建结果不确定而无法唯一确认 locator 时保留现场，避免重复创建。
 
 认证相关请求失败可刷新 Studio session 并重试，最多 4 次。该策略只适用于认证失败；其他业务错误不重试。
 
@@ -60,7 +52,7 @@ python scripts/publish_imagegallery_block.py \
 
 target 来源元数据可通过 `--section-id`、`--section-title`、`--block-type` 和 `--section-list-json` 指定。发布结果应优先提供目标 vertical URL，方便运营回到小节；可额外提供新建的 `imagesgallery` block URL。
 
-发布前后都保留独立的 `本节要点组件`。只有目标来源契约指定的正文组件会被替换。
+首次发布和后续审核分开执行；不要在所有目标完成首次尝试之前运行 validator。审核和修复不得覆盖首次发布的执行记录。
 
 单 Gallery batch checkpoint 的完整参数由 `python scripts/publish_imagegallery_block.py --help` 展示。
 

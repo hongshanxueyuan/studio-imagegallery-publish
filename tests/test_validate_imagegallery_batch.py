@@ -1,4 +1,5 @@
 import importlib
+import copy
 import json
 import sys
 import tempfile
@@ -90,6 +91,9 @@ class FakeStudio:
 
         def request(self, *, method, url, **kwargs):
             return self.studio.request(method, url, **kwargs)
+
+        def get(self, url, **kwargs):
+            return self.studio.request("GET", url, **kwargs)
 
     def _response(self, method, path, kwargs):
         if method == "GET" and path == f"/course/{COURSE_KEY}":
@@ -252,6 +256,232 @@ def make_incomplete_course_structure():
 
 
 class ValidateImageGalleryBatchTests(unittest.TestCase):
+    def test_cli_reports_initial_failure_separately_from_verified_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            operation = self._operation(manifest)
+            operation["galleries"][0]["publish"]["status"] = "failed"
+            path = root / "operation.json"
+            self._write_operation_file(path, operation)
+            studio = FakeStudio({GALLERY_1: {"files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                                              "time_config": valid_time_config(2), "audios": [{}]}})
+            code, stdout, stderr = self._run_cli(path, studio)
+            self.assertEqual(0, code, stdout + stderr)
+            state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            report = state["batch_result"]["operator_report"]["text"]
+            self.assertIn("首次发布", report)
+            self.assertIn("后置审核：全部通过", report)
+            self.assertIn(VERTICAL_1, report)
+            self.assertEqual("failed", state["galleries"][0]["publish"]["status"])
+
+    def test_two_target_cli_pass_continues_after_unreadable_and_ambiguous_structure(self):
+        class SharedStudio(FakeStudio):
+            def __init__(self):
+                self.summary1 = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+                self.summary2 = VERTICAL_2.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+                self.extra = VERTICAL_1.replace("type@vertical", "type@problem").replace("block@vertical", "block@extra")
+                super().__init__({}, vertical_overrides={
+                    VERTICAL_1: {"blocks": [{"id": self.extra, "category": "problem"}, {"id": self.summary1, "category": "html", "display_name": "本节要点"}]},
+                    VERTICAL_2: {"blocks": [{"id": self.summary2, "category": "html", "display_name": "本节要点"}, {"id": self.summary2 + "-other", "category": "html", "display_name": "本节要点"}]},
+                })
+                self.fail_first_structure = True
+                self.omit_first_asset_id = True
+
+            def _response(self, method, path, kwargs):
+                if method == "POST" and path == "/xblock/":
+                    vertical = kwargs["json"]["parent_locator"]
+                    gallery = GALLERY_1 if vertical == VERTICAL_1 else GALLERY_2
+                    self.galleries[gallery] = {"files": [], "time_config": [], "audios": []}
+                    self.vertical_overrides[vertical]["blocks"].append({"id": gallery, "category": "imagesgallery"})
+                    return FakeResponse({"locator": gallery})
+                if method == "GET" and path == f"/course/{COURSE_KEY}" and self.fail_first_structure:
+                    self.fail_first_structure = False
+                    return FakeResponse({"secret": "raw-error-secret"}, 503)
+                if method == "POST" and path.endswith("/handler/file_upload") and self.omit_first_asset_id:
+                    self.omit_first_asset_id = False
+                    super()._response(method, path, kwargs)
+                    return FakeResponse({"secret": "raw-upload-secret"})
+                if method == "DELETE" and path.startswith("/xblock/"):
+                    locator = path[len("/xblock/"):]
+                    for override in self.vertical_overrides.values():
+                        override["blocks"][:] = [block for block in override["blocks"] if block["id"] != locator]
+                    return FakeResponse({"ok": True})
+                if method == "PUT" and path.startswith("/xblock/"):
+                    vertical = path[len("/xblock/"):]
+                    blocks = self.vertical_overrides[vertical]["blocks"]
+                    by_id = {block["id"]: block for block in blocks}
+                    blocks[:] = [by_id[locator] for locator in kwargs["json"]["children"]]
+                    return FakeResponse({"ok": True})
+                return super()._response(method, path, kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            operation = self._operation(manifest, galleries=(GALLERY_1, GALLERY_2))
+            for entry in operation["galleries"]:
+                entry["gallery_locator"] = ""
+                for key in ("publish", "initial_vertical_publish", "vertical_integrity"):
+                    entry.pop(key)
+            path = root / "operation.json"
+            self._write_operation_file(path, operation)
+            studio = SharedStudio()
+            targets = root / "targets.json"
+            targets.write_text(json.dumps({"targets": [
+                {"gallery_key": f"gallery-{index}", "manifest": str(manifest), "target_vertical_block_location": vertical,
+                 "studio_vertical_url": f"https://studio.example.com/container/{vertical}"}
+                for index, vertical in enumerate((VERTICAL_1, VERTICAL_2), start=1)
+            ]}), encoding="utf-8")
+            argv = ["publisher", "--targets-file", str(targets), "--report-file", str(root / "report.json"),
+                    "--execute", "--cookie", "sessionid=secret; csrftoken=secret", "--skip-oss-multipart",
+                    "--operation-file", str(path), "--auth-retry-delay-seconds", "0"]
+            out = StringIO()
+            with patch("sys.argv", argv), patch.object(publisher.requests, "Session", return_value=studio.session), patch.dict(
+                "os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False
+            ), redirect_stdout(out):
+                self.assertEqual(1, publisher.main())
+            first_pass = copy.deepcopy(json.loads(path.read_text(encoding="utf-8")))
+            boundary = len(studio.calls)
+            initial_calls = studio.calls[:boundary]
+            self.assertEqual(2, sum(call["path"] in {f"/xblock/{VERTICAL_1}", f"/xblock/{VERTICAL_2}"} and call["method"] == "POST" for call in initial_calls))
+            self.assertEqual(4, sum(call["path"].endswith("/handler/file_upload") for call in initial_calls))
+            self.assertEqual(1, sum(call["path"].endswith("/handler/get_files") for call in initial_calls))
+            self.assertFalse(any(call["method"] == "DELETE" for call in initial_calls))
+            code, stdout, stderr = self._run_cli(path, studio, extra_args=("--skip-oss-multipart",))
+            self.assertEqual(1, code, stdout + stderr)
+            state = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([entry["publish"] for entry in first_pass["galleries"]], [entry["publish"] for entry in state["galleries"]])
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("unverified", state["galleries"][1]["validation"]["status"])
+            self.assertEqual([GALLERY_1, studio.summary1], [item["id"] for item in studio.vertical_overrides[VERTICAL_1]["blocks"]])
+            self.assertEqual(3, len(studio.vertical_overrides[VERTICAL_2]["blocks"]))
+            for secret in ("raw-error-secret", "raw-upload-secret", "sessionid=secret", "csrftoken=secret"):
+                self.assertNotIn(secret, out.getvalue() + stdout + path.read_text(encoding="utf-8"))
+
+    def test_cli_repairs_identifiable_extra_vertical_children_and_publishes(self):
+        class StructuralStudio(FakeStudio):
+            def _response(self, method, path, kwargs):
+                blocks = self.vertical_overrides[VERTICAL_1]["blocks"]
+                if method == "DELETE" and path.startswith("/xblock/"):
+                    locator = path[len("/xblock/"):]
+                    blocks[:] = [block for block in blocks if block["id"] != locator]
+                    return FakeResponse({"ok": True})
+                if method == "PUT" and path == f"/xblock/{VERTICAL_1}":
+                    by_id = {block["id"]: block for block in blocks}
+                    blocks[:] = [by_id[locator] for locator in kwargs["json"]["children"]]
+                    return FakeResponse({"ok": True})
+                return super()._response(method, path, kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            path = root / "operation.json"
+            operation = self._operation(manifest)
+            self._write_operation_file(path, operation)
+            summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+            extra = VERTICAL_1.replace("type@vertical", "type@problem").replace("block@vertical", "block@extra")
+            other_html = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@body")
+            studio = StructuralStudio({GALLERY_1: {"files": [
+                {"id": "asset-a", "display_name": "page-001.png"},
+                {"id": "asset-b", "display_name": "page-002.png"},
+            ], "time_config": valid_time_config(2), "audios": [{}]}}, vertical_overrides={VERTICAL_1: {"blocks": [
+                {"id": summary, "category": "html", "display_name": "本节要点"},
+                {"id": extra, "category": "problem"},
+                {"id": other_html, "category": "html", "display_name": "关于本节要点的说明"},
+                {"id": GALLERY_1, "category": "imagesgallery"},
+            ]}})
+            code, stdout, stderr = self._run_cli(path, studio, extra_args=("--skip-oss-multipart",))
+            self.assertEqual(0, code, stdout + stderr)
+            self.assertEqual([GALLERY_1, summary], [block["id"] for block in studio.vertical_overrides[VERTICAL_1]["blocks"]])
+            self.assertTrue(any(call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
+            self.assertEqual(operation["galleries"][0]["publish"], json.loads(path.read_text(encoding="utf-8"))["galleries"][0]["publish"])
+
+    def test_publisher_then_validator_cli_complete_first_pass_before_batch_audit(self):
+        class SharedStudio(FakeStudio):
+            def __init__(self):
+                summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+                extra = VERTICAL_1.replace("type@vertical", "type@problem").replace("block@vertical", "block@extra")
+                super().__init__({}, vertical_overrides={VERTICAL_1: {"blocks": [
+                    {"id": extra, "category": "problem", "display_name": "Extra"},
+                    {"id": summary, "category": "html", "display_name": "本节要点"},
+                ]}})
+
+            def _response(self, method, path, kwargs):
+                if method == "POST" and path == "/xblock/":
+                    self.galleries[GALLERY_1] = {"files": [], "time_config": [], "audios": []}
+                    self.vertical_overrides[VERTICAL_1]["blocks"].append({"id": GALLERY_1, "category": "imagesgallery"})
+                    return FakeResponse({"locator": GALLERY_1})
+                if method == "DELETE" and path.startswith("/xblock/"):
+                    locator = path[len("/xblock/"):]
+                    blocks = self.vertical_overrides[VERTICAL_1]["blocks"]
+                    blocks[:] = [block for block in blocks if block["id"] != locator]
+                    return FakeResponse({"ok": True})
+                if method == "PUT" and path == f"/xblock/{VERTICAL_1}":
+                    blocks = self.vertical_overrides[VERTICAL_1]["blocks"]
+                    by_id = {block["id"]: block for block in blocks}
+                    blocks[:] = [by_id[locator] for locator in kwargs["json"]["children"]]
+                    return FakeResponse({"ok": True})
+                return super()._response(method, path, kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation = self._operation(manifest)
+            operation["galleries"][0]["gallery_locator"] = ""
+            operation["galleries"][0].pop("publish")
+            operation["galleries"][0].pop("initial_vertical_publish")
+            operation["galleries"][0].pop("vertical_integrity")
+            operation_path = root / "operation.json"
+            self._write_operation_file(operation_path, operation)
+            studio = SharedStudio()
+            course_path = root / "course.json"
+            course_path.write_text(json.dumps(make_course_structure({}, studio.vertical_overrides)), encoding="utf-8")
+            argv = ["publisher", "--studio-url", f"https://studio.example.com/container/{VERTICAL_1}",
+                    "--manifest", str(manifest), "--course-structure-json", str(course_path), "--execute",
+                    "--cookie", "sessionid=secret; csrftoken=secret", "--skip-oss-multipart",
+                    "--operation-file", str(operation_path), "--gallery-key", "gallery-1", "--auth-retry-delay-seconds", "0"]
+            output = StringIO()
+            with patch("sys.argv", argv), patch.object(publisher.requests, "Session", return_value=studio.session), patch.dict(
+                "os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False
+            ), redirect_stdout(output):
+                publish_exit = publisher.main()
+            self.assertEqual(0, publish_exit, output.getvalue())
+            before = json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["publish"]
+            boundary = len(studio.calls)
+            validate_exit, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
+            self.assertEqual(0, validate_exit, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual(before, state["galleries"][0]["publish"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            calls = studio.calls
+            self.assertTrue(any(call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}" for call in calls[:boundary]))
+            self.assertTrue(any(call["path"].endswith("/handler/get_files") for call in calls[boundary:]))
+            self.assertEqual([GALLERY_1, VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")],
+                             [block["id"] for block in studio.vertical_overrides[VERTICAL_1]["blocks"]])
+
+    def test_cli_repairs_empty_gallery_without_changing_initial_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            operation = self._operation(manifest)
+            operation["galleries"][0]["publish"]["asset_ids"] = []
+            operation["galleries"][0]["publish"]["images"] = []
+            initial_publish = copy.deepcopy(operation["galleries"][0]["publish"])
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {"files": [], "time_config": valid_time_config(2), "audios": [{}]}})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual(initial_publish, gallery["publish"])
+            self.assertEqual("verified", gallery["validation"]["status"])
+            self.assertEqual(1, gallery["repair_attempts"])
+            self.assertEqual(["page-001.png", "page-002.png"], [item["display_name"] for item in studio.galleries[GALLERY_1]["files"]])
+
     def test_valid_time_config_entries_rejects_malformed_or_duplicate_pages(self):
         self.assertTrue(publisher.valid_time_config_entries(valid_time_config(2)))
         invalid_configs = (
@@ -512,7 +742,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(1, verification["subsection_count"])
             self.assertEqual([VERTICAL_1], [item["vertical_locator"] for item in verification["subsections"]])
 
-    def test_cli_rejects_expected_vertical_snapshot_outside_final_two_child_contract(self):
+    def test_cli_uses_live_retained_components_when_prior_expectation_is_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -535,9 +765,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
 
-            self.assertEqual(1, exit_code, stdout + stderr)
+            self.assertEqual(0, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
-            self.assertEqual("mismatch", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
             self.assertFalse(state["galleries"][0]["validation"]["repairable"])
             self.assertEqual(0, state["galleries"][0]["repair_attempts"])
             self.assertFalse(any(call["path"].startswith(f"/xblock/{GALLERY_1}/") for call in studio.calls))
@@ -712,7 +942,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertIn("https://studio.example.com/container/" + VERTICAL_1, report["text"])
             self.assertIn("暂时无法读取", report["text"])
 
-    def test_final_course_check_compares_targeted_vertical_with_publisher_expectation(self):
+    def test_final_course_check_uses_identifiable_live_retained_components(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -728,12 +958,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
 
-            self.assertEqual(1, exit_code, stdout + stderr)
+            self.assertEqual(0, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             target = next(item for item in state["course_structure_verification"]["subsections"] if item["vertical_locator"] == VERTICAL_1)
-            self.assertEqual("issue", target["structure_status"])
-            self.assertIn("expected_structure_contract_invalid", target["issues"])
-            self.assertFalse(state["batch_result"]["all_sections_verified"])
+            self.assertEqual("verified", target["structure_status"])
+            self.assertEqual([], target["issues"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
 
     def test_final_course_check_uses_current_structure_after_unresolved_write_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -841,7 +1071,8 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(1, gallery["repair_attempts"])
             self.assertEqual("completed", gallery["repair_history"][0]["status"])
             self.assertEqual("completed", gallery["repair_history"][0]["vertical_publish"]["status"])
-            self.assertEqual(["asset-new-001", "asset-new-002"], gallery["publish"]["asset_ids"], json.dumps(state, ensure_ascii=False, indent=2))
+            self.assertEqual(["asset-checkpoint-orphan"], gallery["publish"]["asset_ids"])
+            self.assertEqual(["asset-new-001", "asset-new-002"], gallery["repair_publish"]["asset_ids"])
             self.assertEqual("verified", gallery["validation"]["status"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
 
@@ -1291,7 +1522,8 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual("sections", report["mode"])
             self.assertEqual([], report["groups"])
             self.assertEqual("", report["summary"])
-            self.assertEqual("", report["text"])
+            self.assertIn("首次发布", report["text"])
+            self.assertIn("后置审核", report["text"])
 
     def test_operator_report_shows_only_live_findings_with_subsection_links(self):
         with tempfile.TemporaryDirectory() as tmp:

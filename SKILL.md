@@ -19,7 +19,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 ### 1. 发布
 
-按目标顺序推送每个 Gallery，使用来源 block_type 找到并替换对应正文组件，保留“本节要点”HTML，并发布小节。首次发布尝试全部结束后，operation 文件应记录每个目标的 locator 和安全操作证据。写入、重跑和恢复规则见 [发布和替换规则](references/publishing-and-replacement.md)。
+按目标顺序先写入每个 Gallery，再读取小节结构。仅当本批 Gallery 与直接子组件中唯一的“本节要点” HTML 均可确认时，删除其余直接组件并依次排在第一、第二；无法确认时跳过清理，仍尝试发布小节。图片 ID 无法对账时记录部分完成，继续独立写入及小节发布。所有目标首次尝试结束后才调用批次 validator。写入、重跑和恢复规则见 [发布和替换规则](references/publishing-and-replacement.md)。
 
 ### 2. 自审
 
@@ -31,7 +31,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 
 ## 完成与报告
 
-所有目标都应有最终审核状态并写入 operation 文件。全部通过时，`batch_result.all_sections_verified` 为 `true`。否则从 `batch_result.operator_report.text` 取面向运营的说明；通过项和成功请求不逐条展示。报告规则见 [运营报告规则](references/operator-report.md)。详细步骤、资源 ID、HTTP 状态、修复历史和脱敏诊断留在独立的 `batch-operation.json` 记录中。
+所有目标都应有最终审核状态并写入 operation 文件。`publish` 和 `initial_vertical_publish` 记录首次发布执行结果；审核、修复及复审另行记录，不改写首次结果。`batch_result.all_sections_verified` 只表示审核是否全部通过。从 `batch_result.operator_report.text` 取面向运营的说明，见 [运营报告规则](references/operator-report.md)。详细步骤、资源 ID、HTTP 状态、修复历史和脱敏诊断留在独立的 `batch-operation.json` 记录中。
 
 验证器命令：
 

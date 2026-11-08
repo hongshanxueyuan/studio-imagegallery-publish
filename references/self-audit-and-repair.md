@@ -15,6 +15,7 @@ Studio 课程结构必须是可读取的完整树；课程、chapter、sequentia
 - Studio 当前保存的小节已正式发布且没有待发布改动。仅凭发布请求成功不能通过；Studio 返回值不足以确认当前状态时标为无法确认。
 
 Gallery 读取、operation 证据或课程结构无效、不可读或不足以判断时，标记为无法确认。继续独立目标和检查；不根据无法确认结果发起课程写入。
+Studio 返回有效的零图片列表而本地 manifest 有页面时，即使首次发布没有 asset ID，也确认图片不一致并允许安全修复。
 
 ## 安全修复
 
@@ -26,7 +27,7 @@ Gallery 读取、operation 证据或课程结构无效、不可读或不足以�
 
 ## 操作记录
 
-每个 Gallery 的 `validation` 保存审核轮次、预期、实际观察值、检查状态和安全错误摘要；`repair_attempts`、`repair_history` 保存修复次数、步骤与发布结果。`course_structure_verification` 保存目标小节结构与当前发布状态。`batch_result` 汇总每个目标，并写入面向运营的 `operator_report.text`。
+每个 Gallery 的 `publish` 和 `initial_vertical_publish` 保留首次发布执行结果；`validation` 保存审核轮次、预期、实际观察值、检查状态和安全错误摘要；`repair_publish`、`repair_attempts`、`repair_history` 保存修复 checkpoint、次数、步骤与发布结果。`course_structure_verification` 保存目标小节结构与当前发布状态。`batch_result.all_sections_verified` 只描述审核结果，`operator_report.text` 分别汇总首次发布、审核和修复。
 
 运行入口：
 
