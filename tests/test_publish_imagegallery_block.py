@@ -2596,15 +2596,26 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             manifest = self._write_multi_page_manifest_bundle(root)
             operation = root / "operation.json"
             self._write_operation_file(operation, manifest)
-            studio = self._FakeStudioSession(missing_upload_id=True, incomplete_files=True)
+            studio = self._FakeStudioSession(
+                missing_upload_id=True,
+                incomplete_files=True,
+                fail_audio_prepare_once=True,
+            )
             first, stdout, _ = self._run_publisher_cli(manifest, operation, studio)
             second, retry_stdout, _ = self._run_publisher_cli(manifest, operation, studio)
             self.assertEqual((1, 1), (first, second), stdout + retry_stdout)
             self.assertEqual(2, sum(path.endswith("/handler/file_upload") for _method, path in studio.calls))
             self.assertEqual(1, sum(path.endswith("/handler/get_files") for _method, path in studio.calls))
+            self.assertEqual(2, studio.audio_prepare_count)
             self.assertFalse(any(method == "DELETE" for method, _path in studio.calls))
             state = json.loads(operation.read_text(encoding="utf-8"))
             self.assertEqual("partial", state["galleries"][0]["publish"]["status"])
+            self.assertTrue(
+                any(
+                    step["step"] == "upload_audio_prepare" and step["status"] == "ok"
+                    for step in state["galleries"][0]["publish"]["steps"]
+                )
+            )
             self.assertNotIn("response", json.dumps(state))
 
     def test_cli_resumes_from_audio_stage_without_reuploading_confirmed_images(self) -> None:

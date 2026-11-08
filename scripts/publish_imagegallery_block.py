@@ -2953,8 +2953,16 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
     images = checkpoint_images or []
     images_incomplete = False
     if checkpoint and image_started and checkpoint_images is None:
-        images = run_reconciliation("resume_image_reconciliation")
-        if checkpoint:
+        if checkpoint.state["reconciliation_count"] >= 1:
+            images_incomplete = True
+        else:
+            try:
+                images = run_reconciliation("resume_image_reconciliation")
+            except Exception:
+                images_incomplete = True
+        if not images_incomplete and len(images) != len(manifest["items"]):
+            images_incomplete = True
+        if checkpoint and not images_incomplete:
             checkpoint.set_stage("images_ordered" if interrupted_order else "images_uploaded")
     elif checkpoint and checkpoint_images and completed_rank() < stage_order["images_uploaded"]:
         checkpoint.set_stage("images_uploaded")
@@ -2962,7 +2970,7 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
     if checkpoint and checkpoint.state["status"] == "completed" and checkpoint.state["completed_stage"] == "saved":
         images = checkpoint_images or []
     else:
-        if not images:
+        if not images and not images_incomplete:
             missing_image_id = False
             for idx, item in enumerate(manifest["items"], start=1):
                 page_image = manifest_image_name(item)
