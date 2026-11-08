@@ -2028,10 +2028,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 store()
                 continue
             if validation.get("repair_scope") == "publish_vertical":
-                repair_targets.append((entry, None, resume_attempt))
+                repair_targets.append((entry, "publish_vertical", None, resume_attempt))
                 continue
             if validation.get("repair_scope") == "structure":
-                repair_targets.append((entry, "structure", resume_attempt))
+                repair_targets.append((entry, "structure", None, resume_attempt))
                 continue
             try:
                 manifest = publisher.ensure_manifest(Path(str(entry.get("manifest", ""))).expanduser().resolve())
@@ -2040,13 +2040,13 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 validation["repair_skip_reason"] = "The local Gallery package could not be checked before repair"
                 store()
                 continue
-            repair_targets.append((entry, manifest, resume_attempt))
+            repair_targets.append((entry, "gallery", manifest, resume_attempt))
         if not repair_targets:
             break
-        for entry, manifest, resume_attempt in repair_targets:
+        for entry, repair_mode, manifest, resume_attempt in repair_targets:
             validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
             try:
-                if manifest == "structure":
+                if repair_mode == "structure":
                     history = entry.setdefault("repair_history", [])
                     attempt = resume_attempt or {"attempt": len(history) + 1, "repair_round": cycle, "repair_mode": "structure", "steps": []}
                     if resume_attempt is None:
@@ -2062,7 +2062,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                     if expected is not None:
                         entry.setdefault("vertical_integrity", {})["expected"] = expected
                     store()
-                elif manifest is None:
+                elif repair_mode == "publish_vertical":
                     republish_vertical_for_pending_changes(
                         client,
                         entry,
