@@ -9,17 +9,17 @@ import json
 import os
 import re
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import publish_imagegallery_block as publisher
 
 
 DEFAULT_ADAPTER = Path(__file__).resolve().parents[1] / "references" / "adapter.template.json"
 DEFAULT_TIMEOUT = 30
-IMAGE_PAGE_SIZE = 50
 MAX_REPAIR_CYCLES = 2
 class BatchValidationError(RuntimeError):
     def __init__(self, step: str, summary: str, *, http_status: int | None = None):
@@ -472,7 +472,6 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
     locator = safe_locator(entry.get("gallery_locator"))
     expected_count = manifest_image_count(manifest)
     expected_images, expected_asset_ids, checkpoint_status = expected_image_records(entry, manifest)
-    expected_names = [image["image"] for image in expected_images]
     referer = publisher.build_container_block_url(client.studio_base, locator)
     observed: dict[str, Any] = {}
     checks: dict[str, str] = {}
@@ -484,9 +483,6 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
     if files is None:
         checks["images"] = "unverified"
         checks["image_count"] = "unverified"
-        checks["image_names"] = "unverified"
-        checks["image_asset_ids"] = "unverified"
-        checks["image_order"] = "unverified"
     else:
         observed["image_file_count"] = len(files)
         observed["image_total_count"] = total_count
@@ -507,27 +503,7 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
             })
         observed["images"] = observed_images
         checks["image_count"] = "unverified" if len(files) != total_count else "pass" if len(files) == expected_count else "mismatch"
-        observed_names = [image["image"] for image in observed_images]
-        if all(observed_names):
-            checks["image_names"] = "pass" if sorted(observed_names) == sorted(expected_names) else "mismatch"
-            checks["image_order"] = "pass" if observed_names == expected_names else "mismatch"
-        else:
-            checks["image_names"] = "unverified"
-            checks["image_order"] = "unverified"
-        observed_asset_ids = [image["asset_id"] for image in observed_images]
-        if not files and total_count == 0 and expected_count:
-            checks["image_asset_ids"] = "mismatch"
-        elif expected_asset_ids is None:
-            checks["image_asset_ids"] = checkpoint_status
-        else:
-            checks["image_asset_ids"] = "pass" if observed_asset_ids == expected_asset_ids else "mismatch"
-        image_checks = [checks[key] for key in ("image_count", "image_names", "image_asset_ids", "image_order")]
-        if "mismatch" in image_checks:
-            checks["images"] = "mismatch"
-        elif "unverified" in image_checks:
-            checks["images"] = "unverified"
-        else:
-            checks["images"] = "pass"
+        checks["images"] = checks["image_count"]
 
     config_payload, config_diagnostic = read_json_call(
         client,
@@ -541,10 +517,19 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         diagnostics.append(config_diagnostic)
     play_config = config_payload.get("play_config") if isinstance(config_payload, dict) else None
     time_config = play_config.get("time_config") if isinstance(play_config, dict) else None
-    if config_diagnostic and config_diagnostic["status"] != "ok" or not isinstance(time_config, list):
+    play_config_read_failed = bool(config_diagnostic and config_diagnostic["status"] != "ok") or not isinstance(play_config, dict)
+    if play_config_read_failed:
         checks["play_config"] = "unverified"
         if not (config_diagnostic and config_diagnostic["status"] != "ok"):
             diagnostics.append({"step": "get_play_config", "status": "invalid_response", "error_summary": "Studio play_config.time_config is not a list"})
+    elif "time_config" not in play_config:
+        observed["time_config_count"] = 0
+        observed["time_config_entries_valid"] = False
+        checks["play_config"] = "mismatch"
+    elif not isinstance(time_config, list):
+        play_config_read_failed = True
+        checks["play_config"] = "unverified"
+        diagnostics.append({"step": "get_play_config", "status": "invalid_response", "error_summary": "Studio play_config.time_config is not a list"})
     else:
         observed["time_config_count"] = len(time_config)
         timing_entries_valid = publisher.valid_time_config_entries(time_config)
@@ -554,13 +539,14 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         show_subtitles_invalid = show_subtitles_present and not isinstance(show_subtitles, bool)
         if isinstance(show_subtitles, bool):
             observed["show_subtitles"] = show_subtitles
-        subtitles_enabled = not show_subtitles_present or show_subtitles is True
-        if files is None or show_subtitles_invalid:
+        if show_subtitles_invalid:
+            play_config_read_failed = True
+        if show_subtitles_invalid:
             checks["play_config"] = "unverified"
         else:
             checks["play_config"] = (
                 "pass"
-                if len(time_config) == len(files) and timing_entries_valid and subtitles_enabled
+                if len(time_config) == expected_count and timing_entries_valid
                 else "mismatch"
             )
 
@@ -604,6 +590,8 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         "checks": checks,
         "checked_at": utc_now(),
     }
+    if play_config_read_failed:
+        result["play_config_read_failed"] = True
     if failed:
         result["failed_step"] = failed["step"]
         if isinstance(failed.get("http_status"), int):
@@ -627,97 +615,6 @@ def invalid_gallery_result(entry: dict[str, Any], expected_count: int | None, *,
     return result
 
 
-def scan_course_gallery_references(
-    client: StudioClient,
-    *,
-    expected_gallery_locators: set[str],
-) -> tuple[dict[str, list[str]] | None, list[str], str]:
-    structure_payload, diagnostic = read_json_call(
-        client,
-        "load_live_course_structure",
-        "GET",
-        f"{client.studio_base}/course/{client.course_key}",
-        params={"format": "concise"},
-        referer=client.studio_url,
-    )
-    if diagnostic and diagnostic["status"] != "ok":
-        return None, [], str(diagnostic.get("error_summary") or "Studio course structure could not be verified")
-    if not course_structure_payload_is_complete(structure_payload):
-        return None, [], "Studio course structure is incomplete"
-    try:
-        structure = publisher.normalize_course_structure_payload(structure_payload)
-    except Exception:
-        return None, [], "Studio course structure could not be normalized"
-    if not isinstance(structure.get("chapters"), list):
-        return None, [], "Studio course structure has an invalid shape"
-    locators: list[str] = []
-    seen: set[str] = set()
-    for record in publisher.iter_section_vertical_records(structure):
-        vertical = record.get("vertical") if isinstance(record, dict) else None
-        if not isinstance(vertical, dict):
-            continue
-        for block in vertical.get("blocks", []):
-            if not isinstance(block, dict) or publisher.block_category(block) != "imagesgallery":
-                continue
-            locator = safe_locator(publisher.block_locator(block))
-            if not locator or locator in seen:
-                return None, [], "Studio course structure contains a missing or duplicate Gallery locator"
-            seen.add(locator)
-            locators.append(locator)
-    if not locators or not expected_gallery_locators.issubset(seen):
-        return None, locators, "Studio course structure no longer contains the complete Gallery inventory"
-    references: dict[str, list[str]] = {}
-    for locator in locators:
-        files, total_count, file_diagnostic = get_files(client, locator)
-        if file_diagnostic and file_diagnostic["status"] != "ok" or files is None:
-            return None, locators, "A complete Gallery reference scan could not be verified"
-        if len(files) != total_count:
-            return None, locators, "A complete Gallery reference scan could not be verified"
-        for item in files:
-            asset_id = str(item.get("id") or item.get("asset_key") or "").strip()
-            references.setdefault(asset_id, []).append(locator)
-    return references, locators, ""
-
-
-def list_course_assets(client: StudioClient) -> tuple[dict[str, dict[str, Any]] | None, str]:
-    assets_by_id: dict[str, dict[str, Any]] = {}
-    page = 0
-    expected_total: int | None = None
-    while page < 10000:
-        payload, diagnostic = read_json_call(
-            client,
-            "list_course_assets",
-            "GET",
-            f"{client.studio_base}/assets/{client.course_key}/",
-            params={"sort": "uploadDate", "direction": "desc", "asset_type": "Images", "page_size": IMAGE_PAGE_SIZE, "page": page},
-            referer=client.studio_url,
-        )
-        if diagnostic and diagnostic["status"] != "ok" or not isinstance(payload, dict) or not isinstance(payload.get("assets"), list):
-            return None, "Studio image asset listing could not be verified"
-        assets = payload["assets"]
-        if any(not isinstance(asset, dict) or not isinstance(asset.get("id"), str) or not asset["id"] for asset in assets):
-            return None, "Studio image asset listing contains an invalid record"
-        total = payload.get("totalCount")
-        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-            return None, "Studio image asset listing has an invalid totalCount"
-        if expected_total is None:
-            expected_total = total
-        elif total != expected_total:
-            return None, "Studio image asset listing changed during the read"
-        for asset in assets:
-            if asset["id"] in assets_by_id:
-                return None, "Studio image asset listing contains duplicate IDs"
-            assets_by_id[asset["id"]] = asset
-        if len(assets_by_id) == expected_total:
-            return assets_by_id, ""
-        if len(assets_by_id) > expected_total or not assets:
-            return None, "Studio image asset listing is incomplete"
-        if "page" in payload and payload.get("page") != page:
-            return None, "Studio image asset listing returned an unexpected page"
-        page += 1
-    return None, "Studio image asset listing exceeded the page limit"
-
-
 def repair_gallery(
     client: StudioClient,
     operation: dict[str, Any],
@@ -725,311 +622,321 @@ def repair_gallery(
     manifest: dict[str, Any],
     args: argparse.Namespace,
     adapter: dict[str, Any],
-    expected_gallery_locators: set[str],
     store,
     attempt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     history = entry.setdefault("repair_history", [])
+    validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+    checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
+    repair_images = checks.get("images") == "mismatch"
+    repair_audio = checks.get("audio_bindings") == "mismatch"
+    repair_play_config = (
+        checks.get("play_config") == "mismatch"
+        or validation.get("play_config_read_failed") is True
+    )
+    repair_components = [
+        name
+        for name, requested in (
+            ("images", repair_images),
+            ("audio_bindings", repair_audio),
+            ("play_config", repair_play_config),
+        )
+        if requested
+    ]
     if attempt is None:
-        prior_publish = safe_publish_state(entry.get("publish"))
         attempt = {
-            "attempt": len(history) + 1,
+            "attempt": max(len(history), int(entry.get("repair_attempts", 0))) + 1,
             "status": "running",
             "started_at": utc_now(),
             "trigger_validation": copy.deepcopy(entry.get("validation", {})),
-            "initial_publish": prior_publish,
+            "initial_publish": safe_publish_state(entry.get("publish")),
+            "repair_components": repair_components,
             "steps": [],
         }
         history.append(attempt)
     else:
-        prior_publish = safe_publish_state(attempt.get("initial_publish"))
         attempt["status"] = "running"
         attempt["resumed_at"] = utc_now()
         for key in ("finished_at", "failed_step", "error_summary", "http_status"):
             attempt.pop(key, None)
+        attempt["repair_components"] = repair_components
+    request_id = operation.get("repair_request_id")
+    if isinstance(request_id, str) and request_id:
+        attempt["request_id"] = request_id
     entry["repair_attempts"] = max(int(entry.get("repair_attempts", 0)), int(attempt.get("attempt", 1)))
     store()
 
     locator = safe_locator(entry.get("gallery_locator"))
     referer = publisher.build_container_block_url(client.studio_base, locator)
-    files, total_count, diagnostic = get_files(client, locator)
-    if files is None:
-        raise BatchValidationError("get_files_before_repair", (diagnostic or {}).get("error_summary", "Gallery files could not be verified before repair"), http_status=(diagnostic or {}).get("http_status"))
-    if len(files) != total_count:
-        raise BatchValidationError("get_files_before_repair", "Gallery file listing was incomplete before repair")
-    removal_asset_keys: list[str] = []
-    candidate_asset_ids: list[str] = []
-    saved_candidates = attempt.get("candidate_asset_ids")
-    if isinstance(saved_candidates, list) and all(isinstance(item, str) and item for item in saved_candidates):
-        candidate_asset_ids = list(dict.fromkeys(saved_candidates))
-    else:
-        for item in files:
-            asset_id = str(item.get("id") or item.get("asset_key") or "").strip()
-            asset_key = str(item.get("asset_key") or item.get("id") or "").strip()
-            if not asset_id or not asset_key or asset_id in candidate_asset_ids or asset_key in removal_asset_keys:
-                raise BatchValidationError("get_files_before_repair", "Gallery returned duplicate or unidentified assets before repair")
-            candidate_asset_ids.append(asset_id)
-            removal_asset_keys.append(asset_key)
-        for asset_id in prior_publish.get("asset_ids", []):
-            if asset_id not in candidate_asset_ids:
-                candidate_asset_ids.append(asset_id)
-        for image in prior_publish.get("images", []):
-            asset_id = image.get("asset_id") if isinstance(image, dict) else ""
-            if isinstance(asset_id, str) and asset_id and asset_id not in candidate_asset_ids:
-                candidate_asset_ids.append(asset_id)
-    saved_removal_keys = attempt.get("removal_asset_keys")
-    if isinstance(saved_removal_keys, list) and all(isinstance(item, str) and item for item in saved_removal_keys):
-        removal_asset_keys = list(dict.fromkeys(saved_removal_keys))
-    else:
-        candidate_set = set(candidate_asset_ids)
-        for item in files:
-            asset_id = str(item.get("id") or item.get("asset_key") or "").strip()
-            asset_key = str(item.get("asset_key") or item.get("id") or "").strip()
-            if asset_id in candidate_set and asset_key and asset_key not in removal_asset_keys:
-                removal_asset_keys.append(asset_key)
-    attempt["candidate_asset_ids"] = candidate_asset_ids
-    attempt["removal_asset_keys"] = removal_asset_keys
-    store()
-
     attempt_steps = attempt.setdefault("steps", [])
-    remove_step = next((step for step in attempt_steps if step.get("step") == "remove_gallery_files"), None)
-    if removal_asset_keys and (not remove_step or remove_step.get("status") != "completed"):
-        current_keys = {
-            str(item.get("asset_key") or item.get("id") or "").strip()
-            for item in files
-            if isinstance(item, dict)
-        }
-        pending_removals = [asset_key for asset_key in removal_asset_keys if asset_key in current_keys]
-        if not remove_step:
-            remove_step = {"step": "remove_gallery_files", "status": "started", "asset_ids": candidate_asset_ids}
-            attempt_steps.append(remove_step)
-        else:
-            remove_step.update({"status": "started", "asset_ids": candidate_asset_ids})
-            remove_step.pop("error_summary", None)
-            remove_step.pop("http_status", None)
-        store()
-        if not pending_removals:
-            remove_step.update({"status": "completed", "verified_absent": True})
-            store()
-        else:
-            try:
-                _payload, status, _warning, retries = client.request_json(
-                    "remove_gallery_files",
-                    "POST",
-                    f"{client.studio_base}/xblock/{locator}/handler/remove_files",
-                    body={"assets": pending_removals},
-                    referer=referer,
-                )
-                remove_step.update({"status": "completed", "http_status": status})
-                if retries:
-                    remove_step["auth_retry_attempts"] = len(retries)
-                    remove_step["auth_retry_events"] = retries
-                store()
-            except Exception as exc:
-                remove_step.update({"status": "failed", "error_summary": safe_error(exc, "remove_gallery_files")})
-                status = safe_http_status(exc)
-                if status is not None:
-                    remove_step["http_status"] = status
-                store()
-                raise BatchValidationError("remove_gallery_files", remove_step["error_summary"], http_status=status) from None
+    failures: list[BatchValidationError] = []
+    uploaded_images: list[dict[str, Any]] = []
 
-    if candidate_asset_ids:
-        after_remove, after_total_count, verify_diagnostic = get_files(client, locator)
-        if after_remove is None:
-            raise BatchValidationError("verify_removed_gallery_files", (verify_diagnostic or {}).get("error_summary", "Gallery file removal could not be verified"), http_status=(verify_diagnostic or {}).get("http_status"))
-        if len(after_remove) != after_total_count:
-            raise BatchValidationError("verify_removed_gallery_files", "Gallery file listing was incomplete after removal")
-        after_ids = {str(item.get("id") or item.get("asset_key") or "") for item in after_remove}
-        if any(asset_id in after_ids for asset_id in candidate_asset_ids):
-            raise BatchValidationError("verify_removed_gallery_files", "Gallery still references an image scheduled for replacement")
-
-    cleanup = attempt.get("asset_cleanup")
-    if not isinstance(cleanup, dict):
-        cleanup = {"status": "complete", "steps": [], "deleted_asset_ids": [], "retained_asset_ids": [], "skipped_asset_ids": []}
-        attempt["asset_cleanup"] = cleanup
-    cleanup.setdefault("steps", [])
-    cleanup.setdefault("deleted_asset_ids", [])
-    cleanup.setdefault("retained_asset_ids", [])
-    cleanup.setdefault("skipped_asset_ids", [])
-    cleanup["status"] = "complete"
-    cleanup.pop("error_summary", None)
-    store()
-    if candidate_asset_ids:
-        references, _locators, reference_error = scan_course_gallery_references(
-            client,
-            expected_gallery_locators=expected_gallery_locators,
-        )
-        assets, asset_error = list_course_assets(client)
-        if references is None or assets is None:
-            cleanup["status"] = "incomplete"
-            cleanup["error_summary"] = (reference_error or asset_error or "Course asset/reference scan could not be verified")[:240]
-            for asset_id in candidate_asset_ids:
-                asset_step = next((step for step in cleanup["steps"] if step.get("asset_id") == asset_id), None)
-                if not asset_step:
-                    asset_step = {"asset_id": asset_id}
-                    cleanup["steps"].append(asset_step)
-                if asset_step.get("status") not in {"deleted", "retained", "not_found"}:
-                    asset_step.update({"status": "skipped", "reason": "incomplete_course_scan"})
-                    if asset_id not in cleanup["skipped_asset_ids"]:
-                        cleanup["skipped_asset_ids"].append(asset_id)
-            store()
-        else:
-            cleanup["skipped_asset_ids"] = []
-            for asset_id in candidate_asset_ids:
-                asset_step = next((step for step in cleanup["steps"] if step.get("asset_id") == asset_id), None)
-                if not asset_step:
-                    asset_step = {"asset_id": asset_id, "status": "pending"}
-                    cleanup["steps"].append(asset_step)
-                if asset_step.get("status") in {"deleted", "retained", "not_found"}:
-                    continue
-                if asset_id not in assets:
-                    was_deleting = asset_step.get("status") == "started"
-                    asset_step.update({
-                        "status": "deleted" if was_deleting else "not_found",
-                        "reason": "delete_confirmed_by_asset_listing" if was_deleting else "asset_not_in_complete_course_listing",
-                    })
-                    if was_deleting and asset_id not in cleanup["deleted_asset_ids"]:
-                        cleanup["deleted_asset_ids"].append(asset_id)
-                    store()
-                    continue
-                referenced_by = sorted(set(references.get(asset_id, [])))
-                if referenced_by:
-                    asset_step.update({"status": "retained", "reason": "currently_referenced", "referenced_by": referenced_by})
-                    if asset_id not in cleanup["retained_asset_ids"]:
-                        cleanup["retained_asset_ids"].append(asset_id)
-                    store()
-                    continue
-
-                fresh_references, _fresh_locators, fresh_error = scan_course_gallery_references(
-                    client,
-                    expected_gallery_locators=expected_gallery_locators,
-                )
-                if fresh_references is None:
-                    asset_step.update({"status": "skipped", "reason": "pre_delete_reference_scan_incomplete", "error_summary": fresh_error[:240]})
-                    cleanup["status"] = "incomplete"
-                    if asset_id not in cleanup["skipped_asset_ids"]:
-                        cleanup["skipped_asset_ids"].append(asset_id)
-                    store()
-                    continue
-                referenced_by = sorted(set(fresh_references.get(asset_id, [])))
-                if referenced_by:
-                    asset_step.update({"status": "retained", "reason": "referenced_before_delete", "referenced_by": referenced_by})
-                    if asset_id not in cleanup["retained_asset_ids"]:
-                        cleanup["retained_asset_ids"].append(asset_id)
-                    store()
-                    continue
-                asset_step["status"] = "started"
-                asset_step["references_checked_at"] = utc_now()
-                store()
-                try:
-                    _payload, status, _warning, retries = client.request_json(
-                        "delete_course_asset",
-                        "DELETE",
-                        f"{client.studio_base}/assets/{client.course_key}/{quote(asset_id, safe='')}",
-                        referer=client.studio_url,
-                    )
-                    asset_step.update({"status": "deleted", "http_status": status})
-                    if retries:
-                        asset_step["auth_retry_attempts"] = len(retries)
-                        asset_step["auth_retry_events"] = retries
-                    if asset_id not in cleanup["deleted_asset_ids"]:
-                        cleanup["deleted_asset_ids"].append(asset_id)
-                except Exception as exc:
-                    asset_step.update({"status": "failed", "error_summary": safe_error(exc, "delete_course_asset")})
-                    status = safe_http_status(exc)
-                    if status is not None:
-                        asset_step["http_status"] = status
-                    cleanup["status"] = "incomplete"
-                store()
-
-    attempt["prior_asset_ids"] = list(prior_publish.get("asset_ids", []))
-    if not attempt.get("publish_started") and not attempt.get("publish"):
-        entry["repair_publish"] = {
-            "gallery_key": entry["gallery_key"],
-            "status": "in_progress",
-            "completed_stage": "block_created",
-            "active_step": "",
-            "failed_step": "",
-            "asset_ids": [],
-            "images": [],
-            "steps": [],
-            "images_started": False,
-            "reconciliation_count": 0,
-        }
-    attempt["publish_started"] = True
-    store()
-    publish_args = argparse.Namespace(
-        studio_url=args.studio_url,
-        manifest=str(Path(entry["manifest"]).expanduser().resolve()),
-        adapter=args.adapter,
-        execute=True,
-        timeout=args.timeout,
-        vertical_block_id=entry["vertical_locator"],
-        block_url=publisher.build_container_block_url(client.studio_base, entry["vertical_locator"]),
-        account=args.account,
-        password=args.password,
-        courses_base=args.courses_base,
-        cookie=args.cookie,
-        csrf_token=args.csrf_token,
-        skip_oss_multipart=args.skip_oss_multipart,
-        auth_retry_max_retries=args.auth_retry_max_retries,
-        auth_retry_delay_seconds=args.auth_retry_delay_seconds,
-        operation_file=str(args.operation_file),
-        gallery_key=entry["gallery_key"],
-        checkpoint_field="repair_publish",
-    )
-    try:
-        checkpoint = safe_publish_state(entry.get("repair_publish"))
-        if checkpoint.get("status") == "completed" and checkpoint.get("completed_stage") == "saved":
-            publish_result = checkpoint
-        else:
-            publish_result = publisher.run_single_publish(publish_args)
-            refresh_publish_checkpoint(entry, Path(args.operation_file).expanduser().resolve())
-        attempt["publish"] = {
-            "status": "completed",
-            "completed_stage": publish_result.get("completed_stage", "saved"),
-            "asset_ids": [item for item in publish_result.get("asset_ids", []) if isinstance(item, str)],
-            "steps": [publisher.safe_step_record(item) for item in publish_result.get("steps", []) if isinstance(item, dict)],
-        }
-    except Exception as exc:
-        refresh_publish_checkpoint(entry, Path(args.operation_file).expanduser().resolve())
-        attempt["status"] = "failed"
-        attempt["failed_step"] = publisher.safe_step_name(getattr(exc, "step_name", getattr(exc, "step", "republish_gallery")))
-        attempt["error_summary"] = safe_error(exc, attempt["failed_step"])
-        if safe_http_status(exc) is not None:
-            attempt["http_status"] = safe_http_status(exc)
-        attempt["finished_at"] = utc_now()
-        store()
-        return attempt
-    store()
-
-    vertical_publish = attempt.get("vertical_publish")
-    if not isinstance(vertical_publish, dict) or vertical_publish.get("status") != "completed":
-        vertical_publish = {"step": "publish_vertical", "status": "started"}
-        attempt["vertical_publish"] = vertical_publish
+    def recorded_step(step: str, action: Callable[[], dict[str, Any] | None]) -> dict[str, Any]:
+        record = {"step": step, "status": "started"}
+        attempt_steps.append(record)
         store()
         try:
-            context = {
-                "studio_base": client.studio_base,
-                "vertical_block_id": entry["vertical_locator"],
-                "block_url": publisher.build_container_block_url(client.studio_base, entry["vertical_locator"]),
-                "csrftoken": client.csrftoken,
-            }
-            record, retries = client.request_template("publish_vertical", adapter["publish_vertical"], context)
-            vertical_publish.update({"status": "completed", "http_status": record.get("http_status")})
-            if retries:
-                vertical_publish["auth_retry_attempts"] = len(retries)
-                vertical_publish["auth_retry_events"] = retries
+            details = action()
+            if isinstance(details, dict):
+                record.update(details)
+            record["status"] = "completed"
+            store()
+            return record
         except Exception as exc:
-            vertical_publish.update({"status": "failed", "error_summary": safe_error(exc, "publish_vertical")})
-            if safe_http_status(exc) is not None:
-                vertical_publish["http_status"] = safe_http_status(exc)
-        attempt["finished_at"] = utc_now()
-        attempt["status"] = "completed" if vertical_publish["status"] == "completed" else "failed"
-        store()
+            record["status"] = "failed"
+            record["error_summary"] = safe_error(exc, step)
+            status = safe_http_status(exc)
+            if status is not None:
+                record["http_status"] = status
+            store()
+            if isinstance(exc, BatchValidationError):
+                raise
+            raise BatchValidationError(step, record["error_summary"], http_status=status) from None
 
+    if repair_images:
+        try:
+            files, total_count, diagnostic = get_files(client, locator)
+            if files is None:
+                raise BatchValidationError(
+                    "get_files_before_repair",
+                    (diagnostic or {}).get("error_summary", "Gallery files could not be verified before repair"),
+                    http_status=(diagnostic or {}).get("http_status"),
+                )
+            if len(files) != total_count:
+                raise BatchValidationError("get_files_before_repair", "Gallery file listing was incomplete before repair")
+            removal_keys: list[str] = []
+            for item in files:
+                asset_key = str(item.get("asset_key") or item.get("id") or "").strip()
+                if not asset_key or asset_key in removal_keys:
+                    raise BatchValidationError("get_files_before_repair", "Gallery image references could not be identified safely")
+                removal_keys.append(asset_key)
+            if removal_keys:
+                recorded_step(
+                    "remove_gallery_files",
+                    lambda: {
+                        "http_status": client.request_json(
+                            "remove_gallery_files",
+                            "POST",
+                            f"{client.studio_base}/xblock/{locator}/handler/remove_files",
+                            body={"assets": removal_keys},
+                            referer=referer,
+                        )[1]
+                    },
+                )
+                remaining, remaining_total, remaining_diagnostic = get_files(client, locator)
+                if remaining is None or len(remaining) != remaining_total or remaining:
+                    raise BatchValidationError(
+                        "verify_removed_gallery_files",
+                        (remaining_diagnostic or {}).get("error_summary", "Gallery image references could not be cleared before replacement"),
+                        http_status=(remaining_diagnostic or {}).get("http_status"),
+                    )
+
+            uploaded_ids: list[str] = []
+            for index, item in enumerate(manifest["items"], start=1):
+                image_name = publisher.manifest_image_name(item)
+                context = {
+                    "studio_base": client.studio_base,
+                    "block_url": referer,
+                    "block_locator": locator,
+                    "vertical_block_id": entry["vertical_locator"],
+                    "csrftoken": client.csrftoken,
+                    "image_file": item["_image_abs"],
+                    "image_rel": item["image"],
+                    "page": int(item["page"]),
+                    "page_number": int(item["page"]),
+                    "index": index,
+                    "subtitle": item["subtitle"],
+                    "start": int(item["start"]),
+                    "end": int(item["end"]),
+                }
+                step = recorded_step(
+                    f"upload_image[{index}]",
+                    lambda context=context: _template_details(
+                        client,
+                        f"upload_image[{index}]",
+                        adapter["upload_image"],
+                        context,
+                    ),
+                )
+                asset_id = step.get("asset_id")
+                if isinstance(asset_id, str) and asset_id:
+                    uploaded_ids.append(asset_id)
+                    uploaded_images.append({"page": int(item["page"]), "image": image_name, "asset_id": asset_id})
+            if len(uploaded_ids) == len(manifest["items"]):
+                recorded_step(
+                    "change_files_order",
+                    lambda: _template_details(
+                        client,
+                        "change_files_order",
+                        adapter["change_files_order"],
+                        {
+                            "studio_base": client.studio_base,
+                            "block_url": referer,
+                            "block_locator": locator,
+                            "csrftoken": client.csrftoken,
+                            "uploaded_asset_ids": uploaded_ids,
+                        },
+                    ),
+                )
+            else:
+                attempt_steps.append({"step": "change_files_order", "status": "skipped", "reason": "Image asset IDs could not be confirmed"})
+                store()
+        except BatchValidationError as exc:
+            failures.append(exc)
+
+    if repair_audio:
+        try:
+            audio_path = Path(str(manifest["audio"]["_full_audio_abs"]))
+            audio_suffix = audio_path.suffix.lstrip(".")
+            context: dict[str, Any] = {
+                "studio_base": client.studio_base,
+                "block_url": referer,
+                "block_locator": locator,
+                "vertical_block_id": entry["vertical_locator"],
+                "csrftoken": client.csrftoken,
+                "audio_file": str(audio_path),
+                "audio_file_name": audio_path.name,
+                "audio_post_fix": audio_suffix,
+                "course_key": client.course_key,
+                "courses_json": json.dumps({client.course_key: False}, ensure_ascii=False),
+                "total_pages": len(manifest["items"]),
+            }
+            if "upload_audio_prepare" not in adapter or "upload_audio_register" not in adapter or "save_audio_binding" not in adapter:
+                raise BatchValidationError("adapter", "adapter does not define the Gallery audio upload steps")
+            recorded_step(
+                "upload_audio_prepare",
+                lambda: _template_details(client, "upload_audio_prepare", adapter["upload_audio_prepare"], context),
+            )
+            file_key = str(context.get("file_key") or "").strip()
+            document_id = publisher.maybe_extract_uuid(file_key)
+            if not file_key or not document_id:
+                raise BatchValidationError("upload_audio_prepare", "Studio audio preparation did not return a usable document ID")
+            context["edx_document_id"] = document_id
+            context["audio_document_id"] = f"{document_id}.{audio_suffix}"
+            if args.skip_oss_multipart:
+                attempt_steps.append({"step": "upload_audio_multipart", "status": "skipped", "reason": "OSS multipart upload was skipped"})
+                store()
+            else:
+                def upload_audio_multipart() -> dict[str, Any]:
+                    result = publisher.sts_multipart_upload_audio(context)
+                    return {"parts": result["parts"], "size": result["size"]}
+
+                recorded_step("upload_audio_multipart", upload_audio_multipart)
+            recorded_step(
+                "upload_audio_register",
+                lambda: _template_details(client, "upload_audio_register", adapter["upload_audio_register"], context),
+            )
+            recorded_step(
+                "save_audio_binding",
+                lambda: _template_details(client, "save_audio_binding", adapter["save_audio_binding"], context),
+            )
+        except BatchValidationError as exc:
+            failures.append(exc)
+
+    if repair_play_config:
+        try:
+            time_config = [
+                {
+                    "page": int(item["page"]),
+                    "start": int(item["start"]),
+                    "end": int(item["end"]),
+                    "subtitle": item["subtitle"],
+                }
+                for item in manifest["items"]
+            ]
+            play_config: dict[str, Any] = {"time_config": time_config}
+            observed_config = validation.get("observed") if isinstance(validation.get("observed"), dict) else {}
+            show_subtitles = observed_config.get("show_subtitles")
+            if isinstance(show_subtitles, bool):
+                play_config["show_subtitles"] = show_subtitles
+            recorded_step(
+                "update_play_config",
+                lambda: {
+                    "http_status": client.request_json(
+                        "update_play_config",
+                        "POST",
+                        f"{client.studio_base}/xblock/{locator}/handler/update_play_config",
+                        body={"play_config": play_config},
+                        referer=referer,
+                    )[1]
+                },
+            )
+        except BatchValidationError as exc:
+            failures.append(exc)
+
+    if repair_images or repair_audio or repair_play_config:
+        try:
+            vertical_url = publisher.build_container_block_url(client.studio_base, entry["vertical_locator"])
+            vertical_publish = recorded_step(
+                "publish_vertical",
+                lambda: _template_details(
+                    client,
+                    "publish_vertical",
+                    adapter["publish_vertical"],
+                    {
+                        "studio_base": client.studio_base,
+                        "vertical_block_id": entry["vertical_locator"],
+                        "block_url": vertical_url,
+                        "csrftoken": client.csrftoken,
+                    },
+                ),
+            )
+            attempt["vertical_publish"] = {
+                "step": "publish_vertical",
+                "status": "completed",
+                **{key: value for key, value in vertical_publish.items() if key not in {"step", "status"}},
+            }
+        except BatchValidationError as exc:
+            attempt["vertical_publish"] = {"step": "publish_vertical", "status": "failed", "error_summary": safe_error(exc, "publish_vertical")}
+            failures.append(exc)
+
+    observed_images = validation.get("observed", {}).get("images", []) if isinstance(validation.get("observed"), dict) else []
+    image_records = uploaded_images if repair_images else publisher.safe_image_checkpoint_records(observed_images)
+    asset_ids = [item["asset_id"] for item in image_records if isinstance(item.get("asset_id"), str)]
+    entry["repair_publish"] = {
+        "gallery_key": entry["gallery_key"],
+        "status": "completed" if not failures else "partial",
+        "completed_stage": "saved",
+        "active_step": "",
+        "failed_step": failures[0].step if failures else "",
+        "asset_ids": asset_ids,
+        "images": image_records,
+        "steps": [publisher.safe_step_record(step) for step in attempt_steps if isinstance(step, dict)],
+        "images_started": repair_images,
+        "reconciliation_count": 0,
+    }
+    attempt["publish"] = {
+        "status": "completed" if not failures else "partial",
+        "completed_stage": "saved",
+        "asset_ids": asset_ids,
+        "images": image_records,
+        "steps": [publisher.safe_step_record(step) for step in attempt_steps if isinstance(step, dict)],
+    }
+    attempt["finished_at"] = utc_now()
+    attempt["status"] = "completed" if not failures else "failed"
     store()
+    if failures:
+        raise failures[0]
     return attempt
+
+
+def _template_details(
+    client: StudioClient,
+    step: str,
+    template: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    record, retries = client.request_template(step, template, context)
+    details = {
+        key: record[key]
+        for key in ("asset_id", "http_status")
+        if key in record
+    }
+    if retries:
+        details["auth_retry_attempts"] = len(retries)
+        details["auth_retry_events"] = retries
+    return details
 
 
 def resumable_repair_attempt(entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -1063,7 +970,7 @@ def republish_vertical_for_pending_changes(
     history = entry.setdefault("repair_history", [])
     if attempt is None:
         attempt = {
-            "attempt": len(history) + 1,
+            "attempt": max(len(history), int(entry.get("repair_attempts", 0))) + 1,
             "status": "running",
             "repair_mode": "publish_vertical",
             "repair_round": repair_round,
@@ -1071,6 +978,7 @@ def republish_vertical_for_pending_changes(
             "trigger_validation": copy.deepcopy(entry.get("validation", {})),
             "initial_publish": safe_publish_state(entry.get("publish")),
             "steps": [],
+            "request_id": entry.get("repair_request_id", ""),
         }
         history.append(attempt)
     else:
@@ -1827,6 +1735,48 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     operation_path = Path(args.operation_file).expanduser().resolve()
     operation = load_operation(operation_path)
+    resumable_attempts = []
+    for entry in operation["galleries"]:
+        attempt = resumable_repair_attempt(entry)
+        if attempt is not None:
+            resumable_attempts.append(attempt)
+    request_id = ""
+    if resumable_attempts:
+        request_id = next(
+            (
+                attempt["request_id"]
+                for attempt in resumable_attempts
+                if isinstance(attempt.get("request_id"), str) and attempt["request_id"]
+            ),
+            str(operation.get("repair_request_id") or ""),
+        )
+    if not request_id:
+        request_id = uuid.uuid4().hex
+    operation["repair_request_id"] = request_id
+    for entry in operation["galleries"]:
+        resume_attempt = resumable_repair_attempt(entry)
+        if resume_attempt and resume_attempt.get("request_id") in {None, request_id}:
+            resume_attempt["request_id"] = request_id
+            entry["repair_request_id"] = request_id
+            if not isinstance(entry.get("repair_attempts_in_request"), int) or isinstance(entry.get("repair_attempts_in_request"), bool):
+                matching_attempts = [
+                    item
+                    for item in entry.get("repair_history", [])
+                    if isinstance(item, dict) and item.get("request_id") == request_id
+                ]
+                entry["repair_attempts_in_request"] = max(1, len(matching_attempts))
+        else:
+            matching_attempts = [
+                item
+                for item in entry.get("repair_history", [])
+                if isinstance(item, dict) and item.get("request_id") == request_id
+            ]
+            if matching_attempts:
+                entry["repair_request_id"] = request_id
+                entry["repair_attempts_in_request"] = len(matching_attempts)
+            elif not resumable_attempts:
+                entry["repair_request_id"] = request_id
+                entry["repair_attempts_in_request"] = 0
     report_mode = args.report_mode or "sections"
     operation["operator_report_mode"] = report_mode
     store = lambda: publisher.atomic_write_json(operation_path, operation)
@@ -1984,17 +1934,17 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             )
             publication_mismatch = checks.get("vertical_publication") == "mismatch"
             structure_mismatch = checks.get("vertical_structure") == "mismatch"
+            play_config_read_failed = validation.get("play_config_read_failed") is True
+            has_repair_target = content_mismatches or play_config_read_failed or publication_mismatch or structure_mismatch
             validation["repairable"] = bool(
-                validation["status"] == "mismatch"
+                has_repair_target
                 and checks.get("vertical_structure") in {"pass", "mismatch"}
                 and (not structure_mismatch or target_snapshot is not None)
                 and owner_status == "pass"
-                and all(state in {"pass", "mismatch"} for state in states)
-                and (content_mismatches or publication_mismatch or structure_mismatch)
             )
             if validation["repairable"]:
-                validation["repair_scope"] = "gallery" if content_mismatches else "structure" if structure_mismatch else "publish_vertical"
-            if validation["status"] == "mismatch" and not validation["repairable"]:
+                validation["repair_scope"] = "gallery" if content_mismatches or play_config_read_failed else "structure" if structure_mismatch else "publish_vertical"
+            if has_repair_target and not validation["repairable"]:
                 validation["repair_skip_reason"] = "The current section structure or Gallery ownership is not safe to change automatically"
             entry["validation"] = validation
             history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
@@ -2019,14 +1969,22 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         repair_targets = []
         for entry in operation["galleries"]:
             validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
-            if validation.get("status") != "mismatch" or not validation.get("repairable"):
+            if not validation.get("repairable"):
                 continue
-            attempts = entry.get("repair_attempts", 0)
-            resume_attempt = resumable_repair_attempt(entry) if attempts else None
-            if resume_attempt is None and attempts >= MAX_REPAIR_CYCLES:
+            attempts_this_request = entry.get("repair_attempts_in_request", 0)
+            if not isinstance(attempts_this_request, int) or isinstance(attempts_this_request, bool):
+                attempts_this_request = 0
+            resume_attempt = resumable_repair_attempt(entry)
+            if resume_attempt and resume_attempt.get("request_id") not in {None, request_id}:
+                resume_attempt = None
+            if resume_attempt is None and attempts_this_request >= MAX_REPAIR_CYCLES:
                 validation["repair_limit_reached"] = True
                 store()
                 continue
+            if resume_attempt is None:
+                entry["repair_request_id"] = request_id
+                entry["repair_attempts_in_request"] = attempts_this_request + 1
+                store()
             if validation.get("repair_scope") == "publish_vertical":
                 repair_targets.append((entry, "publish_vertical", None, resume_attempt))
                 continue
@@ -2048,7 +2006,15 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 if repair_mode == "structure":
                     history = entry.setdefault("repair_history", [])
-                    attempt = resume_attempt or {"attempt": len(history) + 1, "repair_round": cycle, "repair_mode": "structure", "steps": []}
+                    attempt = resume_attempt or {
+                        "attempt": max(len(history), int(entry.get("repair_attempts", 0))) + 1,
+                        "repair_round": cycle,
+                        "repair_mode": "structure",
+                        "request_id": request_id,
+                        "steps": [],
+                    }
+                    attempt["repair_round"] = cycle
+                    attempt["request_id"] = request_id
                     if resume_attempt is None:
                         history.append(attempt)
                     entry["repair_attempts"] = max(entry.get("repair_attempts", 0), attempt["attempt"])
@@ -2063,7 +2029,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                         entry.setdefault("vertical_integrity", {})["expected"] = expected
                     store()
                 elif repair_mode == "publish_vertical":
-                    republish_vertical_for_pending_changes(
+                    attempt = republish_vertical_for_pending_changes(
                         client,
                         entry,
                         args,
@@ -2072,9 +2038,13 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                         repair_round=cycle,
                         attempt=resume_attempt,
                     )
-                else:
-                    attempt = repair_gallery(client, operation, entry, manifest, args, adapter, set(owners), store, attempt=resume_attempt)
                     attempt["repair_round"] = cycle
+                    attempt["request_id"] = request_id
+                else:
+                    attempt = repair_gallery(client, operation, entry, manifest, args, adapter, store, attempt=resume_attempt)
+                    attempt["repair_round"] = cycle
+                    attempt["request_id"] = request_id
+                    store()
                     if validation.get("checks", {}).get("vertical_structure") == "mismatch":
                         steps, expected = publisher.cleanup_and_publish_vertical(
                             client.session, studio_base=studio_base, vertical_locator=entry["vertical_locator"],
@@ -2088,6 +2058,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 history = entry.setdefault("repair_history", [])
                 attempt = history[-1] if history and isinstance(history[-1], dict) else {"attempt": len(history) + 1, "steps": []}
+                attempt["repair_round"] = cycle
+                attempt["request_id"] = request_id
                 attempt["status"] = "failed"
                 attempt["failed_step"] = publisher.safe_step_name(getattr(exc, "step", getattr(exc, "step_name", "repair")))
                 attempt["error_summary"] = safe_error(exc, attempt["failed_step"])

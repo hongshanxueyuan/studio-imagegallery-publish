@@ -482,6 +482,203 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(1, gallery["repair_attempts"])
             self.assertEqual(["page-001.png", "page-002.png"], [item["display_name"] for item in studio.galleries[GALLERY_1]["files"]])
 
+    def test_false_show_subtitles_is_preserved_without_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "show_subtitles": False,
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertEqual("pass", state["galleries"][0]["validation"]["checks"]["play_config"])
+            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+            self.assertFalse(any(call["path"].endswith("/handler/update_play_config") for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+
+    def test_missing_audio_binding_repairs_audio_without_rewriting_images_or_play_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "show_subtitles": False,
+                "audios": [],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(1, len(studio.galleries[GALLERY_1]["audios"]))
+            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+            paths = [call["path"] for call in studio.calls]
+            self.assertTrue(any(path.endswith("/handler/save_audio") for path in paths))
+            self.assertFalse(any(path.endswith("/handler/remove_files") for path in paths))
+            self.assertFalse(any(path.endswith("/handler/file_upload") for path in paths))
+            self.assertFalse(any(path.endswith("/handler/update_play_config") for path in paths))
+
+    def test_missing_subtitle_time_config_restores_full_timeline_and_preserves_disabled_display(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [],
+                "show_subtitles": False,
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            paths = [call["path"] for call in studio.calls]
+            self.assertTrue(any(path.endswith("/handler/update_play_config") for path in paths))
+            self.assertFalse(any(path.endswith("/handler/remove_files") for path in paths))
+            self.assertFalse(any(path.endswith("/handler/file_upload") for path in paths))
+            self.assertFalse(any(path.endswith("/handler/save_audio") for path in paths))
+            self.assertEqual(valid_time_config(2), studio.galleries[GALLERY_1]["time_config"])
+            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+
+    def test_unreadable_play_config_still_writes_local_timeline_but_remains_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [],
+                "show_subtitles": False,
+                "audios": [{}],
+            }}, payload_overrides={(GALLERY_1, "get_play_config"): {"play_config": "unreadable"}})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            updates = [
+                call for call in studio.calls
+                if call["path"].endswith("/handler/update_play_config")
+            ]
+            self.assertTrue(updates)
+            play_config = updates[0]["kwargs"]["json"]["play_config"]
+            self.assertEqual(valid_time_config(2), play_config["time_config"])
+            self.assertNotIn("show_subtitles", play_config)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+
+    def test_image_count_mismatch_replaces_only_gallery_references_without_deleting_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-old", "asset_key": "asset-old", "display_name": "old-page.png"}],
+                "time_config": valid_time_config(2),
+                "show_subtitles": False,
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(2, len(studio.galleries[GALLERY_1]["files"]))
+            self.assertEqual(3, len(studio.assets))
+            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+            self.assertEqual(1, sum(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+            self.assertEqual(2, sum(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+            self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/save_audio") for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/update_play_config") for call in studio.calls))
+
+    def test_equal_image_counts_ignore_names_order_and_asset_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-other-b", "asset_key": "asset-other-b", "display_name": "different-b.png"},
+                    {"id": "asset-other-a", "asset_key": "asset-other-a", "display_name": "different-a.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("pass", state["galleries"][0]["validation"]["checks"]["images"])
+            self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+
+    def test_new_repair_request_reaudits_live_state_and_gets_two_fresh_cycles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "show_subtitles": False,
+                "audios": [],
+            }}, keep_mismatch_after_repair=True)
+
+            first_exit, first_stdout, first_stderr = self._run_cli(
+                operation_path, studio, extra_args=("--skip-oss-multipart",)
+            )
+            self.assertEqual(1, first_exit, first_stdout + first_stderr)
+            first_audit_count = studio.path_counts[f"/preview/xblock/{GALLERY_1}/handler/get_audios"]
+            self.assertEqual(2, json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["repair_attempts"])
+
+            studio.keep_mismatch_after_repair = False
+            second_exit, second_stdout, second_stderr = self._run_cli(
+                operation_path, studio, extra_args=("--skip-oss-multipart",)
+            )
+
+            self.assertEqual(0, second_exit, second_stdout + second_stderr)
+            self.assertGreater(studio.path_counts[f"/preview/xblock/{GALLERY_1}/handler/get_audios"], first_audit_count)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("verified", gallery["validation"]["status"])
+            self.assertEqual(3, gallery["repair_attempts"])
+            self.assertEqual(1, gallery["repair_attempts_in_request"])
+
     def test_valid_time_config_entries_rejects_malformed_or_duplicate_pages(self):
         self.assertTrue(publisher.valid_time_config_entries(valid_time_config(2)))
         invalid_configs = (
@@ -606,7 +803,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
-            self.assertEqual([1, 1], [item["repair_attempts"] for item in state["galleries"]])
+            self.assertEqual([0, 1], [item["repair_attempts"] for item in state["galleries"]])
             self.assertEqual(["verified", "verified"], [item["validation"]["status"] for item in state["galleries"]])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
 
@@ -684,10 +881,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self._write_operation_file(operation_path, self._operation(manifest, galleries=(GALLERY_1, GALLERY_2)))
             studio = FakeStudio({
                 GALLERY_1: {
-                    "files": [
-                        {"id": "old-a", "asset_key": "old-a", "display_name": "wrong-1.png"},
-                        {"id": "old-b", "asset_key": "old-b", "display_name": "wrong-2.png"},
-                    ],
+                    "files": [{"id": "old-a", "asset_key": "old-a", "display_name": "wrong-1.png"}],
                     "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
@@ -784,7 +978,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             ],
         }))
 
-    def test_cli_reports_filename_mismatch_without_scanning_course_asset_inventory(self):
+    def test_cli_ignores_filename_mismatch_without_scanning_course_asset_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -802,7 +996,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
 
-            self.assertEqual(1, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
+            self.assertEqual(0, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
             self.assertEqual("", stderr)
             self.assertEqual(2, studio.course_reads)
             self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
@@ -810,12 +1004,13 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(operation["skill_provenance"], state["skill_provenance"])
             self.assertEqual(operation["skill_provenance"], state["batch_result"]["skill_provenance"])
             self.assertEqual(operation["provenance"], state["batch_result"]["provenance"])
-            self.assertFalse(state["batch_result"]["all_sections_verified"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
             gallery = state["galleries"][0]
-            self.assertEqual("mismatch", gallery["validation"]["status"])
+            self.assertEqual("verified", gallery["validation"]["status"])
             self.assertEqual(2, gallery["validation"]["observed"]["image_file_count"])
-            self.assertEqual("mismatch", gallery["validation"]["checks"]["image_names"])
-            self.assertEqual("pass", gallery["validation"]["checks"]["image_asset_ids"])
+            self.assertEqual("pass", gallery["validation"]["checks"]["images"])
+            self.assertNotIn("image_names", gallery["validation"]["checks"])
+            self.assertNotIn("image_asset_ids", gallery["validation"]["checks"])
             all_output = stdout + stderr + json.dumps(state)
             for secret in ("success-sts-secret", "success-cookie-secret", "success-csrf-secret", "success-auth-secret", "success-token-secret", "session-secret", "csrf-secret"):
                 self.assertNotIn(secret, all_output)
@@ -1001,19 +1196,30 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             ]
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({
-                GALLERY_1: {"files": [], "time_config": [], "audios": []},
+                GALLERY_1: {"files": [], "time_config": [], "audios": [{}]},
                 GALLERY_2: {"files": [{"id": "b1"}, {"id": "b2"}], "time_config": valid_time_config(2), "audios": [{}]},
-            }, fail_get_files={GALLERY_1: 1})
+            }, payload_overrides={(GALLERY_1, "get_files"): {"files": "unreadable", "total_count": 0}})
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio)
 
             self.assertEqual(1, exit_code, stdout + stderr)
-            self.assertEqual(2, studio.course_reads)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("pass", state["galleries"][0]["validation"]["checks"]["play_config"])
+            self.assertEqual(1, state["galleries"][0]["repair_attempts"])
+            self.assertEqual(["play_config"], state["galleries"][0]["repair_history"][0]["repair_components"])
             self.assertEqual("verified", state["galleries"][1]["validation"]["status"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
-            self.assertFalse(any(call["method"] in {"DELETE", "PUT"} for call in studio.calls))
+            updates = [
+                call for call in studio.calls
+                if call["path"].endswith("/handler/update_play_config")
+            ]
+            self.assertEqual(1, len(updates))
+            self.assertEqual(valid_time_config(2), updates[0]["kwargs"]["json"]["play_config"]["time_config"])
+            self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/save_audio") for call in studio.calls))
+            self.assertFalse(any(call["path"].startswith(f"/xblock/{GALLERY_2}/") for call in studio.calls))
             all_output = stdout + stderr + json.dumps(state)
             for secret in (
                 "raw-response-secret",
@@ -1034,7 +1240,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertNotIn(secret, all_output)
             self.assertNotIn("raw_response", all_output)
 
-    def test_cli_repairs_one_confirmed_mismatch_deletes_only_a_freshly_unreferenced_asset_and_rechecks(self):
+    def test_cli_repairs_confirmed_image_count_mismatch_without_deleting_assets_and_rechecks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -1057,15 +1263,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             delete_indexes = [i for i, (method, path) in enumerate(methods_and_paths) if method == "DELETE"]
             upload_indexes = [i for i, (method, path) in enumerate(methods_and_paths) if method == "POST" and path.endswith("/handler/file_upload")]
             publish_index = next(i for i, (method, path) in enumerate(methods_and_paths) if method == "POST" and path == f"/xblock/{VERTICAL_1}")
-            self.assertEqual(2, len(delete_indexes))
-            self.assertLess(remove_index, min(delete_indexes))
-            self.assertLess(max(delete_indexes), min(upload_indexes))
+            self.assertEqual([], delete_indexes)
+            self.assertLess(remove_index, min(upload_indexes))
             self.assertLess(max(upload_indexes), publish_index)
-            self.assertEqual(6, studio.course_reads)
-            self.assertEqual({
-                f"/assets/{COURSE_KEY}/asset-old",
-                f"/assets/{COURSE_KEY}/asset-checkpoint-orphan",
-            }, {call["path"] for call in studio.calls if call["method"] == "DELETE"})
+            self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             gallery = state["galleries"][0]
             self.assertEqual(1, gallery["repair_attempts"])
@@ -1125,7 +1326,6 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
     def test_cli_repairs_play_config_and_zero_or_multiple_audio_binding_mismatches(self):
         cases = (
             ("play_config", {"time_config": valid_time_config(1), "audios": [{"id": "audio-1"}]}),
-            ("disabled_subtitles", {"time_config": valid_time_config(2), "audios": [{"id": "audio-1"}], "show_subtitles": False}),
             ("invalid_time_entry", {"time_config": [
                 {"page": 1, "start": 10, "end": 5, "subtitle": "第一页"},
                 {"page": 2, "start": 1000, "end": 2000, "subtitle": "第二页"},
@@ -1163,7 +1363,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertEqual("verified", gallery["validation"]["status"])
                 self.assertTrue(operation["batch_result"]["all_sections_verified"])
 
-    def test_cli_keeps_assets_referenced_by_another_gallery_and_deletes_only_orphans(self):
+    def test_audio_only_repair_does_not_rewrite_or_delete_gallery_images(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -1195,41 +1395,46 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code, stdout + stderr)
             deleted_paths = [call["path"] for call in studio.calls if call["method"] == "DELETE"]
-            self.assertEqual([f"/assets/{COURSE_KEY}/asset-orphan"], deleted_paths)
+            self.assertEqual([], deleted_paths)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
-            cleanup = state["galleries"][0]["repair_history"][0]["asset_cleanup"]
-            self.assertIn("asset-shared", cleanup["retained_asset_ids"])
-            self.assertIn("asset-orphan", cleanup["deleted_asset_ids"])
+            attempt = state["galleries"][0]["repair_history"][0]
+            self.assertEqual(["audio_bindings"], attempt["repair_components"])
+            self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+            self.assertEqual({"asset-shared", "asset-orphan"}, {asset["id"] for asset in studio.assets})
             self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
             self.assertEqual("verified", state["course_structure_verification"]["status"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
-            delete_index = next(i for i, call in enumerate(studio.calls) if call["method"] == "DELETE")
-            peer_reference_index = max(i for i, call in enumerate(studio.calls[:delete_index]) if call["path"].endswith(f"/preview/xblock/{GALLERY_2}/handler/get_files"))
-            self.assertLess(peer_reference_index, delete_index)
 
-    def test_cli_skips_deletion_when_fresh_all_gallery_reference_scan_is_unavailable(self):
+    def test_image_repair_does_not_scan_other_galleries_or_delete_course_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
             operation_path = root / "batch-operation.json"
             self._write_operation_file(operation_path, self._operation(manifest))
-            studio = FakeStudio({GALLERY_1: {
-                "files": [{"id": "asset-old", "asset_key": "asset-old"}],
-                "time_config": valid_time_config(1),
-                "audios": [{}],
-            }}, fail_get_files={GALLERY_1: 5})
+            studio = FakeStudio({
+                GALLERY_1: {
+                    "files": [{"id": "asset-old", "asset_key": "asset-old"}],
+                    "time_config": valid_time_config(1),
+                    "audios": [{}],
+                },
+                GALLERY_2: {
+                    "files": [{"id": "peer-asset", "asset_key": "peer-asset"}],
+                    "time_config": valid_time_config(1),
+                    "audios": [{}],
+                },
+            })
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(0, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
             self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+            self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
+            self.assertFalse(any(call["path"].startswith(f"/preview/xblock/{GALLERY_2}/") for call in studio.calls))
             state = json.loads(operation_path.read_text(encoding="utf-8"))
-            cleanup = state["galleries"][0]["repair_history"][0]["asset_cleanup"]
-            self.assertEqual("incomplete", cleanup["status"])
-            self.assertEqual(["asset-old"], cleanup["skipped_asset_ids"])
             self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
 
-    def test_cli_marks_malformed_handler_responses_unverified_without_repair(self):
+    def test_cli_keeps_malformed_responses_unverified_and_writes_unreadable_play_config(self):
         cases = (
             ("get_files", {"files": [{"name": "no-id"}], "total_count": 1}),
             ("get_play_config", {"play_config": {"time_config": "not-a-list"}}),
@@ -1253,8 +1458,24 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertEqual(1, exit_code, stdout + stderr)
                 state = json.loads(operation_path.read_text(encoding="utf-8"))
                 self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
-                self.assertEqual(0, state["galleries"][0]["repair_attempts"])
-                self.assertFalse(any(call["method"] in {"DELETE", "PUT"} for call in studio.calls))
+                if handler == "get_play_config":
+                    self.assertEqual(2, state["galleries"][0]["repair_attempts"])
+                    updates = [
+                        call for call in studio.calls
+                        if call["path"].endswith("/handler/update_play_config")
+                    ]
+                    self.assertEqual(2, len(updates))
+                    self.assertTrue(all(
+                        call["kwargs"]["json"]["play_config"]["time_config"] == valid_time_config(2)
+                        for call in updates
+                    ))
+                    self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+                else:
+                    self.assertEqual(0, state["galleries"][0]["repair_attempts"])
+                    self.assertFalse(any(
+                        call["method"] != "GET" and "/preview/xblock/" not in call["path"]
+                        for call in studio.calls
+                    ))
 
     def test_cli_uses_live_published_state_instead_of_initial_write_response(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1574,29 +1795,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertNotIn(internal_detail, report["text"])
             self.assertEqual("upload_audio_prepare", state["batch_result"]["galleries"][0]["publish"]["failed_step"])
             self.assertEqual(502, state["batch_result"]["galleries"][0]["publish"]["failure_http_status"])
-            self.assertEqual("mismatch", state["galleries"][0]["validation"]["status"])
+            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
             self.assertEqual("unverified", state["galleries"][1]["validation"]["status"])
             self.assertNotIn("operation-secret", json.dumps(state))
 
     def test_course_structure_completeness_rejects_a_missing_vertical_child_list(self):
         self.assertFalse(module.course_structure_payload_is_complete(make_incomplete_course_structure()))
-
-    def test_reference_scan_fails_closed_for_an_incomplete_unrelated_gallery_subtree(self):
-        payload = make_incomplete_course_structure()
-        with patch.object(module, "read_json_call", return_value=(payload, {"status": "ok"})) as read:
-            references, locators, error = module.scan_course_gallery_references(
-                SimpleNamespace(
-                    studio_base="https://studio.example.com",
-                    course_key=COURSE_KEY,
-                    studio_url="https://studio.example.com/course/" + COURSE_KEY,
-                ),
-                expected_gallery_locators={GALLERY_1},
-            )
-
-        self.assertIsNone(references)
-        self.assertEqual([], locators)
-        self.assertIn("incomplete", error.lower())
-        read.assert_called_once()
 
     def test_final_course_structure_verification_rejects_a_partial_tree(self):
         payload = make_incomplete_course_structure()
