@@ -23,3 +23,6 @@ Thumbs.db
 output/
 tmp/
 temp/
+
+# Local feature and handoff bundles
+.scratch/
