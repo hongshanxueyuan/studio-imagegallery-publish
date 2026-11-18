@@ -517,31 +517,33 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         diagnostics.append(config_diagnostic)
     play_config = config_payload.get("play_config") if isinstance(config_payload, dict) else None
     time_config = play_config.get("time_config") if isinstance(play_config, dict) else None
-    play_config_read_failed = bool(config_diagnostic and config_diagnostic["status"] != "ok") or not isinstance(play_config, dict)
-    if play_config_read_failed:
+    play_config_unavailable = bool(config_diagnostic and config_diagnostic["status"] != "ok") or not isinstance(play_config, dict)
+    play_config_untrusted = play_config_unavailable
+    show_subtitles = play_config.get("show_subtitles") if isinstance(play_config, dict) else None
+    show_subtitles_present = isinstance(play_config, dict) and "show_subtitles" in play_config
+    show_subtitles_invalid = show_subtitles_present and not isinstance(show_subtitles, bool)
+    if isinstance(show_subtitles, bool):
+        observed["show_subtitles"] = show_subtitles
+    if show_subtitles_invalid:
+        play_config_untrusted = True
+
+    if play_config_unavailable:
         checks["play_config"] = "unverified"
         if not (config_diagnostic and config_diagnostic["status"] != "ok"):
             diagnostics.append({"step": "get_play_config", "status": "invalid_response", "error_summary": "Studio play_config.time_config is not a list"})
     elif "time_config" not in play_config:
         observed["time_config_count"] = 0
         observed["time_config_entries_valid"] = False
-        checks["play_config"] = "mismatch"
+        checks["play_config"] = "unverified" if play_config_untrusted else "mismatch"
     elif not isinstance(time_config, list):
-        play_config_read_failed = True
+        play_config_untrusted = True
         checks["play_config"] = "unverified"
         diagnostics.append({"step": "get_play_config", "status": "invalid_response", "error_summary": "Studio play_config.time_config is not a list"})
     else:
         observed["time_config_count"] = len(time_config)
         timing_entries_valid = publisher.valid_time_config_entries(time_config)
         observed["time_config_entries_valid"] = timing_entries_valid
-        show_subtitles = play_config.get("show_subtitles") if isinstance(play_config, dict) else None
-        show_subtitles_present = isinstance(play_config, dict) and "show_subtitles" in play_config
-        show_subtitles_invalid = show_subtitles_present and not isinstance(show_subtitles, bool)
-        if isinstance(show_subtitles, bool):
-            observed["show_subtitles"] = show_subtitles
-        if show_subtitles_invalid:
-            play_config_read_failed = True
-        if show_subtitles_invalid:
+        if play_config_untrusted:
             checks["play_config"] = "unverified"
         else:
             checks["play_config"] = (
@@ -590,7 +592,7 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         "checks": checks,
         "checked_at": utc_now(),
     }
-    if play_config_read_failed:
+    if play_config_untrusted:
         result["play_config_read_failed"] = True
     if failed:
         result["failed_step"] = failed["step"]
@@ -630,10 +632,8 @@ def repair_gallery(
     checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
     repair_images = checks.get("images") == "mismatch"
     repair_audio = checks.get("audio_bindings") == "mismatch"
-    repair_play_config = (
-        checks.get("play_config") == "mismatch"
-        or validation.get("play_config_read_failed") is True
-    )
+    play_config_untrusted = validation.get("play_config_read_failed") is True
+    repair_play_config = checks.get("play_config") == "mismatch" or play_config_untrusted
     repair_components = [
         name
         for name, requested in (
@@ -1934,8 +1934,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             )
             publication_mismatch = checks.get("vertical_publication") == "mismatch"
             structure_mismatch = checks.get("vertical_structure") == "mismatch"
-            play_config_read_failed = validation.get("play_config_read_failed") is True
-            has_repair_target = content_mismatches or play_config_read_failed or publication_mismatch or structure_mismatch
+            play_config_untrusted = validation.get("play_config_read_failed") is True
+            has_repair_target = content_mismatches or play_config_untrusted or publication_mismatch or structure_mismatch
             validation["repairable"] = bool(
                 has_repair_target
                 and checks.get("vertical_structure") in {"pass", "mismatch"}
@@ -1943,7 +1943,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 and owner_status == "pass"
             )
             if validation["repairable"]:
-                validation["repair_scope"] = "gallery" if content_mismatches or play_config_read_failed else "structure" if structure_mismatch else "publish_vertical"
+                validation["repair_scope"] = "gallery" if content_mismatches or play_config_untrusted else "structure" if structure_mismatch else "publish_vertical"
             if has_repair_target and not validation["repairable"]:
                 validation["repair_skip_reason"] = "The current section structure or Gallery ownership is not safe to change automatically"
             entry["validation"] = validation

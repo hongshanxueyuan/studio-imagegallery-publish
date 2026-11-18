@@ -2898,8 +2898,9 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         report_doc = (ROOT / "references" / "operator-report.md").read_text(encoding="utf-8")
         all_docs = "\n".join((skill_doc, publishing_doc, audit_doc, report_doc))
 
-        self.assertLess(skill_doc.index("### 1. 发布"), skill_doc.index("### 2. 自审"))
-        self.assertLess(skill_doc.index("### 2. 自审"), skill_doc.index("### 3. 修复与复审"))
+        self.assertLess(skill_doc.index("### 1. 发布前本地素材恢复"), skill_doc.index("### 2. 发布"))
+        self.assertLess(skill_doc.index("### 2. 发布"), skill_doc.index("### 3. 自审"))
+        self.assertLess(skill_doc.index("### 3. 自审"), skill_doc.index("### 4. Studio 修复与复审"))
         self.assertIn("references/publishing-and-replacement.md", skill_doc)
         self.assertIn("references/self-audit-and-repair.md", skill_doc)
         self.assertIn("references/operator-report.md", skill_doc)
@@ -2913,7 +2914,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("`本节要点组件`", publishing_doc)
         self.assertIn("失败步骤", publishing_doc)
         self.assertIn("最多执行两轮", audit_doc)
-        self.assertIn("不根据无法确认结果发起课程写入", audit_doc)
+        self.assertIn("课程结构或 Gallery 归属无法确认时不发起课程写入", audit_doc)
         self.assertIn("可直接打开的 Studio vertical 链接", report_doc)
         self.assertNotIn("nlm-course-auditor", all_docs)
 

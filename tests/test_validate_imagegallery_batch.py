@@ -562,6 +562,60 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(valid_time_config(2), studio.galleries[GALLERY_1]["time_config"])
             self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
 
+    def test_malformed_timeline_repairs_from_manifest_and_preserves_disabled_display(self):
+        class FirstMalformedPlayConfigStudio(FakeStudio):
+            def __init__(self, initial_play_config):
+                super().__init__({GALLERY_1: {
+                    "files": [
+                        {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "show_subtitles": False,
+                    "audios": [{}],
+                }})
+                self.initial_play_config = initial_play_config
+                self.initial_play_config_reads = 0
+
+            def _response(self, method, path, kwargs):
+                if method == "POST" and path.endswith("/handler/get_play_config") and self.initial_play_config_reads == 0:
+                    self.initial_play_config_reads += 1
+                    return FakeResponse({"play_config": self.initial_play_config})
+                return super()._response(method, path, kwargs)
+
+        malformed_configs = (
+            ("missing_time_config", {"show_subtitles": False}, "mismatch"),
+            ("non_list_time_config", {"time_config": "not-a-list", "show_subtitles": False}, "unverified"),
+        )
+        for case, initial_play_config, expected_initial_status in malformed_configs:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                operation_path = root / "batch-operation.json"
+                self._write_operation_file(operation_path, self._operation(manifest))
+                studio = FirstMalformedPlayConfigStudio(initial_play_config)
+
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+                self.assertEqual(0, exit_code, stdout + stderr)
+                state = json.loads(operation_path.read_text(encoding="utf-8"))
+                gallery_state = state["galleries"][0]
+                self.assertEqual("verified", gallery_state["validation"]["status"])
+                self.assertEqual(1, gallery_state["repair_attempts"])
+                self.assertEqual(
+                    expected_initial_status,
+                    gallery_state["repair_history"][0]["trigger_validation"]["status"],
+                )
+                updates = [
+                    call for call in studio.calls
+                    if call["path"].endswith("/handler/update_play_config")
+                ]
+                self.assertEqual(1, len(updates))
+                repaired_config = updates[0]["kwargs"]["json"]["play_config"]
+                self.assertEqual(valid_time_config(2), repaired_config["time_config"])
+                self.assertFalse(repaired_config["show_subtitles"])
+                self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+
     def test_unreadable_play_config_still_writes_local_timeline_but_remains_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
