@@ -120,6 +120,58 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             self.assertEqual(module.ATOMIC_WRITE_REPLACE_RETRIES + 1, replace.call_count)
             self.assertEqual(module.ATOMIC_WRITE_REPLACE_RETRIES, sleep.call_count)
 
+    def test_publish_checkpoint_records_safe_audio_multipart_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_manifest_bundle(root)
+            operation_path = root / "operation.json"
+            self._write_operation_file(operation_path, manifest)
+
+            class MetadataStudio(self._FakeStudioSession):
+                def request(self, *, method, url, **kwargs):
+                    response = super().request(method=method, url=url, **kwargs)
+                    if urlparse(url).path.endswith("/handler/get_upload_info"):
+                        payload = response.json()
+                        payload.update({"bucket": "course-audio", "region": "cn-beijing"})
+                        payload["Credentials"]["AccessKeySecret"] = "secret-key-value"
+                        payload["Credentials"]["SecurityToken"] = "sts-token-value"
+                        return PublishImageGalleryBlockTests._FakeResponse(payload)
+                    return response
+
+            studio = MetadataStudio()
+            with patch.object(
+                module,
+                "sts_multipart_upload_audio",
+                return_value={
+                    "object_key": "course/audio/object.mp3",
+                    "upload_id": "multipart-id-secret",
+                    "parts": 3,
+                    "size": 10,
+                },
+            ) as upload:
+                exit_code, stdout, stderr = self._run_publisher_cli(
+                    manifest,
+                    operation_path,
+                    studio,
+                    skip_oss_multipart=False,
+                )
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            upload.assert_called_once()
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            evidence = state["galleries"][0]["publish"]["audio_upload_evidence"]
+            self.assertEqual({
+                "upload_key_path": "course/audio/object.mp3",
+                "bucket": "course-audio",
+                "region": "cn-beijing",
+                "multipart_part_count": 3,
+                "multipart_completed": True,
+                "local_size_bytes": 10,
+            }, evidence)
+            persisted = stdout + stderr + json.dumps(state)
+            for secret in ("secret-key-value", "sts-token-value", "multipart-id-secret"):
+                self.assertNotIn(secret, persisted)
+
     def _write_manifest_bundle(self, root: Path) -> Path:
         image_path = root / "page-001.png"
         audio_path = root / "full_speech.mp3"
@@ -210,7 +262,15 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         state["galleries"][0]["publish"] = publish
         operation_path.write_text(json.dumps(state), encoding="utf-8")
 
-    def _run_publisher_cli(self, manifest_path: Path, operation_path: Path, fake_session, *, gallery_key: str = "gallery-1") -> tuple[int, str, str]:
+    def _run_publisher_cli(
+        self,
+        manifest_path: Path,
+        operation_path: Path,
+        fake_session,
+        *,
+        gallery_key: str = "gallery-1",
+        skip_oss_multipart: bool = True,
+    ) -> tuple[int, str, str]:
         args = [
             "publish_imagegallery_block.py",
             "--studio-url",
@@ -220,7 +280,6 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             "--execute",
             "--cookie",
             "sessionid=do-not-persist; csrftoken=csrf-do-not-persist",
-            "--skip-oss-multipart",
             "--operation-file",
             str(operation_path),
             "--gallery-key",
@@ -228,6 +287,8 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             "--auth-retry-delay-seconds",
             "0",
         ]
+        if skip_oss_multipart:
+            args.append("--skip-oss-multipart")
         stdout = StringIO()
         stderr = StringIO()
         with patch("sys.argv", args), patch.object(module.requests, "Session", return_value=fake_session), patch.dict(
@@ -2914,7 +2975,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
         self.assertIn("`本节要点组件`", publishing_doc)
         self.assertIn("失败步骤", publishing_doc)
         self.assertIn("最多执行两轮", audit_doc)
-        self.assertIn("课程结构或 Gallery 归属无法确认时不发起课程写入", audit_doc)
+        self.assertIn("课程结构或 Gallery 归属无法确认时不发起 Studio 写入", audit_doc)
         self.assertIn("可直接打开的 Studio vertical 链接", report_doc)
         self.assertNotIn("nlm-course-auditor", all_docs)
 

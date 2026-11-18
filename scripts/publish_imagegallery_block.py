@@ -1374,13 +1374,23 @@ def sts_multipart_upload_audio(ctx: dict[str, Any]) -> dict[str, Any]:
     bucket = oss2.Bucket(auth, endpoint, bucket_name)
 
     total_size = audio_file.stat().st_size
+    upload_evidence = safe_audio_upload_evidence({
+        "upload_key_path": object_key,
+        "bucket": bucket_name,
+        "region": region,
+        "multipart_part_count": 0,
+        "multipart_completed": False,
+        "local_size_bytes": total_size,
+    })
+    ctx["audio_upload_evidence"] = upload_evidence
     part_size = oss2.determine_part_size(total_size, preferred_size=5 * 1024 * 1024)
-    init_res = bucket.init_multipart_upload(object_key)
-    upload_id = init_res.upload_id
     parts = []
     uploaded_parts = 0
+    upload_id = ""
 
     try:
+        init_res = bucket.init_multipart_upload(object_key)
+        upload_id = init_res.upload_id
         with audio_file.open("rb") as fp:
             part_number = 1
             offset = 0
@@ -1396,14 +1406,22 @@ def sts_multipart_upload_audio(ctx: dict[str, Any]) -> dict[str, Any]:
                 offset += num_to_upload
                 part_number += 1
                 uploaded_parts += 1
+                upload_evidence["multipart_part_count"] = uploaded_parts
+                ctx["audio_upload_evidence"] = dict(upload_evidence)
 
         bucket.complete_multipart_upload(object_key, upload_id, parts)
+        upload_evidence["multipart_completed"] = True
     except Exception:
-        try:
-            bucket.abort_multipart_upload(object_key, upload_id)
-        except Exception:
-            pass
+        upload_evidence["multipart_part_count"] = uploaded_parts
+        upload_evidence["multipart_completed"] = False
+        ctx["audio_upload_evidence"] = dict(upload_evidence)
+        if upload_id:
+            try:
+                bucket.abort_multipart_upload(object_key, upload_id)
+            except Exception:
+                pass
         raise
+    ctx["audio_upload_evidence"] = dict(upload_evidence)
 
     return {
         "object_key": object_key,
@@ -1779,6 +1797,28 @@ def safe_step_record(record: dict[str, Any], *, page_image: str = "") -> dict[st
     return safe
 
 
+def safe_audio_upload_evidence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in ("upload_key_path", "bucket", "region"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            if key == "upload_key_path":
+                item = item.split("?", 1)[0].split("#", 1)[0]
+                if "://" in item:
+                    item = urlparse(item).path
+            safe[key] = item[:500]
+    for key in ("multipart_part_count", "local_size_bytes"):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            safe[key] = item
+    item = value.get("multipart_completed")
+    if isinstance(item, bool):
+        safe["multipart_completed"] = item
+    return safe
+
+
 def safe_preview_url(url: str) -> str:
     parsed = urlsplit(url)
     safe_query = []
@@ -1940,7 +1980,12 @@ class PublishCheckpoint:
         audio_document_id = previous.get("audio_document_id")
         if isinstance(audio_document_id, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", audio_document_id):
             self.state["audio_document_id"] = audio_document_id
-        self.gallery_locator = str(self.gallery.get("gallery_locator") or previous.get("gallery_locator") or "").strip()
+        audio_upload_evidence = safe_audio_upload_evidence(previous.get("audio_upload_evidence"))
+        if audio_upload_evidence:
+            self.state["audio_upload_evidence"] = audio_upload_evidence
+        locator_key = "repair_gallery_locator" if field == "repair_publish" else "gallery_locator"
+        self.gallery_locator_key = locator_key
+        self.gallery_locator = str(self.gallery.get(locator_key) or previous.get("gallery_locator") or "").strip()
         self.resume = bool(self.state["completed_stage"] or self.state["active_step"] or self.state["status"] in {"in_progress", "failed"})
 
     @staticmethod
@@ -2000,7 +2045,7 @@ class PublishCheckpoint:
 
     def persist(self) -> None:
         if self.gallery_locator:
-            self.gallery["gallery_locator"] = self.gallery_locator
+            self.gallery[self.gallery_locator_key] = self.gallery_locator
         self.gallery[self.field] = self.state
         atomic_write_json(self.path, self.operation)
 
@@ -2052,6 +2097,12 @@ class PublishCheckpoint:
         self.state.pop("active_page_image", None)
         self.state["status"] = "in_progress"
         self.persist()
+
+    def record_audio_upload_evidence(self, evidence: Any) -> None:
+        safe = safe_audio_upload_evidence(evidence)
+        if safe:
+            self.state["audio_upload_evidence"] = safe
+            self.persist()
 
     def fail(self, exc: Exception, step_name: str, *, page_image: str = "") -> None:
         self.state["status"] = "failed"
@@ -2453,8 +2504,10 @@ def build_publish_args_for_target(
         skip_oss_multipart=bool(getattr(base_args, "skip_oss_multipart", False)),
         auth_retry_max_retries=int(getattr(base_args, "auth_retry_max_retries", DEFAULT_AUTH_RETRY_MAX_RETRIES)),
         auth_retry_delay_seconds=float(getattr(base_args, "auth_retry_delay_seconds", DEFAULT_AUTH_RETRY_DELAY_SECONDS)),
+        show_subtitles=getattr(base_args, "show_subtitles", True),
         operation_file=str(getattr(base_args, "operation_file", "") or ""),
         gallery_key=str(getattr(base_args, "gallery_key", "") or ""),
+        checkpoint_field=str(getattr(base_args, "checkpoint_field", "publish") or "publish"),
     )
 
 
@@ -2580,7 +2633,11 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
         "items_obj": items_obj,
         "time_config_json": json.dumps(time_config_obj, ensure_ascii=False),
         "time_config_obj": time_config_obj,
-        "show_subtitles": True,
+        "show_subtitles": (
+            getattr(args, "show_subtitles", True)
+            if isinstance(getattr(args, "show_subtitles", True), bool)
+            else True
+        ),
         "uploaded_asset_ids": [],
     }
     if ctx["course_key"]:
@@ -3094,6 +3151,27 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
             if ctx.get("edx_document_id"):
                 ctx["audio_document_id"] = f"{ctx['edx_document_id']}.{ctx['audio_post_fix']}"
             accept_step(prepare_step, stage="audio_prepared", audio_document_id=str(ctx.get("edx_document_id", "")))
+            audio_file_size = None
+            try:
+                audio_file_size = Path(str(ctx.get("audio_file", ""))).stat().st_size
+            except OSError:
+                pass
+            prepared_upload_evidence = safe_audio_upload_evidence({
+                "upload_key_path": (
+                    f"{ctx.get('file_key', '')}.{ctx.get('audio_post_fix', '')}"
+                    if ctx.get("file_key") and ctx.get("audio_post_fix")
+                    else str(ctx.get("file_key") or "")
+                ),
+                "bucket": ctx.get("bucket"),
+                "region": ctx.get("region"),
+                "multipart_part_count": 0,
+                "multipart_completed": False,
+                "local_size_bytes": audio_file_size,
+            })
+            if prepared_upload_evidence:
+                ctx["audio_upload_evidence"] = prepared_upload_evidence
+                if checkpoint:
+                    checkpoint.record_audio_upload_evidence(prepared_upload_evidence)
 
             if execute and not args.skip_oss_multipart:
                 if checkpoint:
@@ -3101,12 +3179,24 @@ def run_single_publish(args: argparse.Namespace) -> dict[str, Any]:
                 try:
                     multipart_result = sts_multipart_upload_audio(ctx)
                 except Exception as exc:
+                    if checkpoint and isinstance(ctx.get("audio_upload_evidence"), dict):
+                        checkpoint.record_audio_upload_evidence(ctx["audio_upload_evidence"])
                     mark_failure(exc, "upload_audio_multipart")
                     raise
+                completed_upload_evidence = safe_audio_upload_evidence({
+                    "upload_key_path": multipart_result.get("object_key") or prepared_upload_evidence.get("upload_key_path"),
+                    "bucket": multipart_result.get("bucket") or ctx.get("bucket"),
+                    "region": ctx.get("region"),
+                    "multipart_part_count": multipart_result.get("parts"),
+                    "multipart_completed": True,
+                    "local_size_bytes": multipart_result.get("size"),
+                })
+                ctx["audio_upload_evidence"] = completed_upload_evidence
                 multipart_step = {"step": "upload_audio_multipart", "status": "ok", "result": {"parts": multipart_result["parts"], "size": multipart_result["size"]}}
                 logs.append(multipart_step)
                 if checkpoint:
                     checkpoint.record_success(multipart_step, stage="audio_uploaded", audio_document_id=str(ctx.get("edx_document_id", "")))
+                    checkpoint.record_audio_upload_evidence(completed_upload_evidence)
                 ctx["audio_object_key"] = multipart_result["object_key"]
             elif not execute:
                 logs.append({"step": "upload_audio_multipart", "status": "dry-run", "note": "execute mode uploads audio through OSS multipart"})
@@ -4234,7 +4324,8 @@ def process_publish_target(
             if not target_args.gallery_key:
                 raise PublishFailure("operation_file", "target is missing its gallery_key")
             PublishCheckpoint.load(target_args.operation_file, target_args.gallery_key,
-                                   manifest_path=Path(target_args.manifest).expanduser().resolve(), vertical_block_id=vertical)
+                                   manifest_path=Path(target_args.manifest).expanduser().resolve(), vertical_block_id=vertical,
+                                   field=target_args.checkpoint_field)
         single: dict[str, Any] = {}
         error = None
         try:
@@ -4278,10 +4369,12 @@ def process_publish_target(
         record = operation_gallery_checkpoint(target_args)
         if record is not None:
             path, operation, entry = record
-            if error and not isinstance(entry.get("publish"), dict):
-                entry["publish"] = {"status": "failed", "failed_step": safe_step_name(getattr(error, "step_name", "publish")),
-                                    "error_summary": safe_error_summary(error), "steps": [safe_step_record(step) for step in steps[:-len(action_steps)]]}
-            entry["initial_vertical_publish"] = {"status": vertical_step["status"], **({"error_summary": vertical_step["reason"]} if vertical_step.get("reason") else {})}
+            checkpoint_field = target_args.checkpoint_field
+            if error and not isinstance(entry.get(checkpoint_field), dict):
+                entry[checkpoint_field] = {"status": "failed", "failed_step": safe_step_name(getattr(error, "step_name", "publish")),
+                                           "error_summary": safe_error_summary(error), "steps": [safe_step_record(step) for step in steps[:-len(action_steps)]]}
+            vertical_field = "repair_vertical_publish" if checkpoint_field == "repair_publish" else "initial_vertical_publish"
+            entry[vertical_field] = {"status": vertical_step["status"], **({"error_summary": vertical_step["reason"]} if vertical_step.get("reason") else {})}
             atomic_write_json(path, operation)
             persist_vertical_integrity_evidence(target_args, result)
         return result

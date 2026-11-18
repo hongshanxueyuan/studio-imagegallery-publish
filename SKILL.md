@@ -12,7 +12,7 @@ description: 使用可配置的 API 适配器，将本地 imagesgallery 包发�
 ## 必需输入
 
 - 一个 Studio 小节 URL，或显式 vertical locator。
-- 本地 ImageGallery manifest。正常发布使用完整 Stage-B 包；仅在用户明确要求修复且本地素材缺失或路径失效时，先按本地素材恢复规则补齐。
+- 本地 ImageGallery manifest。正常发布使用完整 Stage-B 包；老课程批次自审也可提供含 `course_id` 和 `targets` 的本地 `targets-file`，具体映射规则见[本地素材恢复规则](references/local-material-repair.md)。
 - 批次发布可选用目标文件、报告文件和课程结构信息。完整输入约定见 [发布和替换规则](references/publishing-and-replacement.md)。
 
 ## 工作流
@@ -45,6 +45,17 @@ python scripts/validate_imagegallery_batch.py \
   --operation-file "/path/to/batch-operation.json" \
   --execute
 ```
+
+没有 operation 文件的老课程包可直接从目标清单只读检查；若同目录已有默认 operation 文件，验证器会复用并校验课程归属：
+
+```bash
+python scripts/validate_imagegallery_batch.py \
+  --studio-url "https://studio.example.com/container/block-v1:ORG+COURSE+RUN+type@vertical+block@XXXX" \
+  --targets-file "/path/to/legacy-targets.json" \
+  --check
+```
+
+仅在用户明确要求“检查并修复”时使用 `--execute`。缺少本地素材时，验证器会在目标唯一且素材来源可用时调用单小节恢复；生成器 skill 根目录可由 `PPT_TO_IMAGESGALLERY_ROOT` 或 `--ppt-to-imagesgallery-root` 提供。
 
 ## 资源
 
