@@ -256,6 +256,11 @@ def make_incomplete_course_structure():
 
 
 class ValidateImageGalleryBatchTests(unittest.TestCase):
+    def test_play_config_untrusted_signal_reads_legacy_persisted_flag(self):
+        self.assertTrue(module.play_config_is_untrusted({"play_config_untrusted": True}))
+        self.assertTrue(module.play_config_is_untrusted({"play_config_read_failed": True}))
+        self.assertFalse(module.play_config_is_untrusted({}))
+
     def test_cli_reports_initial_failure_separately_from_verified_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -606,6 +611,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     expected_initial_status,
                     gallery_state["repair_history"][0]["trigger_validation"]["status"],
                 )
+                trigger_validation = gallery_state["repair_history"][0]["trigger_validation"]
+                if case == "non_list_time_config":
+                    self.assertTrue(trigger_validation["play_config_untrusted"])
+                    self.assertNotIn("play_config_read_failed", trigger_validation)
                 updates = [
                     call for call in studio.calls
                     if call["path"].endswith("/handler/update_play_config")
@@ -615,6 +624,49 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertEqual(valid_time_config(2), repaired_config["time_config"])
                 self.assertFalse(repaired_config["show_subtitles"])
                 self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+
+    def test_invalid_subtitle_visibility_uses_canonical_untrusted_flag_and_remains_repairable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "show_subtitles": False,
+                "audios": [{}],
+            }}, payload_overrides={(GALLERY_1, "get_play_config"): {
+                "play_config": {"time_config": valid_time_config(2), "show_subtitles": "false"},
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery_state = state["galleries"][0]
+            self.assertEqual("unverified", gallery_state["validation"]["status"])
+            self.assertTrue(gallery_state["validation"]["repairable"])
+            self.assertTrue(gallery_state["validation"]["play_config_untrusted"])
+            self.assertNotIn("play_config_read_failed", gallery_state["validation"])
+            self.assertEqual(2, gallery_state["repair_attempts"])
+            for attempt in gallery_state["repair_history"]:
+                trigger_validation = attempt["trigger_validation"]
+                self.assertTrue(trigger_validation["play_config_untrusted"])
+                self.assertNotIn("play_config_read_failed", trigger_validation)
+                self.assertTrue(trigger_validation["repairable"])
+            updates = [
+                call for call in studio.calls
+                if call["path"].endswith("/handler/update_play_config")
+            ]
+            self.assertEqual(2, len(updates))
+            self.assertTrue(all(
+                call["kwargs"]["json"]["play_config"]["time_config"] == valid_time_config(2)
+                for call in updates
+            ))
 
     def test_unreadable_play_config_still_writes_local_timeline_but_remains_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -645,6 +697,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertNotIn("show_subtitles", play_config)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
+            validation = state["galleries"][0]["validation"]
+            self.assertTrue(validation["play_config_untrusted"])
+            self.assertTrue(validation["play_config_read_failed"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
             self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
 
@@ -1514,6 +1569,8 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
                 if handler == "get_play_config":
                     self.assertEqual(2, state["galleries"][0]["repair_attempts"])
+                    self.assertTrue(state["galleries"][0]["validation"]["play_config_untrusted"])
+                    self.assertNotIn("play_config_read_failed", state["galleries"][0]["validation"])
                     updates = [
                         call for call in studio.calls
                         if call["path"].endswith("/handler/update_play_config")
