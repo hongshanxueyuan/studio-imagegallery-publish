@@ -6,12 +6,16 @@
 
 先将 Studio vertical 唯一映射到一个本地 manifest。只有需要重建图片时，才进一步唯一确定源 PPT 和对应的 `section-list.json` 记录；若缺少页面讲解文本，再唯一确定可提供文本的 section 记录。优先用 `section_id` 匹配；没有 ID 时才用唯一的 section 标题匹配。无法唯一确定目标或所需来源时，不猜路径、不启动整批规划，也不发布该目标；将该目标报告为无法验证，并继续其他独立目标。
 
+老课程包可通过 validator 的 `--targets-file` 提供课程及目标清单。清单未指定 operation 文件时，验证器复用同目录下的 `<目标文件名>.batch-operation.json`（若存在）；复用前会核对 operation 文件的课程与 Studio URL 中的课程一致。没有 operation 文件时，按课程、小节 ID 优先、唯一标题兜底映射。相对的 `manifest`、PPT、section JSON、`section-list.json` 和 `audio_search_root` 路径均相对于 targets 文件目录解析。只读检查使用 `--check`，不会重建素材或写 Studio。
+
 只对受影响小节调用 `ppt-to-imagesgallery` skill 的 `scripts/repair_imagesgallery_materials.py`。不要运行 `plan_batch_jobs.py`，也不要直接用会重建整个 Gallery 目录的单 deck builder 覆盖现有 Stage-B 包。
 
 ```bash
 python <ppt-to-imagesgallery-skill-root>/scripts/repair_imagesgallery_materials.py \
   --manifest "/path/to/imagesgallery.json"
 ```
+
+validator 会按安装路径查找生成器 skill；找不到默认安装时，可用 `PPT_TO_IMAGESGALLERY_ROOT` 或 `--ppt-to-imagesgallery-root` 指定其根目录。只有用户明确要求“检查并修复”时才运行 `--execute`；本地重建完整后才继续整段 Gallery 替换。
 
 `--manifest` 必需。图片缺失时必须同时提供 `--ppt` 与 `--section-json`，两者须精确对应同一目标小节；只缺字幕或时间轴且 manifest 的页面讲解文本不完整时，可单独提供 `--section-json` 补全文本。若音频需重建但 manifest 已有完整页面文本，则无需 `--section-json`。`--audio-search-root` 可选；修复失效的音频路径时，将它设为范围尽可能窄的本地课程素材目录。省略时，工具只在 Gallery 包目录内搜索。
 
