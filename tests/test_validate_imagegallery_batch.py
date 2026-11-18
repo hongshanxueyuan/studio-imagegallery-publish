@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -49,6 +49,16 @@ class FakeResponse:
         return self.payload
 
 
+class FakeRangeResponse:
+    def __init__(self, status_code=206, *, headers=None, content=b"x"):
+        self.status_code = status_code
+        self.headers = headers or {"Content-Range": "bytes 0-0/999", "Content-Length": "1"}
+        self.raw = BytesIO(content)
+
+    def close(self):
+        self.raw.close()
+
+
 class FakeCookies:
     def set(self, *_args, **_kwargs):
         return None
@@ -70,6 +80,7 @@ class FakeStudio:
         self.course_reads = 0
         self.publication_reads = 0
         self.next_asset = 1
+        self.next_gallery = 1
         self.assets = []
         for gallery in galleries.values():
             for index, item in enumerate(gallery["files"], start=1):
@@ -111,6 +122,44 @@ class FakeStudio:
             page = int((kwargs.get("params") or {}).get("page", 0))
             return FakeResponse({"assets": self.assets if page == 0 else [], "totalCount": len(self.assets), "page": page, "pageSize": 50})
 
+        if method == "POST" and path == "/xblock/":
+            vertical = (kwargs.get("json") or {}).get("parent_locator", "")
+            gallery = f"block-v1:ORG+COURSE+RUN+type@imagesgallery+block@created-{self.next_gallery}"
+            self.next_gallery += 1
+            self.galleries[gallery] = {"files": [], "time_config": [], "audios": []}
+            override = self.vertical_overrides.setdefault(vertical, {})
+            override["has_changes"] = True
+            if not isinstance(override.get("blocks"), list):
+                original_gallery = GALLERY_1 if vertical == VERTICAL_1 else GALLERY_2
+                summary = vertical.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+                override["blocks"] = []
+                if original_gallery in self.galleries:
+                    override["blocks"].append({"id": original_gallery, "category": "imagesgallery", "display_name": "有声幻灯片"})
+                override["blocks"].append({"id": summary, "category": "html", "display_name": "本节要点"})
+            override["blocks"].append({"id": gallery, "category": "imagesgallery", "display_name": "有声幻灯片"})
+            return FakeResponse({"locator": gallery})
+
+        if method == "DELETE" and path.startswith("/xblock/") and "+type@vertical+" not in path:
+            locator = path[len("/xblock/"):]
+            self.galleries.pop(locator, None)
+            for override in self.vertical_overrides.values():
+                if isinstance(override.get("blocks"), list):
+                    original_count = len(override["blocks"])
+                    override["blocks"][:] = [block for block in override["blocks"] if block.get("id") != locator]
+                    if len(override["blocks"]) != original_count:
+                        override["has_changes"] = True
+            return FakeResponse({"ok": True})
+
+        if method == "PUT" and path.startswith("/xblock/") and "+type@vertical+" in path:
+            vertical = path[len("/xblock/"):]
+            override = self.vertical_overrides.setdefault(vertical, {"blocks": []})
+            override["has_changes"] = True
+            blocks = override.setdefault("blocks", [])
+            by_id = {block["id"]: block for block in blocks if isinstance(block, dict) and isinstance(block.get("id"), str)}
+            requested = (kwargs.get("json") or {}).get("children", [])
+            override["blocks"] = [by_id[locator] for locator in requested if locator in by_id]
+            return FakeResponse({"ok": True})
+
         for gallery_locator, gallery in self.galleries.items():
             preview_prefix = f"/preview/xblock/{gallery_locator}/handler/"
             author_prefix = f"/xblock/{gallery_locator}/handler/"
@@ -148,7 +197,15 @@ class FakeStudio:
                 return FakeResponse(override if override is not None else {"play_config": play_config})
             if method == "POST" and path == preview_prefix + "get_audios":
                 override = self.payload_overrides.get((gallery_locator, "get_audios"))
-                return FakeResponse(override if override is not None else {"audios": gallery["audios"]})
+                audios = gallery["audios"]
+                if audios == [{}]:
+                    audios = [{"document_id": "doc-1.mp3"}]
+                return FakeResponse(override if override is not None else {"audios": audios})
+            if method == "POST" and path == preview_prefix + "get_audio_download_url":
+                override = self.payload_overrides.get((gallery_locator, "get_audio_download_url"))
+                return FakeResponse(override if override is not None else {
+                    "download_url": "https://objects.example.com/audio/doc-1.mp3?signature=signed-secret&token=sts-secret",
+                })
             if method == "POST" and path == author_prefix + "remove_files":
                 requested = set((kwargs.get("json") or {}).get("assets", []))
                 gallery["files"] = [
@@ -213,8 +270,18 @@ class FakeStudio:
 
 
 def make_course_structure(galleries, vertical_overrides=None):
+    vertical_overrides = vertical_overrides or {}
+    override_gallery_locators = {
+        block.get("id")
+        for override in vertical_overrides.values()
+        if isinstance(override, dict) and isinstance(override.get("blocks"), list)
+        for block in override["blocks"]
+        if isinstance(block, dict) and block.get("category") == "imagesgallery"
+    }
     blocks_by_vertical = {VERTICAL_1: [], VERTICAL_2: []}
     for locator in galleries:
+        if locator in override_gallery_locators:
+            continue
         vertical = VERTICAL_1 if locator == GALLERY_1 else VERTICAL_2
         blocks_by_vertical[vertical].extend([
             {"id": locator, "category": "imagesgallery", "display_name": "有声幻灯片"},
@@ -224,7 +291,6 @@ def make_course_structure(galleries, vertical_overrides=None):
                 "display_name": "本节要点",
             },
         ])
-    vertical_overrides = vertical_overrides or {}
     vertical_nodes = []
     for locator in dict.fromkeys([*blocks_by_vertical, *vertical_overrides]):
         override = vertical_overrides.get(locator, {})
@@ -280,6 +346,275 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertIn("后置审核：全部通过", report)
             self.assertIn(VERTICAL_1, report)
             self.assertEqual("failed", state["galleries"][0]["publish"]["status"])
+
+    def test_cli_checks_bound_audio_object_with_one_byte_range_and_safe_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            operation_path = root / "operation.json"
+            operation = self._operation(manifest)
+            operation["galleries"][0]["publish"]["audio_upload_evidence"] = {
+                "upload_key_path": "audio/course.mp3?signature=upload-secret",
+                "bucket": "course-audio",
+                "region": "cn-beijing",
+                "multipart_part_count": 2,
+                "multipart_completed": True,
+                "Credentials": {"AccessKeyId": "sts-secret"},
+            }
+            self._write_operation_file(operation_path, operation)
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+            object_requests = []
+
+            def get_object(url, **kwargs):
+                object_requests.append((url, kwargs))
+                return FakeRangeResponse()
+
+            code, stdout, stderr = self._run_cli(
+                operation_path,
+                studio,
+                execute=False,
+                object_get=get_object,
+            )
+
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            validation = state["galleries"][0]["validation"]
+            self.assertEqual(0, code, stdout + stderr)
+            self.assertEqual("pass", validation["checks"]["audio_bindings"])
+            self.assertEqual("pass", validation["checks"]["audio_object_accessibility"])
+            self.assertEqual("accessible", validation["observed"]["audio_object_accessibility"])
+            summary_checks = state["batch_result"]["galleries"][0]["checks"]
+            self.assertEqual("pass", summary_checks["audio_bindings"])
+            self.assertEqual("pass", summary_checks["audio_object_accessibility"])
+            self.assertEqual("doc-1.mp3", validation["observed"]["audio_id"])
+            self.assertEqual(1, len(object_requests))
+            self.assertEqual("bytes=0-0", object_requests[0][1]["headers"]["Range"])
+            self.assertTrue(object_requests[0][1]["stream"])
+            download_call = next(call for call in studio.calls if call["path"].endswith("/get_audio_download_url"))
+            self.assertEqual({"audio_id": "doc-1.mp3"}, download_call["kwargs"]["json"])
+            evidence = state["galleries"][0]["audio_evidence"]
+            self.assertEqual(206, evidence["download_http_status"])
+            self.assertEqual(999, evidence["object_length_bytes"])
+            self.assertEqual(10, evidence["local_size_bytes"])
+            self.assertEqual("72401f193251f177a310936253acb57e91e29d2aa582093974351e65e267bb32", evidence["local_sha256"])
+            self.assertEqual("audio/course.mp3", evidence["upload_key_path"])
+            self.assertEqual("/audio/doc-1.mp3", evidence["download_key_path"])
+            self.assertFalse(evidence["key_paths_match"])
+            self.assertEqual("course-audio", evidence["bucket"])
+            self.assertEqual("cn-beijing", evidence["region"])
+            self.assertEqual(2, evidence["multipart_part_count"])
+            self.assertTrue(evidence["multipart_completed"])
+            self.assertNotIn("signed-secret", json.dumps(state))
+            self.assertNotIn("upload-secret", json.dumps(state))
+            self.assertNotIn("sts-secret", json.dumps(state))
+            self.assertNotIn("signed-secret", stdout)
+            self.assertNotIn("sts-secret", stdout)
+
+    def test_cli_classifies_missing_and_unconfirmed_audio_objects(self):
+        scenarios = (
+            (200, b"x", {"Content-Length": "200"}, "accessible", "pass"),
+            (206, b"x", {"Content-Range": "bytes 0-0/200", "Content-Length": "1"}, "accessible", "pass"),
+            (206, b"", {"Content-Range": "bytes 0-0/200", "Content-Length": "0"}, "unverified", "unverified"),
+            (403, b"", {}, "unverified", "unverified"),
+            (404, b"", {}, "missing", "mismatch"),
+            (400, b"<Error><Code>NoSuchKey</Code></Error>", {}, "missing", "mismatch"),
+        )
+        for status_code, body, headers, expected_access, expected_check in scenarios:
+            with self.subTest(status_code=status_code, body=body):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    manifest = self._write_bundle(root)
+                    operation_path = root / "operation.json"
+                    self._write_operation_file(operation_path, self._operation(manifest))
+                    studio = FakeStudio({GALLERY_1: {
+                        "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                        "time_config": valid_time_config(2),
+                        "audios": [{"document_id": "doc-1.mp3"}],
+                    }})
+                    code, stdout, stderr = self._run_cli(
+                        operation_path,
+                        studio,
+                        execute=False,
+                        object_get=lambda _url, **_kwargs: FakeRangeResponse(
+                            status_code,
+                            headers=headers,
+                            content=body,
+                        ),
+                    )
+                    state = json.loads(operation_path.read_text(encoding="utf-8"))
+                    validation = state["galleries"][0]["validation"]
+                    self.assertEqual(0 if expected_check == "pass" else 1, code, stdout + stderr)
+                    self.assertEqual(expected_access, validation["observed"]["audio_object_accessibility"])
+                    self.assertEqual(expected_check, validation["checks"]["audio_object_accessibility"])
+
+    def test_cli_classifies_audio_object_transport_errors_as_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            operation_path = root / "operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+
+            def fail_transport(_url, **_kwargs):
+                raise publisher.requests.ConnectionError("transport-secret")
+
+            code, stdout, stderr = self._run_cli(
+                operation_path,
+                studio,
+                execute=False,
+                object_get=fail_transport,
+            )
+
+            self.assertEqual(1, code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            validation = state["galleries"][0]["validation"]
+            self.assertEqual("unverified", validation["observed"]["audio_object_accessibility"])
+            self.assertEqual("unverified", validation["checks"]["audio_object_accessibility"])
+            self.assertEqual("unverified", state["galleries"][0]["audio_evidence"]["object_accessibility"])
+            self.assertNotIn("transport-secret", stdout + stderr + json.dumps(state))
+
+    def test_cli_rejects_operation_file_for_another_course_before_studio_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            operation_path = root / "operation.json"
+            operation = self._operation(manifest)
+            operation["course_id"] = "course-v1:OTHER+COURSE+RUN"
+            self._write_operation_file(operation_path, operation)
+            original_operation = operation_path.read_bytes()
+            studio = FakeStudio({GALLERY_1: {
+                "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+
+            code, stdout, stderr = self._run_cli(operation_path, studio, execute=False)
+
+            self.assertEqual(2, code)
+            self.assertEqual([], studio.calls)
+            self.assertEqual(original_operation, operation_path.read_bytes())
+            error = json.loads(stdout)
+            self.assertEqual("failed", error["status"])
+            self.assertIn("operation file does not match", error["error_summary"])
+            self.assertEqual("", stderr)
+
+    def test_summary_exposes_audio_binding_and_object_access_states_separately(self):
+        scenarios = (
+            (404, "missing", "mismatch", "issue", "对象缺失（404/NoSuchKey）"),
+            (403, "unverified", "unverified", "unverified", "对象可访问性暂时无法确认"),
+        )
+        for status_code, expected_access, expected_check, expected_report_status, expected_message in scenarios:
+            with self.subTest(expected_access=expected_access), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root)
+                operation_path = root / "operation.json"
+                self._write_operation_file(operation_path, self._operation(manifest))
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                    "time_config": valid_time_config(2),
+                    "audios": [{"document_id": "doc-1.mp3"}],
+                }})
+
+                code, stdout, stderr = self._run_cli(
+                    operation_path,
+                    studio,
+                    execute=False,
+                    object_get=lambda _url, **_kwargs: FakeRangeResponse(
+                        status_code,
+                        content=b"" if status_code == 404 else b"",
+                    ),
+                )
+
+                self.assertEqual(1, code, stdout + stderr)
+                batch_result = json.loads(operation_path.read_text(encoding="utf-8"))["batch_result"]
+                summary_gallery = batch_result["galleries"][0]
+                checks = summary_gallery["checks"]
+                self.assertEqual("pass", checks["audio_bindings"])
+                self.assertEqual(expected_check, checks["audio_object_accessibility"])
+                report = batch_result["operator_report"]
+                self.assertEqual(expected_report_status, report["status"])
+                audio_findings = [
+                    finding
+                    for group in report["groups"]
+                    for finding in group["findings"]
+                    if finding["category"] == "音频对象可访问性"
+                ]
+                self.assertEqual(1, len(audio_findings))
+                self.assertIn("音频绑定存在", audio_findings[0]["message"])
+                self.assertIn(expected_message, audio_findings[0]["message"])
+                self.assertNotIn("完整", report["text"])
+
+    def test_cli_does_not_request_download_url_when_binding_count_is_not_one(self):
+        for audios in ([], [{"document_id": "doc-a.mp3"}, {"document_id": "doc-b.mp3"}]):
+            with self.subTest(binding_count=len(audios)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root)
+                operation_path = root / "operation.json"
+                self._write_operation_file(operation_path, self._operation(manifest))
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                    "time_config": valid_time_config(2),
+                    "audios": audios,
+                }})
+                code, stdout, stderr = self._run_cli(operation_path, studio, execute=False)
+                state = json.loads(operation_path.read_text(encoding="utf-8"))
+                validation = state["galleries"][0]["validation"]
+                self.assertEqual(1, code, stdout + stderr)
+                self.assertEqual("mismatch", validation["checks"]["audio_bindings"])
+                self.assertEqual("not_checked", validation["checks"]["audio_object_accessibility"])
+                result = state["batch_result"]
+                self.assertEqual("mismatch", result["galleries"][0]["checks"]["audio_bindings"])
+                self.assertEqual("not_checked", result["galleries"][0]["checks"]["audio_object_accessibility"])
+                findings = [
+                    finding
+                    for group in result["operator_report"]["groups"]
+                    for finding in group["findings"]
+                ]
+                self.assertIn("音频绑定", [finding["category"] for finding in findings])
+                self.assertNotIn("音频对象可访问性", [finding["category"] for finding in findings])
+                self.assertFalse(any(call["path"].endswith("/get_audio_download_url") for call in studio.calls))
+
+    def test_cli_repairs_only_definite_audio_object_missing_and_rechecks_it(self):
+        for initial_access, expected_repairs in (("missing", 1), ("unverified", 0)):
+            with self.subTest(initial_access=initial_access), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root)
+                operation_path = root / "operation.json"
+                self._write_operation_file(operation_path, self._operation(manifest))
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [{"id": "asset-a"}, {"id": "asset-b"}],
+                    "time_config": valid_time_config(2),
+                    "audios": [{"document_id": "doc-1.mp3"}],
+                }})
+                object_statuses = [404 if initial_access == "missing" else 403, 206]
+
+                def get_object(_url, **_kwargs):
+                    status = object_statuses.pop(0) if object_statuses else 206
+                    return FakeRangeResponse(status, content=b"x" if status == 206 else b"")
+
+                code, stdout, stderr = self._run_cli(
+                    operation_path,
+                    studio,
+                    extra_args=("--skip-oss-multipart",),
+                    object_get=get_object,
+                )
+                state = json.loads(operation_path.read_text(encoding="utf-8"))
+                entry = state["galleries"][0]
+                save_audio_calls = [call for call in studio.calls if call["path"].endswith("/handler/save_audio")]
+                self.assertEqual(0 if initial_access == "missing" else 1, code, stdout + stderr)
+                self.assertEqual(expected_repairs, entry["repair_attempts"])
+                self.assertEqual(expected_repairs, len(save_audio_calls))
+                self.assertEqual(
+                    "pass" if initial_access == "missing" else "unverified",
+                    entry["validation"]["checks"]["audio_object_accessibility"],
+                )
 
     def test_two_target_cli_pass_continues_after_unreadable_and_ambiguous_structure(self):
         class SharedStudio(FakeStudio):
@@ -485,7 +820,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(initial_publish, gallery["publish"])
             self.assertEqual("verified", gallery["validation"]["status"])
             self.assertEqual(1, gallery["repair_attempts"])
-            self.assertEqual(["page-001.png", "page-002.png"], [item["display_name"] for item in studio.galleries[GALLERY_1]["files"]])
+            repaired_gallery = studio.galleries[gallery["gallery_locator"]]
+            self.assertNotEqual(GALLERY_1, gallery["gallery_locator"])
+            self.assertEqual(["page-001.png", "page-002.png"], [item["display_name"] for item in repaired_gallery["files"]])
 
     def test_false_show_subtitles_is_preserved_without_repair(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -513,7 +850,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertFalse(any(call["path"].endswith("/handler/update_play_config") for call in studio.calls))
             self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
 
-    def test_missing_audio_binding_repairs_audio_without_rewriting_images_or_play_config(self):
+    def test_missing_audio_binding_replaces_the_gallery_from_the_local_package(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -532,15 +869,27 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(0, exit_code, stdout + stderr)
-            self.assertEqual(1, len(studio.galleries[GALLERY_1]["audios"]))
-            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery_state = state["galleries"][0]
+            repaired_locator = gallery_state["gallery_locator"]
+            self.assertNotEqual(GALLERY_1, repaired_locator)
+            self.assertEqual(2, len(studio.galleries[repaired_locator]["files"]))
+            self.assertEqual(1, len(studio.galleries[repaired_locator]["audios"]))
+            self.assertFalse(studio.galleries[repaired_locator]["show_subtitles"])
+            self.assertEqual("gallery_replacement", gallery_state["repair_history"][0]["repair_mode"])
             paths = [call["path"] for call in studio.calls]
             self.assertTrue(any(path.endswith("/handler/save_audio") for path in paths))
+            self.assertTrue(any(path.endswith("/handler/file_upload") for path in paths))
+            self.assertTrue(any(path.endswith("/handler/update_play_config") for path in paths))
             self.assertFalse(any(path.endswith("/handler/remove_files") for path in paths))
-            self.assertFalse(any(path.endswith("/handler/file_upload") for path in paths))
-            self.assertFalse(any(path.endswith("/handler/update_play_config") for path in paths))
+            deleted_galleries = [
+                call["path"][len("/xblock/"):]
+                for call in studio.calls
+                if call["method"] == "DELETE" and call["path"].startswith("/xblock/")
+            ]
+            self.assertEqual([GALLERY_1], deleted_galleries)
 
-    def test_missing_subtitle_time_config_restores_full_timeline_and_preserves_disabled_display(self):
+    def test_missing_subtitle_time_config_replaces_gallery_and_preserves_disabled_display(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -556,16 +905,19 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 "audios": [{}],
             }})
 
-            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(0, exit_code, stdout + stderr)
             paths = [call["path"] for call in studio.calls]
             self.assertTrue(any(path.endswith("/handler/update_play_config") for path in paths))
             self.assertFalse(any(path.endswith("/handler/remove_files") for path in paths))
-            self.assertFalse(any(path.endswith("/handler/file_upload") for path in paths))
-            self.assertFalse(any(path.endswith("/handler/save_audio") for path in paths))
-            self.assertEqual(valid_time_config(2), studio.galleries[GALLERY_1]["time_config"])
-            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            repaired_locator = state["galleries"][0]["gallery_locator"]
+            self.assertNotEqual(GALLERY_1, repaired_locator)
+            self.assertTrue(any(path.endswith("/handler/file_upload") for path in paths))
+            self.assertTrue(any(path.endswith("/handler/save_audio") for path in paths))
+            self.assertEqual(valid_time_config(2), studio.galleries[repaired_locator]["time_config"])
+            self.assertFalse(studio.galleries[repaired_locator]["show_subtitles"])
 
     def test_malformed_timeline_repairs_from_manifest_and_preserves_disabled_display(self):
         class FirstMalformedPlayConfigStudio(FakeStudio):
@@ -600,7 +952,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self._write_operation_file(operation_path, self._operation(manifest))
                 studio = FirstMalformedPlayConfigStudio(initial_play_config)
 
-                exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
                 self.assertEqual(0, exit_code, stdout + stderr)
                 state = json.loads(operation_path.read_text(encoding="utf-8"))
@@ -615,6 +967,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 if case == "non_list_time_config":
                     self.assertTrue(trigger_validation["play_config_untrusted"])
                     self.assertNotIn("play_config_read_failed", trigger_validation)
+                self.assertEqual("gallery_replacement", gallery_state["repair_history"][0]["repair_mode"])
+                repaired_locator = gallery_state["gallery_locator"]
+                self.assertNotEqual(GALLERY_1, repaired_locator)
                 updates = [
                     call for call in studio.calls
                     if call["path"].endswith("/handler/update_play_config")
@@ -623,9 +978,17 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 repaired_config = updates[0]["kwargs"]["json"]["play_config"]
                 self.assertEqual(valid_time_config(2), repaired_config["time_config"])
                 self.assertFalse(repaired_config["show_subtitles"])
-                self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+                self.assertEqual(valid_time_config(2), studio.galleries[repaired_locator]["time_config"])
+                self.assertFalse(studio.galleries[repaired_locator]["show_subtitles"])
+                self.assertTrue(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+                self.assertTrue(any(call["path"].endswith("/handler/save_audio") for call in studio.calls))
+                self.assertIn(GALLERY_1, [
+                    call["path"][len("/xblock/"):]
+                    for call in studio.calls
+                    if call["method"] == "DELETE" and call["path"].startswith("/xblock/")
+                ])
 
-    def test_invalid_subtitle_visibility_uses_canonical_untrusted_flag_and_remains_repairable(self):
+    def test_invalid_subtitle_visibility_remains_unverified_without_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -643,21 +1006,61 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 "play_config": {"time_config": valid_time_config(2), "show_subtitles": "false"},
             }})
 
-            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(1, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             gallery_state = state["galleries"][0]
             self.assertEqual("unverified", gallery_state["validation"]["status"])
-            self.assertTrue(gallery_state["validation"]["repairable"])
+            self.assertFalse(gallery_state["validation"]["repairable"])
             self.assertTrue(gallery_state["validation"]["play_config_untrusted"])
             self.assertNotIn("play_config_read_failed", gallery_state["validation"])
+            self.assertEqual(0, gallery_state["repair_attempts"])
+            self.assertEqual([], gallery_state["repair_history"])
+            updates = [
+                call for call in studio.calls
+                if call["path"].endswith("/handler/update_play_config")
+            ]
+            self.assertEqual([], updates)
+            self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+
+    def test_unreadable_play_config_replaces_gallery_with_local_timeline_but_stays_unverified(self):
+        class UnreadablePlayConfigStudio(FakeStudio):
+            def _response(self, method, path, kwargs):
+                if method == "POST" and path.endswith("/handler/get_play_config"):
+                    return FakeResponse({"play_config": "unreadable"})
+                return super()._response(method, path, kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = UnreadablePlayConfigStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": [],
+                "show_subtitles": False,
+                "audios": [{}],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery_state = state["galleries"][0]
+            self.assertEqual("unverified", gallery_state["validation"]["status"])
+            self.assertTrue(gallery_state["validation"]["play_config_untrusted"])
+            self.assertTrue(gallery_state["validation"]["play_config_read_failed"])
             self.assertEqual(2, gallery_state["repair_attempts"])
-            for attempt in gallery_state["repair_history"]:
-                trigger_validation = attempt["trigger_validation"]
-                self.assertTrue(trigger_validation["play_config_untrusted"])
-                self.assertNotIn("play_config_read_failed", trigger_validation)
-                self.assertTrue(trigger_validation["repairable"])
+            self.assertTrue(all(
+                attempt["repair_mode"] == "gallery_replacement"
+                for attempt in gallery_state["repair_history"]
+            ))
+            self.assertNotEqual(GALLERY_1, gallery_state["gallery_locator"])
+            self.assertEqual(valid_time_config(2), studio.galleries[gallery_state["gallery_locator"]]["time_config"])
             updates = [
                 call for call in studio.calls
                 if call["path"].endswith("/handler/update_play_config")
@@ -667,43 +1070,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 call["kwargs"]["json"]["play_config"]["time_config"] == valid_time_config(2)
                 for call in updates
             ))
-
-    def test_unreadable_play_config_still_writes_local_timeline_but_remains_unverified(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            manifest = self._write_bundle(root, page_count=2)
-            operation_path = root / "batch-operation.json"
-            self._write_operation_file(operation_path, self._operation(manifest))
-            studio = FakeStudio({GALLERY_1: {
-                "files": [
-                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
-                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
-                ],
-                "time_config": [],
-                "show_subtitles": False,
-                "audios": [{}],
-            }}, payload_overrides={(GALLERY_1, "get_play_config"): {"play_config": "unreadable"}})
-
-            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
-
-            self.assertEqual(1, exit_code, stdout + stderr)
-            updates = [
-                call for call in studio.calls
-                if call["path"].endswith("/handler/update_play_config")
-            ]
-            self.assertTrue(updates)
-            play_config = updates[0]["kwargs"]["json"]["play_config"]
-            self.assertEqual(valid_time_config(2), play_config["time_config"])
-            self.assertNotIn("show_subtitles", play_config)
-            state = json.loads(operation_path.read_text(encoding="utf-8"))
-            self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
-            validation = state["galleries"][0]["validation"]
-            self.assertTrue(validation["play_config_untrusted"])
-            self.assertTrue(validation["play_config_read_failed"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
-            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
+            self.assertTrue(studio.galleries[gallery_state["gallery_locator"]]["show_subtitles"])
 
-    def test_image_count_mismatch_replaces_only_gallery_references_without_deleting_assets(self):
+    def test_image_count_mismatch_replaces_the_entire_gallery_without_deleting_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -719,31 +1089,45 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(0, exit_code, stdout + stderr)
-            self.assertEqual(2, len(studio.galleries[GALLERY_1]["files"]))
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery_state = state["galleries"][0]
+            repaired_locator = gallery_state["gallery_locator"]
+            self.assertNotEqual(GALLERY_1, repaired_locator)
+            repaired_gallery = studio.galleries[repaired_locator]
+            self.assertEqual(2, len(repaired_gallery["files"]))
             self.assertEqual(3, len(studio.assets))
-            self.assertFalse(studio.galleries[GALLERY_1]["show_subtitles"])
-            self.assertEqual(1, sum(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+            self.assertFalse(repaired_gallery["show_subtitles"])
+            self.assertEqual(0, sum(call["path"].endswith("/handler/remove_files") for call in studio.calls))
             self.assertEqual(2, sum(call["path"].endswith("/handler/file_upload") for call in studio.calls))
-            self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
-            self.assertFalse(any(call["path"].endswith("/handler/save_audio") for call in studio.calls))
-            self.assertFalse(any(call["path"].endswith("/handler/update_play_config") for call in studio.calls))
+            self.assertEqual([GALLERY_1], [
+                call["path"][len("/xblock/"):]
+                for call in studio.calls
+                if call["method"] == "DELETE" and call["path"].startswith("/xblock/")
+            ])
+            self.assertTrue(any(call["path"].endswith("/handler/save_audio") for call in studio.calls))
+            self.assertTrue(any(call["path"].endswith("/handler/update_play_config") for call in studio.calls))
+            self.assertEqual("gallery_replacement", gallery_state["repair_history"][0]["repair_mode"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
 
-    def test_equal_image_counts_ignore_names_order_and_asset_ids(self):
+    def test_ordered_image_filenames_match_when_expected_asset_ids_are_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
             operation_path = root / "batch-operation.json"
-            self._write_operation_file(operation_path, self._operation(manifest))
+            operation = self._operation(manifest)
+            operation["galleries"][0]["publish"].pop("asset_ids")
+            operation["galleries"][0]["publish"].pop("images")
+            self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
                 "files": [
-                    {"id": "asset-other-b", "asset_key": "asset-other-b", "display_name": "different-b.png"},
-                    {"id": "asset-other-a", "asset_key": "asset-other-a", "display_name": "different-a.png"},
+                    {"id": "asset-other-a", "asset_key": "asset-other-a", "display_name": "page-001.png"},
+                    {"id": "asset-other-b", "asset_key": "asset-other-b", "display_name": "page-002.png"},
                 ],
                 "time_config": valid_time_config(2),
                 "audios": [{}],
             }})
 
-            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, execute=False)
 
             self.assertEqual(0, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
@@ -751,6 +1135,152 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual("pass", state["galleries"][0]["validation"]["checks"]["images"])
             self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
             self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+
+    def test_reordered_and_wrong_image_references_are_mismatch_and_repairable(self):
+        scenarios = (
+            (
+                "reordered",
+                [
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                ],
+            ),
+            (
+                "wrong reference",
+                [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-wrong", "asset_key": "asset-wrong", "display_name": "other-page.png"},
+                ],
+            ),
+        )
+        for label, files in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                operation_path = root / "batch-operation.json"
+                self._write_operation_file(operation_path, self._operation(manifest))
+                studio = FakeStudio({GALLERY_1: {
+                    "files": files,
+                    "time_config": valid_time_config(2),
+                    "audios": [{}],
+                }})
+
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio, execute=False)
+
+                self.assertEqual(1, exit_code, stdout + stderr)
+                state = json.loads(operation_path.read_text(encoding="utf-8"))
+                validation = state["galleries"][0]["validation"]
+                self.assertEqual("mismatch", validation["status"])
+                self.assertEqual("mismatch", validation["checks"]["images"])
+                self.assertTrue(validation["repairable"])
+                self.assertEqual(0, state["galleries"][0]["repair_attempts"])
+                self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
+                self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+
+    def test_known_image_reference_and_subtitle_differences_replace_the_whole_gallery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            wrong_time_config = valid_time_config(2)
+            wrong_time_config[0]["subtitle"] = "旧字幕文本"
+            wrong_time_config[1]["start"] = 1050
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "stale-asset-a", "asset_key": "stale-asset-a", "display_name": "page-001.png"},
+                    {"id": "stale-asset-b", "asset_key": "stale-asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": wrong_time_config,
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+            replacement_gallery = "block-v1:ORG+COURSE+RUN+type@imagesgallery+block@replacement-gallery"
+            summary_locator = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+            publish_calls = []
+
+            def replace_target(target, _course_structure, publish_args, _adapter, *, previous_result=None):
+                publish_calls.append((target, publish_args, previous_result))
+                self.assertEqual("repair_publish", publish_args.checkpoint_field)
+                self.assertTrue(publish_args.execute)
+                self.assertEqual(VERTICAL_1, target["target_vertical_block_location"])
+                persisted = json.loads(operation_path.read_text(encoding="utf-8"))
+                entry = persisted["galleries"][0]
+                entry["repair_publish"] = {
+                    "status": "completed",
+                    "completed_stage": "saved",
+                    "asset_ids": ["replacement-a", "replacement-b"],
+                    "images": [
+                        {"page": 1, "image": "page-001.png", "asset_id": "replacement-a"},
+                        {"page": 2, "image": "page-002.png", "asset_id": "replacement-b"},
+                    ],
+                }
+                entry["repair_gallery_locator"] = replacement_gallery
+                publisher.atomic_write_json(operation_path, persisted)
+                studio.galleries.pop(GALLERY_1)
+                studio.galleries[replacement_gallery] = {
+                    "files": [
+                        {"id": "replacement-a", "asset_key": "replacement-a", "display_name": "page-001.png"},
+                        {"id": "replacement-b", "asset_key": "replacement-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{"document_id": "doc-1.mp3"}],
+                }
+                studio.vertical_overrides[VERTICAL_1] = {
+                    "blocks": [
+                        {"id": replacement_gallery, "category": "imagesgallery", "display_name": "有声幻灯片"},
+                        {"id": summary_locator, "category": "html", "display_name": "本节要点"},
+                    ],
+                    "published": True,
+                    "has_changes": False,
+                    "visibility_state": "live",
+                }
+                studio.vertical_overrides[VERTICAL_2] = {"blocks": []}
+                return {
+                    "status": "replaced",
+                    "content_status": "completed",
+                    "created_block_locator": replacement_gallery,
+                    "expected_vertical_snapshot_after_delete": {
+                        "direct_child_count": 2,
+                        "children": [
+                            {"locator": replacement_gallery, "type": "imagesgallery", "order": 1},
+                            {"locator": summary_locator, "type": "html", "order": 2},
+                        ],
+                    },
+                    "steps": [
+                        {"step": "create_block", "status": "completed", "block_locator": replacement_gallery},
+                        {"step": "publish_vertical", "status": "completed"},
+                    ],
+                }
+
+            with patch.object(publisher, "process_publish_target", side_effect=replace_target) as process_target:
+                exit_code, stdout, stderr = self._run_cli(
+                    operation_path,
+                    studio,
+                    extra_args=("--skip-oss-multipart",),
+                    object_get=lambda _url, **_kwargs: FakeRangeResponse(),
+                )
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(1, process_target.call_count)
+            self.assertEqual(1, len(publish_calls))
+            self.assertIsNone(publish_calls[0][2])
+            self.assertFalse(any(
+                call["path"].endswith(("/handler/remove_files", "/handler/update_play_config", "/handler/save_audio"))
+                for call in studio.calls
+            ))
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            repair = gallery["repair_history"][0]
+            self.assertEqual("gallery_replacement", repair["repair_mode"])
+            self.assertEqual("mismatch", repair["trigger_validation"]["checks"]["images"])
+            self.assertEqual("mismatch", repair["trigger_validation"]["checks"]["play_config"])
+            self.assertIn("images", repair["repair_components"])
+            self.assertIn("play_config", repair["repair_components"])
+            self.assertEqual(replacement_gallery, gallery["gallery_locator"])
+            self.assertEqual("verified", gallery["validation"]["status"])
+            self.assertEqual("pass", gallery["validation"]["checks"]["images"])
+            self.assertEqual("pass", gallery["validation"]["checks"]["play_config"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
 
     def test_new_repair_request_reaudits_live_state_and_gets_two_fresh_cycles(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -772,7 +1302,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 operation_path, studio, extra_args=("--skip-oss-multipart",)
             )
             self.assertEqual(1, first_exit, first_stdout + first_stderr)
-            first_audit_count = studio.path_counts[f"/preview/xblock/{GALLERY_1}/handler/get_audios"]
+            first_audit_count = sum(call["path"].endswith("/handler/get_audios") for call in studio.calls)
             self.assertEqual(2, json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]["repair_attempts"])
 
             studio.keep_mismatch_after_repair = False
@@ -781,7 +1311,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             )
 
             self.assertEqual(0, second_exit, second_stdout + second_stderr)
-            self.assertGreater(studio.path_counts[f"/preview/xblock/{GALLERY_1}/handler/get_audios"], first_audit_count)
+            self.assertGreater(sum(call["path"].endswith("/handler/get_audios") for call in studio.calls), first_audit_count)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             gallery = state["galleries"][0]
             self.assertEqual("verified", gallery["validation"]["status"])
@@ -815,6 +1345,24 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
         manifest = root / "imagesgallery.json"
         manifest.write_text(json.dumps({"audio": {"full_audio": str(audio)}, "items": items}, ensure_ascii=False), encoding="utf-8")
         return manifest
+
+    def _write_repair_targets(self, root, manifest, **source_fields):
+        section_id = "block-v1:ORG+COURSE+RUN+type@sequential+block@section"
+        section_title = "1.1 Local repair section"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["section_id"] = section_id
+        data["section_title"] = section_title
+        manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        targets_path = root / "legacy-targets.json"
+        target = {
+            "gallery_key": "legacy-gallery-1",
+            "manifest": manifest.name,
+            "section_id": section_id,
+            "section_title": section_title,
+            **source_fields,
+        }
+        targets_path.write_text(json.dumps({"course_id": COURSE_KEY, "targets": [target]}, ensure_ascii=False), encoding="utf-8")
+        return targets_path, section_id, section_title
 
     def _operation(self, manifest, *, galleries=(GALLERY_1,), initial_vertical_status="completed"):
         entries = []
@@ -852,23 +1400,51 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             })
         return {"operation_id": "operation-1", "galleries": entries}
 
-    def _run_cli(self, operation_path, studio, *, extra_args=()):
+    def _run_cli(self, operation_path, studio, *, execute=True, extra_args=(), object_get=None):
         args = [
             "validate_imagegallery_batch.py",
             "--studio-url",
             f"https://studio.example.com/container/{VERTICAL_1}",
             "--operation-file",
             str(operation_path),
-            "--execute",
             "--cookie",
             "sessionid=session-secret; csrftoken=csrf-secret",
             "--auth-retry-delay-seconds",
             "0",
+        ]
+        args.append("--execute" if execute else "--check")
+        args.extend(extra_args)
+        stdout = StringIO()
+        stderr = StringIO()
+        object_get = object_get or (lambda _url, **_kwargs: FakeRangeResponse())
+        with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.object(
+            publisher.requests, "get", side_effect=object_get
+        ), patch.dict(
+            "os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = module.main()
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def _run_package_cli(self, targets_path, studio, *, execute=False, extra_args=(), object_get=None):
+        args = [
+            "validate_imagegallery_batch.py",
+            "--studio-url",
+            f"https://studio.example.com/container/{VERTICAL_1}",
+            "--targets-file",
+            str(targets_path),
+            "--cookie",
+            "sessionid=session-secret; csrftoken=csrf-secret",
+            "--auth-retry-delay-seconds",
+            "0",
+            "--execute" if execute else "--check",
             *extra_args,
         ]
         stdout = StringIO()
         stderr = StringIO()
-        with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.dict(
+        object_get = object_get or (lambda _url, **_kwargs: FakeRangeResponse())
+        with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.object(
+            publisher.requests, "get", side_effect=object_get
+        ), patch.dict(
             "os.environ", {"FIRA_SAAS_OP_ACCOUNT": "", "FIRA_SAAS_OP_PASSWORD": ""}, clear=False
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             exit_code = module.main()
@@ -891,6 +1467,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"id": "wrong-b", "asset_key": "wrong-b", "display_name": "second-wrong.png"},
                     ],
                     "time_config": valid_time_config(2),
+                    "show_subtitles": False,
                     "audios": [{}],
                 },
                 GALLERY_2: {
@@ -912,8 +1489,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
-            self.assertEqual([0, 1], [item["repair_attempts"] for item in state["galleries"]])
+            self.assertEqual([1, 1], [item["repair_attempts"] for item in state["galleries"]])
             self.assertEqual(["verified", "verified"], [item["validation"]["status"] for item in state["galleries"]])
+            repaired_gallery = state["galleries"][0]["gallery_locator"]
+            self.assertFalse(studio.galleries[repaired_gallery]["show_subtitles"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
 
     def test_cli_allows_two_batch_repair_cycles_before_stopping(self):
@@ -1087,7 +1666,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             ],
         }))
 
-    def test_cli_ignores_filename_mismatch_without_scanning_course_asset_inventory(self):
+    def test_cli_verifies_ordered_filenames_without_scanning_course_asset_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -1098,7 +1677,10 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             operation["provenance"] = {"repository_commit": "fallback-commit"}
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({GALLERY_1: {
-                "files": [{"id": "asset-a", "display_name": "renamed-a.png"}, {"id": "asset-b", "display_name": "renamed-b.png"}],
+                "files": [
+                    {"id": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "display_name": "page-002.png"},
+                ],
                 "time_config": valid_time_config(2),
                 "audios": [{"id": "audio-binding"}],
             }})
@@ -1305,7 +1887,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             ]
             self._write_operation_file(operation_path, operation)
             studio = FakeStudio({
-                GALLERY_1: {"files": [], "time_config": [], "audios": [{}]},
+                GALLERY_1: {"files": [], "time_config": valid_time_config(2), "audios": [{}]},
                 GALLERY_2: {"files": [{"id": "b1"}, {"id": "b2"}], "time_config": valid_time_config(2), "audios": [{}]},
             }, payload_overrides={(GALLERY_1, "get_files"): {"files": "unreadable", "total_count": 0}})
 
@@ -1315,19 +1897,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
             self.assertEqual("pass", state["galleries"][0]["validation"]["checks"]["play_config"])
-            self.assertEqual(1, state["galleries"][0]["repair_attempts"])
-            self.assertEqual(["play_config"], state["galleries"][0]["repair_history"][0]["repair_components"])
+            self.assertEqual(0, state["galleries"][0]["repair_attempts"])
+            self.assertEqual([], state["galleries"][0]["repair_history"])
             self.assertEqual("verified", state["galleries"][1]["validation"]["status"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
-            updates = [
-                call for call in studio.calls
-                if call["path"].endswith("/handler/update_play_config")
-            ]
-            self.assertEqual(1, len(updates))
-            self.assertEqual(valid_time_config(2), updates[0]["kwargs"]["json"]["play_config"]["time_config"])
-            self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
-            self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
-            self.assertFalse(any(call["path"].endswith("/handler/save_audio") for call in studio.calls))
+            self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+            self.assertFalse(any(call["path"].endswith(("/handler/remove_files", "/handler/file_upload", "/handler/save_audio", "/handler/update_play_config")) for call in studio.calls))
             self.assertFalse(any(call["path"].startswith(f"/xblock/{GALLERY_2}/") for call in studio.calls))
             all_output = stdout + stderr + json.dumps(state)
             for secret in (
@@ -1349,6 +1924,63 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertNotIn(secret, all_output)
             self.assertNotIn("raw_response", all_output)
 
+    def test_unverified_audio_evidence_blocks_replacement_despite_known_image_mismatch(self):
+        scenarios = (
+            ("binding_unreadable", {(GALLERY_1, "get_audios"): {"audios": "unreadable"}}, None),
+            ("object_unverified", {}, FakeRangeResponse(403, content=b"")),
+        )
+        for label, payload_overrides, range_response in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                operation_path = root / "batch-operation.json"
+                operation = self._operation(manifest)
+                operation["galleries"][0]["publish"]["asset_ids"] = ["expected-a", "expected-b"]
+                operation["galleries"][0]["publish"]["images"] = [
+                    {"page": 1, "image": "page-001.png", "asset_id": "expected-a"},
+                    {"page": 2, "image": "page-002.png", "asset_id": "expected-b"},
+                ]
+                self._write_operation_file(operation_path, operation)
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [
+                        {"id": "wrong-a", "asset_key": "wrong-a", "display_name": "page-001.png"},
+                        {"id": "wrong-b", "asset_key": "wrong-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{}],
+                }}, payload_overrides=payload_overrides)
+                range_requests = []
+
+                def get_audio_object(url, **kwargs):
+                    range_requests.append((url, kwargs))
+                    return range_response or FakeRangeResponse()
+
+                exit_code, stdout, stderr = self._run_cli(
+                    operation_path,
+                    studio,
+                    extra_args=("--skip-oss-multipart",),
+                    object_get=get_audio_object,
+                )
+
+                self.assertEqual(1, exit_code, stdout + stderr)
+                state = json.loads(operation_path.read_text(encoding="utf-8"))
+                gallery = state["galleries"][0]
+                self.assertEqual("unverified", gallery["validation"]["status"])
+                self.assertEqual("mismatch", gallery["validation"]["checks"]["images"])
+                self.assertFalse(gallery["validation"]["repairable"])
+                self.assertEqual(0, gallery["repair_attempts"])
+                self.assertEqual([], gallery["repair_history"])
+                self.assertEqual([GALLERY_1], list(studio.galleries))
+                self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+                self.assertFalse(any(call["path"].endswith((
+                    "/handler/remove_files",
+                    "/handler/file_upload",
+                    "/handler/save_audio",
+                    "/handler/update_play_config",
+                )) for call in studio.calls))
+                self.assertFalse(any(call["path"] == "/xblock/" or call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
+                self.assertEqual(0 if label == "binding_unreadable" else 1, len(range_requests))
+
     def test_cli_repairs_confirmed_image_count_mismatch_without_deleting_assets_and_rechecks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1368,16 +2000,23 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(0, exit_code, stdout + stderr)
             self.assertEqual("", stderr)
             methods_and_paths = [(call["method"], call["path"]) for call in studio.calls]
-            remove_index = next(i for i, (method, path) in enumerate(methods_and_paths) if method == "POST" and path.endswith("/handler/remove_files"))
-            delete_indexes = [i for i, (method, path) in enumerate(methods_and_paths) if method == "DELETE"]
+            gallery_delete_indexes = [
+                i for i, (method, path) in enumerate(methods_and_paths)
+                if method == "DELETE" and path.startswith("/xblock/")
+            ]
             upload_indexes = [i for i, (method, path) in enumerate(methods_and_paths) if method == "POST" and path.endswith("/handler/file_upload")]
             publish_index = next(i for i, (method, path) in enumerate(methods_and_paths) if method == "POST" and path == f"/xblock/{VERTICAL_1}")
-            self.assertEqual([], delete_indexes)
-            self.assertLess(remove_index, min(upload_indexes))
-            self.assertLess(max(upload_indexes), publish_index)
+            self.assertEqual(1, len(gallery_delete_indexes))
+            self.assertEqual(f"/xblock/{GALLERY_1}", methods_and_paths[gallery_delete_indexes[0]][1])
+            self.assertLess(max(upload_indexes), gallery_delete_indexes[0])
+            self.assertLess(gallery_delete_indexes[0], publish_index)
+            self.assertFalse(any(path.endswith("/handler/remove_files") for _, path in methods_and_paths))
+            self.assertTrue(any(asset["id"] == "asset-old" for asset in studio.assets))
+            self.assertTrue(any(asset["id"] == "asset-checkpoint-orphan" for asset in studio.assets))
             self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             gallery = state["galleries"][0]
+            self.assertNotEqual(GALLERY_1, gallery["gallery_locator"])
             self.assertEqual(1, gallery["repair_attempts"])
             self.assertEqual("completed", gallery["repair_history"][0]["status"])
             self.assertEqual("completed", gallery["repair_history"][0]["vertical_publish"]["status"])
@@ -1410,7 +2049,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertTrue(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
             self.assertTrue(any(call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
 
-    def test_cli_keeps_verified_content_status_when_repair_vertical_publish_fails(self):
+    def test_failed_repair_publication_is_reported_after_live_recheck(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -1424,13 +2063,20 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
-            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(1, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             gallery = state["galleries"][0]
-            self.assertEqual("verified", gallery["validation"]["status"])
-            self.assertEqual("failed", gallery["repair_history"][0]["status"])
-            self.assertEqual("failed", gallery["repair_history"][0]["vertical_publish"]["status"])
-            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertEqual("mismatch", gallery["validation"]["status"])
+            self.assertEqual("mismatch", gallery["validation"]["checks"]["vertical_publication"])
+            self.assertEqual(2, gallery["repair_attempts"])
+            self.assertEqual("failed", gallery["repair_history"][-1]["status"])
+            self.assertEqual("failed", gallery["repair_history"][-1]["vertical_publish"]["status"])
+            self.assertEqual("failed", state["batch_result"]["galleries"][0]["repair_status"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+            report = state["batch_result"]["operator_report"]
+            self.assertEqual("issue", report["status"])
+            self.assertIn("未发布改动", report["text"])
+            self.assertIn(f"https://studio.example.com/container/{VERTICAL_1}", report["text"])
 
     def test_cli_repairs_play_config_and_zero_or_multiple_audio_binding_mismatches(self):
         cases = (
@@ -1472,7 +2118,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertEqual("verified", gallery["validation"]["status"])
                 self.assertTrue(operation["batch_result"]["all_sections_verified"])
 
-    def test_audio_only_repair_does_not_rewrite_or_delete_gallery_images(self):
+    def test_audio_binding_mismatch_replaces_gallery_without_deleting_course_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -1503,15 +2149,25 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(0, exit_code, stdout + stderr)
-            deleted_paths = [call["path"] for call in studio.calls if call["method"] == "DELETE"]
-            self.assertEqual([], deleted_paths)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
-            attempt = state["galleries"][0]["repair_history"][0]
+            gallery_state = state["galleries"][0]
+            repaired_locator = gallery_state["gallery_locator"]
+            self.assertNotEqual(GALLERY_1, repaired_locator)
+            repaired_gallery = studio.galleries[repaired_locator]
+            self.assertEqual(2, len(repaired_gallery["files"]))
+            self.assertEqual(1, len(repaired_gallery["audios"]))
+            attempt = gallery_state["repair_history"][0]
             self.assertEqual(["audio_bindings"], attempt["repair_components"])
             self.assertFalse(any(call["path"].endswith("/handler/remove_files") for call in studio.calls))
-            self.assertFalse(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
-            self.assertEqual({"asset-shared", "asset-orphan"}, {asset["id"] for asset in studio.assets})
-            self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
+            self.assertTrue(any(call["path"].endswith("/handler/file_upload") for call in studio.calls))
+            self.assertTrue({"asset-shared", "asset-orphan"}.issubset({asset["id"] for asset in studio.assets}))
+            self.assertEqual([GALLERY_1], [
+                call["path"][len("/xblock/"):]
+                for call in studio.calls
+                if call["method"] == "DELETE" and call["path"].startswith("/xblock/")
+            ])
+            self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
+            self.assertEqual("verified", gallery_state["validation"]["status"])
             self.assertEqual("verified", state["course_structure_verification"]["status"])
             self.assertTrue(state["batch_result"]["all_sections_verified"])
 
@@ -1537,13 +2193,17 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(0, exit_code, stdout + stderr + operation_path.read_text(encoding="utf-8"))
-            self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+            self.assertEqual([GALLERY_1], [
+                call["path"][len("/xblock/"):]
+                for call in studio.calls
+                if call["method"] == "DELETE" and call["path"].startswith("/xblock/")
+            ])
             self.assertFalse(any(call["path"].startswith(f"/assets/{COURSE_KEY}/") for call in studio.calls))
             self.assertFalse(any(call["path"].startswith(f"/preview/xblock/{GALLERY_2}/") for call in studio.calls))
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             self.assertEqual("verified", state["galleries"][0]["validation"]["status"])
 
-    def test_cli_keeps_malformed_responses_unverified_and_writes_unreadable_play_config(self):
+    def test_cli_blocks_unverified_gallery_evidence_and_replaces_an_unreadable_timeline(self):
         cases = (
             ("get_files", {"files": [{"name": "no-id"}], "total_count": 1}),
             ("get_play_config", {"play_config": {"time_config": "not-a-list"}}),
@@ -1557,32 +2217,36 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 operation_path = root / "batch-operation.json"
                 self._write_operation_file(operation_path, self._operation(manifest))
                 studio = FakeStudio({GALLERY_1: {
-                    "files": [{"id": "a"}, {"id": "b"}],
+                    "files": [{"id": "asset-a"}, {"id": "asset-b"}],
                     "time_config": valid_time_config(2),
                     "audios": [{}],
                 }}, payload_overrides={(GALLERY_1, handler): response})
 
-                exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
-                self.assertEqual(1, exit_code, stdout + stderr)
+                expected_exit = 0 if handler == "get_play_config" and not isinstance(response["play_config"].get("time_config"), list) else 1
+                self.assertEqual(expected_exit, exit_code, stdout + stderr)
                 state = json.loads(operation_path.read_text(encoding="utf-8"))
-                self.assertEqual("unverified", state["galleries"][0]["validation"]["status"])
-                if handler == "get_play_config":
-                    self.assertEqual(2, state["galleries"][0]["repair_attempts"])
-                    self.assertTrue(state["galleries"][0]["validation"]["play_config_untrusted"])
-                    self.assertNotIn("play_config_read_failed", state["galleries"][0]["validation"])
+                gallery = state["galleries"][0]
+                if handler == "get_play_config" and not isinstance(response["play_config"].get("time_config"), list):
+                    self.assertEqual("verified", gallery["validation"]["status"])
+                    self.assertEqual(1, gallery["repair_attempts"])
+                    trigger_validation = gallery["repair_history"][0]["trigger_validation"]
+                    self.assertEqual("unverified", trigger_validation["status"])
+                    self.assertTrue(trigger_validation["play_config_untrusted"])
+                    self.assertNotIn("play_config_read_failed", trigger_validation)
+                    self.assertEqual("gallery_replacement", gallery["repair_history"][0]["repair_mode"])
+                    repaired = studio.galleries[gallery["gallery_locator"]]
+                    self.assertEqual(valid_time_config(2), repaired["time_config"])
                     updates = [
                         call for call in studio.calls
                         if call["path"].endswith("/handler/update_play_config")
                     ]
-                    self.assertEqual(2, len(updates))
-                    self.assertTrue(all(
-                        call["kwargs"]["json"]["play_config"]["time_config"] == valid_time_config(2)
-                        for call in updates
-                    ))
-                    self.assertFalse(any(call["method"] == "DELETE" for call in studio.calls))
+                    self.assertTrue(updates)
+                    self.assertEqual(valid_time_config(2), updates[-1]["kwargs"]["json"]["play_config"]["time_config"])
                 else:
-                    self.assertEqual(0, state["galleries"][0]["repair_attempts"])
+                    self.assertEqual("unverified", gallery["validation"]["status"])
+                    self.assertEqual(0, gallery["repair_attempts"])
                     self.assertFalse(any(
                         call["method"] != "GET" and "/preview/xblock/" not in call["path"]
                         for call in studio.calls
@@ -1822,9 +2486,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 "FIRA_SAAS_OP_CSRF_TOKEN": "csrf-secret",
             }
 
-            with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.dict(
-                "os.environ", env, clear=False
-            ), redirect_stdout(stdout):
+            with patch("sys.argv", args), patch.object(publisher.requests, "Session", return_value=studio.session), patch.object(
+                publisher.requests, "get", return_value=FakeRangeResponse()
+            ), patch.dict("os.environ", env, clear=False), redirect_stdout(stdout):
                 exit_code = module.main()
 
             self.assertEqual(0, exit_code, stdout.getvalue())
@@ -1858,6 +2522,12 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertIn("后置审核", report["text"])
 
     def test_operator_report_shows_only_live_findings_with_subsection_links(self):
+        class PersistentlyUnreadableSecondGalleryStudio(FakeStudio):
+            def _response(self, method, path, kwargs):
+                if method == "POST" and path == f"/preview/xblock/{GALLERY_2}/handler/get_files":
+                    return FakeResponse({"files": "unreadable", "total_count": 0})
+                return super()._response(method, path, kwargs)
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -1873,7 +2543,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             })
             operation_path = root / "batch-operation.json"
             self._write_operation_file(operation_path, operation)
-            studio = FakeStudio({
+            studio = PersistentlyUnreadableSecondGalleryStudio({
                 GALLERY_1: {
                     "files": [
                         {"id": "wrong-a", "asset_key": "wrong-a", "display_name": "wrong-a.png"},
@@ -1890,9 +2560,9 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     "time_config": valid_time_config(2),
                     "audios": [{}],
                 },
-            }, fail_get_files={GALLERY_2: 1})
+            })
 
-            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio, extra_args=("--skip-oss-multipart",))
 
             self.assertEqual(1, exit_code, stdout + stderr)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
@@ -1912,6 +2582,464 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
     def test_course_structure_completeness_rejects_a_missing_vertical_child_list(self):
         self.assertFalse(module.course_structure_payload_is_complete(make_incomplete_course_structure()))
+
+    def test_package_target_does_not_fall_back_when_a_supplied_vertical_is_invalid(self):
+        other_vertical = "block-v1:ORG+COURSE+RUN+type@vertical+block@other-vertical"
+        other_gallery = "block-v1:ORG+COURSE+RUN+type@imagesgallery+block@other-gallery"
+        missing_vertical = "block-v1:ORG+COURSE+RUN+type@vertical+block@missing-vertical"
+        course_structure = {
+            "chapters": [{
+                "sections": [
+                    {
+                        "name": "1.1 First section",
+                        "block_location": "block-v1:ORG+COURSE+RUN+type@sequential+block@section-one",
+                        "verticals": [{
+                            "name": "First vertical",
+                            "block_location": VERTICAL_1,
+                            "blocks": [{"category": "imagesgallery", "block_location": GALLERY_1}],
+                        }],
+                    },
+                    {
+                        "name": "1.2 Other section",
+                        "block_location": "block-v1:ORG+COURSE+RUN+type@sequential+block@section-two",
+                        "verticals": [{
+                            "name": "Other vertical",
+                            "block_location": other_vertical,
+                            "blocks": [{"category": "imagesgallery", "block_location": other_gallery}],
+                        }],
+                    },
+                ],
+            }],
+        }
+        cases = (
+            ("target_vertical_block_location", missing_vertical, "missing target"),
+            ("target_vertical_block_location", other_vertical, "outside matched section"),
+            ("vertical_locator", missing_vertical, "legacy missing target"),
+            ("vertical_locator", other_vertical, "legacy target outside matched section"),
+            ("target_vertical_block_location", "not-a-locator", "malformed target"),
+        )
+
+        for locator_key, locator, label in cases:
+            with self.subTest(label=label):
+                resolution = module.resolve_package_target(
+                    {"section_id": "1.1", locator_key: locator},
+                    {"section_id": "1.1", "section_title": "1.1 First section"},
+                    course_structure,
+                    course_key=COURSE_KEY,
+                )
+
+                self.assertEqual("unverified", resolution["status"])
+                self.assertNotEqual(VERTICAL_1, resolution.get("vertical_locator"))
+
+    def test_package_cli_stops_ambiguous_section_id_mapping_and_reports_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest_data.update({"section_id": "1.1", "section_title": "1.1 Duplicate section A"})
+            manifest.write_text(json.dumps(manifest_data, ensure_ascii=False), encoding="utf-8")
+            targets_path = root / "ambiguous-targets.json"
+            targets_path.write_text(json.dumps({
+                "course_id": COURSE_KEY,
+                "targets": [{
+                    "gallery_key": "ambiguous-gallery",
+                    "manifest": manifest.name,
+                    "section_id": "1.1",
+                    "section_title": "1.1 Duplicate section A",
+                }],
+            }, ensure_ascii=False), encoding="utf-8")
+            course_structure = {
+                "course_id": COURSE_KEY,
+                "chapters": [{
+                    "name": "Chapter",
+                    "sections": [
+                        {
+                            "name": "1.1 Duplicate section A",
+                            "block_location": "block-v1:ORG+COURSE+RUN+type@sequential+block@section-a",
+                            "verticals": [{
+                                "name": "Vertical A",
+                                "block_location": VERTICAL_1,
+                                "published": True,
+                                "has_changes": False,
+                                "blocks": [
+                                    {"category": "imagesgallery", "block_location": GALLERY_1},
+                                    {
+                                        "category": "html",
+                                        "block_location": VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary"),
+                                        "display_name": "本节要点",
+                                    },
+                                ],
+                            }],
+                        },
+                        {
+                            "name": "1.1 Duplicate section B",
+                            "block_location": "block-v1:ORG+COURSE+RUN+type@sequential+block@section-b",
+                            "verticals": [{
+                                "name": "Vertical B",
+                                "block_location": VERTICAL_2,
+                                "published": True,
+                                "has_changes": False,
+                                "blocks": [
+                                    {"category": "imagesgallery", "block_location": GALLERY_2},
+                                    {
+                                        "category": "html",
+                                        "block_location": VERTICAL_2.replace("type@vertical", "type@html").replace("block@vertical", "block@summary"),
+                                        "display_name": "本节要点",
+                                    },
+                                ],
+                            }],
+                        },
+                    ],
+                }],
+            }
+
+            class AmbiguousSectionStudio(FakeStudio):
+                def _response(self, method, path, kwargs):
+                    if method == "GET" and path == f"/course/{COURSE_KEY}":
+                        if (kwargs.get("params") or {}).get("format") == "concise":
+                            self.course_reads += 1
+                        else:
+                            self.publication_reads += 1
+                        return FakeResponse(course_structure)
+                    return super()._response(method, path, kwargs)
+
+            studio = AmbiguousSectionStudio({})
+
+            code, stdout, stderr = self._run_package_cli(targets_path, studio, execute=False)
+
+            self.assertEqual(1, code, stdout + stderr)
+            self.assertEqual("", stderr)
+            self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+            state = json.loads((root / "ambiguous-targets.batch-operation.json").read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("unverified", gallery["target_mapping_status"])
+            self.assertIn("more than one", gallery["target_mapping_error"])
+            self.assertEqual("target_mapping", gallery["validation"]["failed_step"])
+            self.assertEqual("unverified", state["batch_result"]["galleries"][0]["target_mapping_status"])
+            self.assertIn("more than one", state["batch_result"]["galleries"][0]["target_mapping_error"])
+            self.assertIn("无法唯一映射", state["batch_result"]["operator_report"]["text"])
+
+    def test_repair_publish_checkpoint_keeps_the_source_gallery_locator_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "operation.json"
+            self._write_operation_file(operation_path, {
+                "galleries": [{
+                    "gallery_key": "gallery-1",
+                    "manifest": str(manifest),
+                    "vertical_locator": VERTICAL_1,
+                    "gallery_locator": GALLERY_1,
+                    "repair_publish": {},
+                }],
+            })
+            replacement = "block-v1:ORG+COURSE+RUN+type@imagesgallery+block@replacement"
+
+            checkpoint = publisher.PublishCheckpoint.load(
+                str(operation_path),
+                "gallery-1",
+                manifest_path=manifest,
+                vertical_block_id=VERTICAL_1,
+                field="repair_publish",
+            )
+            self.assertEqual("", checkpoint.gallery_locator)
+            checkpoint.record_success(
+                {"step": "create_block", "status": "ok", "block_locator": replacement},
+                stage="block_created",
+            )
+
+            persisted = json.loads(operation_path.read_text(encoding="utf-8"))["galleries"][0]
+            self.assertEqual(GALLERY_1, persisted["gallery_locator"])
+            self.assertEqual(replacement, persisted["repair_gallery_locator"])
+
+    def test_check_mode_does_not_rebuild_incomplete_local_materials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            targets_path, _section_id, _section_title = self._write_repair_targets(root, manifest)
+            (root / "page-002.png").unlink()
+            original_manifest = manifest.read_bytes()
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+            generator_root = root / "generator"
+            (generator_root / "scripts").mkdir(parents=True)
+            (generator_root / "scripts" / "repair_imagesgallery_materials.py").write_text("", encoding="utf-8")
+
+            with patch.object(module.subprocess, "run") as run_generator:
+                exit_code, stdout, stderr = self._run_package_cli(
+                    targets_path,
+                    studio,
+                    execute=False,
+                    extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
+                )
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            run_generator.assert_not_called()
+            self.assertFalse((root / "page-002.png").exists())
+            self.assertEqual(original_manifest, manifest.read_bytes())
+            state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("incomplete", gallery["local_package_status"])
+            self.assertNotIn("local_material_repair", gallery)
+            self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+
+    def test_execute_repairs_local_materials_before_auditing_and_resolves_relative_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            targets_path, section_id, section_title = self._write_repair_targets(
+                root,
+                manifest,
+                ppt="source.pptx",
+                section_json="section.json",
+                audio_search_root="audio-assets",
+            )
+            source_ppt = root / "source.pptx"
+            source_ppt.write_bytes(b"fake deck")
+            section_json = root / "section.json"
+            section_json.write_text(json.dumps({
+                "section_id": section_id,
+                "section_title": section_title,
+                "page_count": 2,
+                "page_content": ["Lesson page one", "Lesson page two"],
+            }), encoding="utf-8")
+            audio_search_root = root / "audio-assets"
+            audio_search_root.mkdir()
+            missing_image = root / "page-002.png"
+            missing_image.unlink()
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+            generator_root = root / "generator"
+            repair_script = generator_root / "scripts" / "repair_imagesgallery_materials.py"
+            repair_script.parent.mkdir(parents=True)
+            repair_script.write_text("", encoding="utf-8")
+            calls = []
+
+            def repair_materials(command, **kwargs):
+                calls.append((command, kwargs))
+                missing_image.write_bytes(b"restored image")
+                return SimpleNamespace(returncode=0, stdout="OK", stderr="")
+
+            with patch.object(module.subprocess, "run", side_effect=repair_materials):
+                exit_code, stdout, stderr = self._run_package_cli(
+                    targets_path,
+                    studio,
+                    execute=True,
+                    extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
+                )
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(1, len(calls))
+            command = calls[0][0]
+            self.assertIsInstance(command, list)
+            self.assertEqual(str(repair_script.resolve()), command[1])
+            for flag, expected_path in (
+                ("--manifest", manifest.resolve()),
+                ("--ppt", source_ppt.resolve()),
+                ("--section-json", section_json.resolve()),
+                ("--audio-search-root", audio_search_root.resolve()),
+            ):
+                self.assertEqual(str(expected_path), command[command.index(flag) + 1])
+            self.assertTrue(calls[0][1]["capture_output"])
+            self.assertEqual("utf-8", calls[0][1]["encoding"])
+            self.assertTrue(missing_image.is_file())
+            state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("complete", gallery["local_package_status"])
+            self.assertEqual("completed", gallery["local_material_repair"]["status"])
+            self.assertEqual("complete", state["batch_result"]["galleries"][0]["local_package_status"])
+            self.assertEqual("verified", gallery["validation"]["status"])
+            self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+
+    def test_failed_or_incomplete_local_repair_blocks_studio_writes(self):
+        scenarios = (("nonzero exit", 1), ("still incomplete", 0))
+        for label, return_code in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                targets_path, _section_id, _section_title = self._write_repair_targets(root, manifest)
+                (root / "page-002.png").unlink()
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [
+                        {"id": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{"document_id": "doc-1.mp3"}],
+                }})
+                generator_root = root / "generator"
+                repair_script = generator_root / "scripts" / "repair_imagesgallery_materials.py"
+                repair_script.parent.mkdir(parents=True)
+                repair_script.write_text("", encoding="utf-8")
+
+                with patch.object(
+                    module.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=return_code, stdout="token=output-secret", stderr="signature=signed-secret"),
+                ):
+                    exit_code, stdout, stderr = self._run_package_cli(
+                        targets_path,
+                        studio,
+                        execute=True,
+                        extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
+                    )
+
+                self.assertEqual(1, exit_code, stdout + stderr)
+                self.assertFalse((root / "page-002.png").exists())
+                self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+                state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
+                gallery = state["galleries"][0]
+                self.assertEqual("incomplete", gallery["local_package_status"])
+                self.assertEqual("failed", gallery["local_material_repair"]["status"])
+                self.assertEqual(return_code, gallery["local_material_repair"]["return_code"])
+                self.assertFalse(gallery["validation"]["repairable"])
+                self.assertIn("本地素材恢复失败", state["batch_result"]["operator_report"]["text"])
+                persisted = stdout + stderr + json.dumps(state)
+                self.assertNotIn("output-secret", persisted)
+                self.assertNotIn("signed-secret", persisted)
+
+    def test_legacy_package_check_persists_a_read_only_missing_gallery_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            original_manifest = manifest.read_bytes()
+            section_locator = "block-v1:ORG+COURSE+RUN+type@sequential+block@section"
+            targets_path = root / "legacy-targets.json"
+            targets_path.write_text(json.dumps({
+                "course_id": COURSE_KEY,
+                "targets": [{
+                    "gallery_key": "legacy-gallery-1",
+                    "manifest": str(manifest),
+                    "section_id": section_locator,
+                    "section_title": "1.1 Legacy section",
+                }],
+            }), encoding="utf-8")
+            summary_locator = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+            studio = FakeStudio({}, vertical_overrides={VERTICAL_1: {
+                "blocks": [{"id": summary_locator, "category": "html", "display_name": "本节要点"}],
+            }})
+
+            exit_code, stdout, stderr = self._run_package_cli(targets_path, studio, execute=False)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            operation_path = root / "legacy-targets.batch-operation.json"
+            self.assertTrue(operation_path.is_file())
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("resolved", gallery["target_mapping_status"])
+            self.assertEqual("mismatch", gallery["validation"]["status"])
+            self.assertEqual("mismatch", gallery["validation"]["checks"]["gallery_presence"])
+            self.assertTrue(gallery["validation"]["repairable"])
+            self.assertIn("缺少 ImageGallery", state["batch_result"]["operator_report"]["text"])
+            self.assertEqual(original_manifest, manifest.read_bytes())
+            self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+
+    def test_execute_replaces_a_missing_legacy_gallery_and_rechecks_the_returned_locator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            section_locator = "block-v1:ORG+COURSE+RUN+type@sequential+block@section"
+            targets_path = root / "legacy-targets.json"
+            targets_path.write_text(json.dumps({
+                "course_id": COURSE_KEY,
+                "targets": [{
+                    "gallery_key": "legacy-gallery-1",
+                    "manifest": str(manifest),
+                    "section_id": section_locator,
+                    "section_title": "1.1 Legacy section",
+                }],
+            }), encoding="utf-8")
+            summary_locator = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+            studio = FakeStudio({}, vertical_overrides={VERTICAL_1: {
+                "blocks": [{"id": summary_locator, "category": "html", "display_name": "本节要点"}],
+            }})
+            new_gallery = GALLERY_1
+            expected_snapshot = {
+                "direct_child_count": 2,
+                "children": [
+                    {"locator": new_gallery, "type": "imagesgallery", "order": 1},
+                    {"locator": summary_locator, "type": "html", "order": 2},
+                ],
+            }
+            publish_calls = []
+
+            def fake_publish_target(target, _course_structure, publish_args, _adapter, *, previous_result=None):
+                publish_calls.append((target, publish_args, previous_result))
+                self.assertEqual("repair_publish", publish_args.checkpoint_field)
+                self.assertTrue(publish_args.execute)
+                operation_path = Path(publish_args.operation_file)
+                operation = json.loads(operation_path.read_text(encoding="utf-8"))
+                entry = next(item for item in operation["galleries"] if item["gallery_key"] == "legacy-gallery-1")
+                entry["repair_publish"] = {
+                    "status": "completed",
+                    "completed_stage": "saved",
+                    "asset_ids": ["asset-a", "asset-b"],
+                    "images": [
+                        {"page": 1, "image": "page-001.png", "asset_id": "asset-a"},
+                        {"page": 2, "image": "page-002.png", "asset_id": "asset-b"},
+                    ],
+                }
+                entry["repair_gallery_locator"] = new_gallery
+                entry["repair_vertical_publish"] = {"status": "completed"}
+                publisher.atomic_write_json(operation_path, operation)
+                studio.galleries[new_gallery] = {
+                    "files": [
+                        {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{}],
+                }
+                studio.vertical_overrides[VERTICAL_1] = {
+                    "blocks": [
+                        {"id": new_gallery, "category": "imagesgallery", "display_name": "有声幻灯片"},
+                        {"id": summary_locator, "category": "html", "display_name": "本节要点"},
+                    ],
+                }
+                return {
+                    "status": "replaced",
+                    "content_status": "completed",
+                    "created_block_locator": new_gallery,
+                    "expected_vertical_snapshot_after_delete": expected_snapshot,
+                    "steps": [
+                        {"step": "create_block", "status": "completed", "block_locator": new_gallery},
+                        {"step": "publish_vertical", "status": "completed"},
+                    ],
+                }
+
+            with patch.object(publisher, "process_publish_target", side_effect=fake_publish_target):
+                exit_code, stdout, stderr = self._run_package_cli(targets_path, studio, execute=True)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            self.assertEqual(1, len(publish_calls))
+            self.assertEqual(VERTICAL_1, publish_calls[0][0]["target_vertical_block_location"])
+            operation_path = root / "legacy-targets.batch-operation.json"
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual(new_gallery, gallery["gallery_locator"])
+            self.assertEqual(new_gallery, gallery["repair_gallery_locator"])
+            self.assertEqual("verified", gallery["validation"]["status"])
+            self.assertEqual("verified", state["batch_result"]["status"])
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertGreater(studio.path_counts[f"/preview/xblock/{new_gallery}/handler/get_files"], 0)
+            self.assertEqual("not_applicable", state["batch_result"]["galleries"][0]["operation_status"])
+            self.assertFalse(any(
+                finding["category"] == "首次发布"
+                for group in state["batch_result"]["operator_report"]["groups"]
+                for finding in group["findings"]
+            ))
 
     def test_final_course_structure_verification_rejects_a_partial_tree(self):
         payload = make_incomplete_course_structure()

@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -62,11 +66,29 @@ def safe_summary_text(value: Any) -> str:
     return summary[:240]
 
 
+def safe_object_key_path(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    path = value.strip()
+    if "://" in path or path.startswith("//"):
+        path = urlsplit(path).path
+    else:
+        path = path.split("?", 1)[0].split("#", 1)[0]
+    return path[:500]
+
+
 def sanitize_operation_evidence(value: Any) -> Any:
     if isinstance(value, dict):
         forbidden = ("response", "request", "authorization", "cookie", "csrf", "password", "secret", "token", "credential")
-        return {key: sanitize_operation_evidence(item) for key, item in value.items()
-                if not any(word in str(key).lower() for word in forbidden)}
+        safe = {}
+        for key, item in value.items():
+            if any(word in str(key).lower() for word in forbidden):
+                continue
+            if key in {"upload_key_path", "download_key_path"}:
+                safe[key] = safe_object_key_path(item)
+            else:
+                safe[key] = sanitize_operation_evidence(item)
+        return safe
     if isinstance(value, list):
         return [sanitize_operation_evidence(item) for item in value]
     if isinstance(value, str):
@@ -130,6 +152,9 @@ def refresh_publish_checkpoint(entry: dict[str, Any], operation_path: Path) -> N
     ] if isinstance(persisted_operation, dict) else []
     if len(persisted_entries) == 1:
         entry["repair_publish"] = safe_publish_state(persisted_entries[0].get("repair_publish"))
+        repair_locator = safe_locator(persisted_entries[0].get("repair_gallery_locator"))
+        if repair_locator:
+            entry["repair_gallery_locator"] = repair_locator
 
 
 def load_operation(path: Path) -> dict[str, Any]:
@@ -165,6 +190,7 @@ def load_operation(path: Path) -> dict[str, Any]:
             entry["initial_vertical_publish"] = safe_vertical
         history = entry.get("repair_history")
         entry["repair_history"] = [sanitize_operation_evidence(item) for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+        entry["audio_evidence"] = safe_audio_evidence(entry.get("audio_evidence"))
         attempts = entry.get("repair_attempts", 0)
         if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
             attempts = 0
@@ -188,7 +214,7 @@ class StudioClient:
             allow_login=True,
         )
         if not auth_ready:
-            raise BatchValidationError("authentication", "execute mode requires Studio credentials or --cookie")
+            raise BatchValidationError("authentication", "Studio access requires credentials or --cookie")
         self.can_refresh_auth = bool(self.account and self.password and self.courses_base)
 
     def refresh_auth(self) -> None:
@@ -474,6 +500,600 @@ def get_files(client: StudioClient, gallery_locator: str) -> tuple[list[dict[str
     return files, total_count, diagnostic
 
 
+def audio_binding_id(binding: dict[str, Any]) -> str:
+    for key in ("document_id", "audio_id", "id"):
+        value = binding.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def audio_length_from_headers(headers: Any) -> int | None:
+    if not isinstance(headers, Mapping):
+        return None
+    content_range = headers.get("Content-Range") or headers.get("content-range")
+    if isinstance(content_range, str):
+        match = re.fullmatch(r"bytes\s+\d+-\d+/(\d+)", content_range.strip(), re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    content_length = headers.get("Content-Length") or headers.get("content-length")
+    try:
+        length = int(content_length)
+    except (TypeError, ValueError):
+        return None
+    return length if length >= 0 else None
+
+
+def read_audio_range_byte(download_url: str, *, timeout: int) -> tuple[str, int | None, int | None]:
+    """Check a GET-signed audio object URL without downloading the full MP3."""
+    response = None
+    try:
+        response = publisher.requests.get(
+            download_url,
+            headers={"Range": "bytes=0-0"},
+            timeout=timeout,
+            stream=True,
+        )
+        status = int(response.status_code)
+        object_length = audio_length_from_headers(getattr(response, "headers", {}))
+        if status in {200, 206}:
+            raw = getattr(response, "raw", None)
+            byte = raw.read(1) if raw is not None else b""
+            return ("accessible" if byte else "unverified"), status, object_length
+        if status == 404:
+            return "missing", status, object_length
+        if status < 400:
+            return "unverified", status, object_length
+        # OSS commonly includes NoSuchKey in the XML body even when a proxy
+        # changes the HTTP status. Read only a small prefix of an error body.
+        raw = getattr(response, "raw", None)
+        prefix = raw.read(1024) if raw is not None else b""
+        if b"NoSuchKey" in prefix:
+            return "missing", status, object_length
+        return "unverified", status, object_length
+    except Exception:
+        return "unverified", None, None
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def audio_download_url(client: StudioClient, locator: str, audio_id: str, referer: str) -> tuple[str, dict[str, Any] | None]:
+    payload, diagnostic = read_json_call(
+        client,
+        "get_audio_download_url",
+        "POST",
+        f"{client.studio_base}/preview/xblock/{locator}/handler/get_audio_download_url",
+        body={"audio_id": audio_id},
+        referer=referer,
+    )
+    if diagnostic and diagnostic.get("status") != "ok":
+        return "", diagnostic
+    if not isinstance(payload, dict):
+        return "", {"step": "get_audio_download_url", "status": "invalid_response", "error_summary": "Studio did not return an audio download address"}
+    url = next((payload.get(key) for key in ("download_url", "url") if isinstance(payload.get(key), str) and payload.get(key).strip()), "")
+    parsed = urlsplit(url)
+    if not url or parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+        return "", {"step": "get_audio_download_url", "status": "invalid_response", "error_summary": "Studio returned an invalid audio download address"}
+    return url, diagnostic
+
+
+def local_audio_fingerprint(manifest: dict[str, Any]) -> tuple[int | None, str]:
+    path = Path(str((manifest.get("audio") or {}).get("_full_audio_abs", "")))
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as audio_file:
+            for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return path.stat().st_size, digest.hexdigest()
+    except OSError:
+        return None, ""
+
+
+def audio_upload_evidence(entry: dict[str, Any]) -> dict[str, Any]:
+    sources = [
+        (entry.get(field) or {}).get("audio_upload_evidence")
+        for field in ("repair_publish", "publish")
+        if isinstance(entry.get(field), dict)
+    ]
+    sources.append(entry.get("audio_evidence"))
+    for evidence in sources:
+        if not isinstance(evidence, dict):
+            continue
+        safe = {
+            key: evidence[key]
+            for key in (
+                "upload_key_path", "bucket", "region", "multipart_part_count", "multipart_completed"
+            )
+            if key in evidence
+        }
+        if safe:
+            return safe_audio_evidence(safe)
+    return {}
+
+
+def safe_audio_evidence(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in ("audio_id", "upload_key_path", "download_key_path", "bucket", "region", "object_accessibility"):
+        item = value.get(key)
+        if isinstance(item, str):
+            safe[key] = safe_object_key_path(item) if key in {"upload_key_path", "download_key_path"} else item[:500]
+    for key in ("local_size_bytes", "multipart_part_count", "download_http_status", "object_length_bytes"):
+        item = value.get(key)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            safe[key] = item
+    digest = value.get("local_sha256")
+    if isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest):
+        safe["local_sha256"] = digest
+    for key in ("multipart_completed", "key_paths_match"):
+        item = value.get(key)
+        if isinstance(item, bool):
+            safe[key] = item
+    return safe
+
+
+def load_package_targets(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        payload = publisher.read_json(path)
+    except Exception as exc:
+        raise BatchValidationError("targets_file", "local package targets file is not readable JSON") from exc
+    targets = payload.get("targets") if isinstance(payload, dict) else None
+    if not isinstance(targets, list) or not targets or any(not isinstance(item, dict) for item in targets):
+        raise BatchValidationError("targets_file", "local package targets file must contain a non-empty targets list")
+    return payload, targets
+
+
+def course_identity(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if value.startswith("block-v1:"):
+        return publisher.course_key_from_vertical_block_id(value)
+    return value if value.startswith("course-v1:") else ""
+
+
+def operation_course_matches(operation: dict[str, Any], course_key: str) -> bool:
+    identities = [course_identity(operation.get(key)) for key in ("course_id", "course_key")]
+    for entry in operation.get("galleries", []):
+        if not isinstance(entry, dict):
+            continue
+        identities.extend(
+            course_identity(entry.get(key))
+            for key in ("course_id", "course_key", "vertical_locator", "gallery_locator")
+        )
+    known = [identity for identity in identities if identity]
+    return bool(known) and all(identity == course_key for identity in known)
+
+
+def section_id_matches(section: dict[str, Any], section_id: str) -> bool:
+    candidates = [
+        section.get("section_id"),
+        section.get("id"),
+        section.get("block_location"),
+        section.get("locator"),
+    ]
+    if section_id in [str(value or "").strip() for value in candidates]:
+        return True
+    name = str(section.get("name", "")).strip()
+    prefix = re.match(r"^(\d+(?:\.\d+)*)\b", name)
+    return bool(prefix and prefix.group(1) == section_id)
+
+
+def target_course_matches(target: dict[str, Any], package: dict[str, Any], manifest: dict[str, Any], course_key: str) -> bool:
+    identities = [
+        course_identity(package.get("course_id")),
+        course_identity(package.get("course_key")),
+        course_identity(target.get("course_id")),
+        course_identity(target.get("course_key")),
+        course_identity(manifest.get("course_id")),
+        course_identity(target.get("target_vertical_block_location")),
+    ]
+    known = [identity for identity in identities if identity]
+    return all(identity == course_key for identity in known)
+
+
+def resolve_package_target(
+    target: dict[str, Any],
+    manifest: dict[str, Any],
+    course_structure: dict[str, Any],
+    *,
+    course_key: str,
+) -> dict[str, Any]:
+    section_id = str(target.get("section_id") or manifest.get("section_id") or "").strip()
+    section_title = str(target.get("section_title") or manifest.get("section_title") or target.get("name") or "").strip()
+    if not target_course_matches(target, {}, manifest, course_key):
+        return {"status": "unverified", "error": "Package target belongs to a different Studio course"}
+
+    records = publisher.iter_section_vertical_records(course_structure)
+    sections = list(dict.fromkeys(id(record["section"]) for record in records))
+    section_objects = {id(record["section"]): record["section"] for record in records}
+    matched_section = None
+    if section_id:
+        id_matches = [section_objects[section_id_key] for section_id_key in sections
+                      if section_id_matches(section_objects[section_id_key], section_id)]
+        if len(id_matches) > 1:
+            return {"status": "unverified", "error": "Section ID matches more than one Studio section"}
+        if len(id_matches) == 1:
+            matched_section = id_matches[0]
+    if matched_section is None and section_title:
+        title_matches = [section_objects[section_id_key] for section_id_key in sections
+                         if str(section_objects[section_id_key].get("name", "")).strip() == section_title]
+        if len(title_matches) > 1:
+            return {"status": "unverified", "error": "Section title is not unique in the Studio course"}
+        if len(title_matches) == 1:
+            matched_section = title_matches[0]
+
+    target_vertical_value = None
+    target_vertical_supplied = False
+    for key in ("target_vertical_block_location", "vertical_locator"):
+        value = target.get(key)
+        if value is None or isinstance(value, str) and not value.strip():
+            continue
+        target_vertical_value = value
+        target_vertical_supplied = True
+        break
+    target_vertical = safe_locator(target_vertical_value)
+    if target_vertical_supplied and not target_vertical:
+        return {"status": "unverified", "error": "Target vertical locator is invalid"}
+    candidates = [record for record in records if matched_section is None or record["section"] is matched_section]
+    if target_vertical_supplied:
+        if course_identity(target_vertical) != course_key:
+            return {"status": "unverified", "error": "Target vertical belongs to a different Studio course"}
+        vertical_matches = [record for record in records if safe_locator(record["vertical"].get("block_location")) == target_vertical]
+        if len(vertical_matches) != 1:
+            return {"status": "unverified", "error": "Target vertical could not be found uniquely in the Studio course"}
+        if matched_section is not None and vertical_matches[0]["section"] is not matched_section:
+            return {"status": "unverified", "error": "Target vertical is outside the matched Studio section"}
+        candidates = vertical_matches
+        matched_section = vertical_matches[0]["section"]
+    if matched_section is None:
+        return {"status": "unverified", "error": "No Studio section matches the package section ID or unique title"}
+    if len(candidates) == 0:
+        return {"status": "unverified", "error": "No unique target vertical was found in the matched section"}
+
+    if not target_vertical:
+        gallery_verticals = [
+            record for record in candidates
+            if any(publisher.block_category(block) == "imagesgallery" for block in record["vertical"].get("blocks", []) if isinstance(block, dict))
+        ]
+        if len(gallery_verticals) == 1:
+            candidates = gallery_verticals
+        elif not gallery_verticals and len(candidates) != 1:
+            return {"status": "unverified", "error": "Section has multiple possible verticals and no unique Gallery"}
+    if len(candidates) != 1:
+        return {"status": "unverified", "error": "Package section maps to multiple Studio verticals"}
+
+    vertical = candidates[0]["vertical"]
+    vertical_locator = safe_locator(vertical.get("block_location"))
+    if not vertical_locator or course_identity(vertical_locator) != course_key:
+        return {"status": "unverified", "error": "Matched Studio vertical locator is invalid"}
+    galleries = [
+        publisher.block_locator(block)
+        for block in vertical.get("blocks", [])
+        if isinstance(block, dict) and publisher.block_category(block) == "imagesgallery" and publisher.block_locator(block)
+    ]
+    if len(galleries) > 1:
+        return {"status": "unverified", "error": "Matched section contains multiple Gallery candidates"}
+    return {
+        "status": "resolved",
+        "vertical_locator": vertical_locator,
+        "gallery_locator": safe_locator(galleries[0]) if galleries else "",
+        "gallery_missing": not galleries,
+        "section_id": section_id,
+        "section_title": section_title,
+        "vertical_snapshot": publisher.retained_vertical_snapshot(vertical, safe_locator(galleries[0])) if galleries else None,
+    }
+
+
+def package_operation(
+    package_path: Path,
+    package: dict[str, Any],
+    targets: list[dict[str, Any]],
+    course_structure: dict[str, Any] | None,
+    *,
+    course_key: str,
+) -> dict[str, Any]:
+    entries = []
+    for index, target in enumerate(targets, start=1):
+        manifest_value = str(target.get("manifest", "") or "").strip()
+        manifest_path = Path(manifest_value).expanduser()
+        if manifest_value and not manifest_path.is_absolute():
+            manifest_path = (package_path.parent / manifest_path).resolve()
+        manifest_data: dict[str, Any] = {}
+        manifest_error = ""
+        try:
+            raw = publisher.read_json(manifest_path)
+            if isinstance(raw, dict):
+                manifest_data = raw
+            else:
+                manifest_error = "Local Gallery manifest is not an object"
+        except Exception:
+            manifest_error = "Local Gallery manifest could not be read"
+        if manifest_error:
+            resolution = {"status": "unverified", "error": manifest_error}
+        elif not target_course_matches(target, package, manifest_data, course_key):
+            resolution = {"status": "unverified", "error": "Package target belongs to a different Studio course"}
+        elif course_structure is None:
+            resolution = {"status": "unverified", "error": "Studio course structure is unavailable"}
+        else:
+            resolution = resolve_package_target(target, manifest_data, course_structure, course_key=course_key)
+        gallery_key = str(target.get("gallery_key") or "").strip()
+        if not gallery_key:
+            identity = str(target.get("section_id") or manifest_data.get("section_id") or target.get("section_title") or manifest_data.get("section_title") or target.get("name") or index)
+            gallery_key = f"package-{index}-{re.sub(r'[^A-Za-z0-9_-]+', '-', identity).strip('-')[:48]}"
+        package_target = {}
+        for key in ("ppt", "pptx", "section_json", "section_list_json", "audio_search_root"):
+            value = target.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            source_path = Path(value).expanduser()
+            if not source_path.is_absolute():
+                source_path = package_path.parent / source_path
+            package_target[key] = str(source_path.resolve())
+        entry: dict[str, Any] = {
+            "gallery_key": gallery_key,
+            "manifest": str(manifest_path) if manifest_value else "",
+            "section_id": str(target.get("section_id") or manifest_data.get("section_id") or ""),
+            "section_title": str(target.get("section_title") or manifest_data.get("section_title") or target.get("name") or ""),
+            "package_target": package_target,
+            "publish": {},
+            "initial_vertical_publish": {"status": "not_started"},
+            "repair_history": [],
+            "repair_attempts": 0,
+            "audio_evidence": {},
+            "target_mapping_status": resolution.get("status", "unverified"),
+            "target_mapping_error": str(resolution.get("error", ""))[:240],
+        }
+        if resolution.get("status") == "resolved":
+            entry.update({
+                "vertical_locator": resolution["vertical_locator"],
+                "gallery_locator": resolution["gallery_locator"],
+                "gallery_missing": resolution["gallery_missing"],
+            })
+            if resolution.get("vertical_snapshot"):
+                entry["vertical_integrity"] = {"expected": resolution["vertical_snapshot"]}
+        else:
+            entry["vertical_locator"] = ""
+            entry["gallery_locator"] = ""
+        entries.append(entry)
+    return {"operation_id": uuid.uuid4().hex, "course_id": course_key, "galleries": entries}
+
+
+def material_repair_script(root_value: str = "") -> Path:
+    script_name = Path("scripts") / "repair_imagesgallery_materials.py"
+    if root_value:
+        candidate = Path(root_value).expanduser().resolve() / script_name
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError("PPT_TO_IMAGESGALLERY_ROOT does not contain the targeted repair script")
+
+    roots = []
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if codex_home:
+        roots.append(Path(codex_home).expanduser() / "skills" / "ppt-to-imagesgallery")
+    roots.extend((
+        Path.home() / ".codex" / "skills" / "ppt-to-imagesgallery",
+        Path.home() / ".agents" / "skills" / "ppt-to-imagesgallery",
+        Path(__file__).resolve().parents[2] / "ppt-to-imagesgallery",
+    ))
+    for root in roots:
+        candidate = root / script_name
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError("PPT-to-ImagesGallery targeted repair script is unavailable")
+
+
+def resolve_package_source_path(value: Any, *, targets_file: str, manifest_path: Path) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        base = Path(targets_file).expanduser().resolve().parent if targets_file else manifest_path.parent
+        path = base / path
+    return path.resolve()
+
+
+def _section_title(record: dict[str, Any]) -> str:
+    for key in ("section_title", "title", "resource_title", "name"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def section_payload_from_list(
+    entry: dict[str, Any],
+    manifest: dict[str, Any],
+    section_list_path: Path,
+) -> dict[str, Any]:
+    records = publisher.section_list_records(section_list_path)
+    section_id = str(entry.get("section_id") or manifest.get("section_id") or "").strip()
+    section_title = str(entry.get("section_title") or manifest.get("section_title") or "").strip()
+    id_matches = [record for record in records if section_id and section_id_matches(record, section_id)]
+    if len(id_matches) > 1:
+        raise ValueError("section-list.json has multiple records for the target section ID")
+    matched_by_id = len(id_matches) == 1
+    if matched_by_id:
+        record = id_matches[0]
+    else:
+        title_matches = [record for record in records if section_title and _section_title(record) == section_title]
+        if len(title_matches) != 1:
+            raise ValueError("section-list.json does not uniquely identify the target section")
+        record = title_matches[0]
+
+    page_content = record.get("page_content")
+    if not isinstance(page_content, list):
+        raise ValueError("resolved section record has no page_content list")
+    page_count = record.get("page_count")
+    if not isinstance(page_count, int) or isinstance(page_count, bool):
+        page_count = len(page_content)
+    resolved_id = str(record.get("section_id") or "").strip()
+    if not resolved_id and matched_by_id:
+        resolved_id = section_id
+    resolved_title = _section_title(record)
+    if not resolved_title and matched_by_id:
+        resolved_title = section_title
+    return {
+        "section_id": resolved_id,
+        "section_title": resolved_title,
+        "resource_title": str(record.get("resource_title") or "").strip(),
+        "output_name": str(record.get("output_name") or "").strip(),
+        "block_type": str(record.get("block_type") or "").strip(),
+        "page_count": page_count,
+        "page_content": page_content,
+    }
+
+
+def section_payload_from_manifest(entry: dict[str, Any], manifest_path: Path) -> dict[str, Any] | None:
+    manifest = publisher.read_json(manifest_path)
+    items = manifest.get("items") if isinstance(manifest, dict) else None
+    if not isinstance(items, list) or not items:
+        return None
+    try:
+        ordered_items = sorted(items, key=lambda item: int(item["page"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if any(not isinstance(item, dict) or not isinstance(item.get("speech"), str) or not item["speech"].strip() for item in ordered_items):
+        return None
+    return {
+        "section_id": str(entry.get("section_id") or manifest.get("section_id") or "").strip(),
+        "section_title": str(entry.get("section_title") or manifest.get("section_title") or "").strip(),
+        "resource_title": str(manifest.get("resource_title") or "").strip(),
+        "output_name": str(manifest.get("output_name") or "").strip(),
+        "block_type": str(manifest.get("block_type") or "").strip(),
+        "page_count": len(ordered_items),
+        "page_content": [item["speech"] for item in ordered_items],
+    }
+
+
+def invoke_material_repair(
+    entry: dict[str, Any],
+    manifest_path: Path,
+    *,
+    args: argparse.Namespace,
+    targets_file: str,
+) -> int:
+    script = material_repair_script(str(getattr(args, "ppt_to_imagesgallery_root", "") or ""))
+    package_target = entry.get("package_target") if isinstance(entry.get("package_target"), dict) else {}
+    ppt_path = resolve_package_source_path(
+        package_target.get("ppt") or package_target.get("pptx"),
+        targets_file=targets_file,
+        manifest_path=manifest_path,
+    )
+    section_json_path = resolve_package_source_path(
+        package_target.get("section_json"),
+        targets_file=targets_file,
+        manifest_path=manifest_path,
+    )
+    section_list_path = resolve_package_source_path(
+        package_target.get("section_list_json"),
+        targets_file=targets_file,
+        manifest_path=manifest_path,
+    )
+    audio_search_root = resolve_package_source_path(
+        package_target.get("audio_search_root"),
+        targets_file=targets_file,
+        manifest_path=manifest_path,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="imagegallery-local-repair-") as temp_dir:
+        if section_json_path is None and section_list_path is not None:
+            manifest = publisher.read_json(manifest_path)
+            section_payload = section_payload_from_list(entry, manifest, section_list_path)
+            section_json_path = Path(temp_dir) / "section.json"
+            section_json_path.write_text(json.dumps(section_payload, ensure_ascii=False), encoding="utf-8")
+        elif section_json_path is None:
+            section_payload = section_payload_from_manifest(entry, manifest_path)
+            if section_payload is not None:
+                section_json_path = Path(temp_dir) / "section.json"
+                section_json_path.write_text(json.dumps(section_payload, ensure_ascii=False), encoding="utf-8")
+
+        command = [sys.executable, str(script), "--manifest", str(manifest_path)]
+        if section_json_path is not None:
+            command.extend(("--section-json", str(section_json_path)))
+        if ppt_path is not None and section_json_path is not None:
+            command.extend(("--ppt", str(ppt_path)))
+        if audio_search_root is not None:
+            command.extend(("--audio-search-root", str(audio_search_root)))
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        return int(result.returncode)
+
+
+def ensure_local_package(
+    entry: dict[str, Any],
+    manifest_path: Path,
+    *,
+    args: argparse.Namespace,
+    targets_file: str,
+    request_id: str,
+    allow_local_repair: bool,
+    store: Callable[[], None],
+) -> dict[str, Any] | None:
+    try:
+        manifest = publisher.ensure_manifest(manifest_path)
+        entry["local_package_status"] = "complete"
+        return manifest
+    except Exception:
+        entry["local_package_status"] = "incomplete"
+
+    if not args.execute or not allow_local_repair:
+        return None
+    previous_repair = entry.get("local_material_repair") if isinstance(entry.get("local_material_repair"), dict) else {}
+    if previous_repair.get("request_id") == request_id:
+        return None
+
+    repair = {
+        "status": "running",
+        "request_id": request_id,
+        "started_at": utc_now(),
+    }
+    entry["local_material_repair"] = repair
+    store()
+    try:
+        return_code = invoke_material_repair(
+            entry,
+            manifest_path,
+            args=args,
+            targets_file=targets_file,
+        )
+        repair["return_code"] = return_code
+        if return_code != 0:
+            raise BatchValidationError("local_material_repair", "Targeted local material repair failed")
+        try:
+            manifest = publisher.ensure_manifest(manifest_path)
+        except Exception:
+            raise BatchValidationError(
+                "local_material_repair",
+                "Local Gallery package remains incomplete after targeted repair",
+            ) from None
+    except Exception as exc:
+        repair["status"] = "failed"
+        repair["failed_step"] = publisher.safe_step_name(getattr(exc, "step", "local_material_repair"))
+        repair["error_summary"] = safe_error(exc, repair["failed_step"])
+        repair["finished_at"] = utc_now()
+        entry["local_package_status"] = "incomplete"
+        store()
+        return None
+
+    repair["status"] = "completed"
+    repair["finished_at"] = utc_now()
+    entry["local_package_status"] = "complete"
+    store()
+    return manifest
+
+
 def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     locator = safe_locator(entry.get("gallery_locator"))
     expected_count = manifest_image_count(manifest)
@@ -509,7 +1129,17 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
             })
         observed["images"] = observed_images
         checks["image_count"] = "unverified" if len(files) != total_count else "pass" if len(files) == expected_count else "mismatch"
-        checks["images"] = checks["image_count"]
+        names_available = all(item["image"] for item in observed_images)
+        if checks["image_count"] == "unverified" or not names_available:
+            checks["images"] = "unverified"
+        elif checks["image_count"] == "mismatch":
+            checks["images"] = "mismatch"
+        else:
+            names_match = [item["image"] for item in observed_images] == [item["image"] for item in expected_images]
+            asset_ids_match = expected_asset_ids is None or [
+                item["asset_id"] for item in observed_images
+            ] == expected_asset_ids
+            checks["images"] = "pass" if names_match and asset_ids_match else "mismatch"
 
     config_payload, config_diagnostic = read_json_call(
         client,
@@ -553,9 +1183,35 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         if play_config_untrusted:
             checks["play_config"] = "unverified"
         else:
+            observed["time_config"] = [
+                {
+                    "page": item.get("page"),
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "subtitle": item.get("subtitle"),
+                }
+                for item in time_config
+            ]
+            expected_time_config = {
+                int(item["page"]): {
+                    "start": int(item["start"]),
+                    "end": int(item["end"]),
+                    "subtitle": item["subtitle"],
+                }
+                for item in manifest["items"]
+            }
+            observed_time_config = {
+                int(item["page"]): {
+                    "start": int(item["start"]),
+                    "end": int(item["end"]),
+                    "subtitle": item["subtitle"],
+                }
+                for item in time_config
+                if isinstance(item, dict) and isinstance(item.get("page"), int) and not isinstance(item.get("page"), bool)
+            } if timing_entries_valid else {}
             checks["play_config"] = (
                 "pass"
-                if len(time_config) == expected_count and timing_entries_valid
+                if timing_entries_valid and observed_time_config == expected_time_config
                 else "mismatch"
             )
 
@@ -577,6 +1233,71 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
     else:
         observed["audio_binding_count"] = len(audios)
         checks["audio_bindings"] = "pass" if len(audios) == 1 else "mismatch"
+
+    upload_evidence = audio_upload_evidence(entry)
+    audio_size, audio_sha256 = local_audio_fingerprint(manifest)
+    audio_evidence = {
+        **upload_evidence,
+        "local_size_bytes": audio_size,
+        "local_sha256": audio_sha256,
+    }
+    if isinstance(audios, list) and len(audios) == 1 and not (
+        audio_diagnostic and audio_diagnostic.get("status") != "ok"
+    ):
+        bound_audio_id = audio_binding_id(audios[0])
+        if bound_audio_id:
+            observed["audio_id"] = bound_audio_id
+            audio_evidence["audio_id"] = bound_audio_id
+            signed_url, url_diagnostic = audio_download_url(client, locator, bound_audio_id, referer)
+            if url_diagnostic:
+                diagnostics.append(url_diagnostic)
+            if signed_url:
+                download_path = urlsplit(signed_url).path
+                audio_evidence["download_key_path"] = download_path
+                upload_path = audio_evidence.get("upload_key_path")
+                if isinstance(upload_path, str) and upload_path:
+                    audio_evidence["key_paths_match"] = upload_path.lstrip("/") == download_path.lstrip("/")
+                access_status, download_status, object_length = read_audio_range_byte(
+                    signed_url,
+                    timeout=client.args.timeout,
+                )
+                audio_evidence["object_accessibility"] = access_status
+                if download_status is not None:
+                    audio_evidence["download_http_status"] = download_status
+                    observed["audio_download_http_status"] = download_status
+                if object_length is not None:
+                    audio_evidence["object_length_bytes"] = object_length
+                    observed["audio_object_length_bytes"] = object_length
+                observed["audio_object_accessibility"] = access_status
+                checks["audio_object_accessibility"] = (
+                    "pass" if access_status == "accessible" else
+                    "mismatch" if access_status == "missing" else
+                    "unverified"
+                )
+                if access_status == "unverified":
+                    diagnostics.append({
+                        "step": "audio_object_range_get",
+                        "status": "unverified",
+                        "error_summary": "Audio object accessibility could not be confirmed",
+                    })
+            else:
+                checks["audio_object_accessibility"] = "unverified"
+                observed["audio_object_accessibility"] = "unverified"
+                audio_evidence["object_accessibility"] = "unverified"
+        else:
+            checks["audio_object_accessibility"] = "unverified"
+            observed["audio_object_accessibility"] = "unverified"
+            audio_evidence["object_accessibility"] = "unverified"
+            diagnostics.append({
+                "step": "get_audios",
+                "status": "invalid_response",
+                "error_summary": "Studio audio binding does not contain an audio ID",
+            })
+    else:
+        checks["audio_object_accessibility"] = "not_checked"
+        observed["audio_object_accessibility"] = "not_checked"
+
+    entry["audio_evidence"] = safe_audio_evidence(audio_evidence)
 
     if "unverified" in checks.values():
         status = "unverified"
@@ -626,6 +1347,174 @@ def invalid_gallery_result(entry: dict[str, Any], expected_count: int | None, *,
     return result
 
 
+def replace_gallery_from_package(
+    operation: dict[str, Any],
+    entry: dict[str, Any],
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+    adapter: dict[str, Any],
+    store: Callable[[], None],
+    *,
+    repair_round: int,
+    attempt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    history = entry.setdefault("repair_history", [])
+    validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+    checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
+    observed = validation.get("observed") if isinstance(validation.get("observed"), dict) else {}
+    show_subtitles = observed.get("show_subtitles")
+    if not isinstance(show_subtitles, bool):
+        show_subtitles = True
+    repair_components = [
+        name
+        for name in ("gallery_presence", "images", "play_config", "audio_bindings", "audio_object_accessibility")
+        if checks.get(name) == "mismatch"
+    ]
+    if play_config_is_untrusted(validation) and "time_config_entries_valid" not in observed and "play_config" not in repair_components:
+        repair_components.append("play_config")
+    if attempt is None:
+        attempt = {
+            "attempt": max(len(history), int(entry.get("repair_attempts", 0))) + 1,
+            "status": "running",
+            "repair_mode": "gallery_replacement",
+            "repair_round": repair_round,
+            "started_at": utc_now(),
+            "trigger_validation": copy.deepcopy(validation),
+            "initial_publish": safe_publish_state(entry.get("publish")),
+            "replaced_gallery_locator": safe_locator(entry.get("gallery_locator")),
+            "repair_components": repair_components,
+            "steps": [],
+        }
+        previous_repair_publish = entry.get("repair_publish")
+        if isinstance(previous_repair_publish, dict):
+            attempt["previous_repair_publish"] = safe_publish_state(previous_repair_publish)
+        previous_repair_locator = safe_locator(entry.get("repair_gallery_locator"))
+        if previous_repair_locator:
+            attempt["previous_repair_gallery_locator"] = previous_repair_locator
+        entry.pop("repair_publish", None)
+        entry.pop("repair_gallery_locator", None)
+        history.append(attempt)
+    else:
+        attempt["status"] = "running"
+        attempt["repair_mode"] = "gallery_replacement"
+        attempt["repair_round"] = repair_round
+        attempt["resumed_at"] = utc_now()
+        for key in ("finished_at", "failed_step", "error_summary", "http_status"):
+            attempt.pop(key, None)
+
+    request_id = operation.get("repair_request_id")
+    if isinstance(request_id, str) and request_id:
+        attempt["request_id"] = request_id
+    entry["repair_attempts"] = max(int(entry.get("repair_attempts", 0)), int(attempt.get("attempt", 1)))
+    store()
+
+    vertical_locator = safe_locator(entry.get("vertical_locator"))
+    if not vertical_locator:
+        raise BatchValidationError("target_mapping", "Gallery replacement requires a uniquely matched Studio vertical")
+    parsed_studio_url = urlsplit(args.studio_url)
+    studio_base = f"{parsed_studio_url.scheme}://{parsed_studio_url.netloc}"
+    studio_vertical_url = publisher.build_container_block_url(studio_base, vertical_locator)
+    package_target = entry.get("package_target") if isinstance(entry.get("package_target"), dict) else {}
+    target = {
+        "name": str(entry.get("section_title") or entry.get("gallery_key") or "Gallery"),
+        "manifest": str(Path(str(entry.get("manifest", ""))).expanduser().resolve()),
+        "gallery_key": str(entry.get("gallery_key", "")),
+        "section_id": str(entry.get("section_id", "")),
+        "section_title": str(entry.get("section_title", "")),
+        "block_type": str(entry.get("block_type") or manifest.get("block_type") or "imagesgallery"),
+        "section_list_json": str(package_target.get("section_list_json", "")),
+        "source_vertical_block_location": vertical_locator,
+        "target_vertical_block_location": vertical_locator,
+        "studio_vertical_url": studio_vertical_url,
+    }
+    publish_args = argparse.Namespace(
+        execute=True,
+        dry_run=False,
+        adapter=str(args.adapter),
+        studio_url=studio_vertical_url,
+        timeout=int(args.timeout),
+        operation_file=str(args.operation_file or ""),
+        gallery_key=str(entry.get("gallery_key", "")),
+        checkpoint_field="repair_publish",
+        courses_base=str(args.courses_base or ""),
+        account=str(args.account or ""),
+        password=str(args.password or ""),
+        cookie=str(args.cookie or ""),
+        csrf_token=str(args.csrf_token or ""),
+        skip_oss_multipart=bool(args.skip_oss_multipart),
+        auth_retry_max_retries=int(args.auth_retry_max_retries),
+        auth_retry_delay_seconds=float(args.auth_retry_delay_seconds),
+        show_subtitles=show_subtitles,
+    )
+    result = publisher.process_publish_target(
+        target,
+        {"chapters": []},
+        publish_args,
+        adapter,
+        previous_result=None,
+    )
+
+    operation_path_value = str(args.operation_file or "").strip()
+    if operation_path_value:
+        refresh_publish_checkpoint(entry, Path(operation_path_value))
+    created_locator = safe_locator(result.get("created_block_locator") or result.get("block_locator"))
+    if not created_locator:
+        created_locator = safe_locator(entry.get("repair_gallery_locator"))
+    if created_locator:
+        entry["repair_gallery_locator"] = created_locator
+        entry["gallery_locator"] = created_locator
+        entry["gallery_missing"] = False
+        attempt["created_block_locator"] = created_locator
+
+    expected_snapshot = normalize_child_snapshot(result.get("expected_vertical_snapshot_after_delete"))
+    if expected_snapshot is not None:
+        entry.setdefault("vertical_integrity", {})["expected"] = expected_snapshot
+
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    safe_steps = [publisher.safe_step_record(step) for step in steps if isinstance(step, dict)]
+    attempt["steps"] = safe_steps
+    attempt["publisher_result"] = {
+        key: result[key]
+        for key in ("status", "content_status", "failed_step")
+        if isinstance(result.get(key), str)
+    }
+    attempt["publisher_result"]["steps"] = safe_steps
+    vertical_steps = [step for step in steps if isinstance(step, dict) and step.get("step") == "publish_vertical"]
+    if vertical_steps:
+        vertical_step = vertical_steps[-1]
+        attempt["vertical_publish"] = {
+            "step": "publish_vertical",
+            "status": str(vertical_step.get("status", "unverified")),
+            **({"reason": safe_summary_text(vertical_step.get("reason"))} if vertical_step.get("reason") else {}),
+        }
+    repair_publish = entry.get("repair_publish") if isinstance(entry.get("repair_publish"), dict) else {}
+    attempt["publish"] = safe_publish_state(repair_publish)
+    publisher_status = str(result.get("status", ""))
+    content_status = str(result.get("content_status", ""))
+    vertical_publish_status = str((attempt.get("vertical_publish") or {}).get("status", ""))
+    replacement_completed = bool(
+        created_locator
+        and publisher_status == "replaced"
+        and content_status == "completed"
+        and vertical_publish_status == "completed"
+    )
+    attempt["status"] = "running" if replacement_completed else "failed"
+    if not replacement_completed:
+        default_failed_step = "create_block" if not created_locator else "publish_vertical" if vertical_publish_status != "completed" else "publish"
+        attempt["failed_step"] = publisher.safe_step_name(result.get("failed_step") or default_failed_step)
+        default_error = (
+            "Studio did not confirm the replacement Gallery locator"
+            if not created_locator
+            else "Studio did not confirm a complete Gallery replacement and vertical publication"
+        )
+        attempt["error_summary"] = safe_summary_text(result.get("note") or default_error)
+    attempt["finished_at"] = utc_now()
+    store()
+    if not created_locator:
+        raise BatchValidationError("create_block", "Studio did not confirm the replacement Gallery locator")
+    return attempt
+
+
 def repair_gallery(
     client: StudioClient,
     operation: dict[str, Any],
@@ -640,9 +1529,8 @@ def repair_gallery(
     validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
     checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
     repair_images = checks.get("images") == "mismatch"
-    repair_audio = checks.get("audio_bindings") == "mismatch"
-    play_config_untrusted = play_config_is_untrusted(validation)
-    repair_play_config = checks.get("play_config") == "mismatch" or play_config_untrusted
+    repair_audio = checks.get("audio_bindings") == "mismatch" or checks.get("audio_object_accessibility") == "mismatch"
+    repair_play_config = checks.get("play_config") == "mismatch" or play_config_is_untrusted(validation)
     repair_components = [
         name
         for name, requested in (
@@ -656,6 +1544,7 @@ def repair_gallery(
         attempt = {
             "attempt": max(len(history), int(entry.get("repair_attempts", 0))) + 1,
             "status": "running",
+            "repair_mode": "play_config",
             "started_at": utc_now(),
             "trigger_validation": copy.deepcopy(entry.get("validation", {})),
             "initial_publish": safe_publish_state(entry.get("publish")),
@@ -665,6 +1554,7 @@ def repair_gallery(
         history.append(attempt)
     else:
         attempt["status"] = "running"
+        attempt["repair_mode"] = "play_config"
         attempt["resumed_at"] = utc_now()
         for key in ("finished_at", "failed_step", "error_summary", "http_status"):
             attempt.pop(key, None)
@@ -1193,13 +2083,21 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
         initial_publish = entry.get("publish") if isinstance(entry.get("publish"), dict) else {}
         initial_vertical = entry.get("initial_vertical_publish") if isinstance(entry.get("initial_vertical_publish"), dict) else {}
         if initial_publish.get("status") != "completed" or initial_vertical.get("status") != "completed":
-            add_finding(entry, "issue", "首次发布", "首次内容写入或小节发布未全部完成，请查看发布步骤记录。")
+            no_initial_publish_attempt = (
+                bool(operation.get("targets_file"))
+                and initial_publish.get("status") in {None, "", "not_started"}
+                and initial_vertical.get("status") in {None, "", "not_started", "pending"}
+            )
+            if not no_initial_publish_attempt:
+                add_finding(entry, "issue", "首次发布", "首次内容写入或小节发布未全部完成，请查看发布步骤记录。")
         validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
         checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
         image_mismatch = any(
             checks.get(name) == "mismatch"
             for name in ("images", "image_count", "image_names", "image_asset_ids", "image_order")
         )
+        if checks.get("gallery_presence") == "mismatch":
+            add_finding(entry, "issue", "ImageGallery 内容", "本地包对应的小节中缺少 ImageGallery。")
         if image_mismatch:
             add_finding(
                 entry,
@@ -1210,12 +2108,34 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
         if checks.get("play_config") == "mismatch":
             add_finding(entry, "issue", "字幕设置", "Studio 保存的字幕未启用、配置页数不符，或页码、时间边界、字幕字段无效。")
         if checks.get("audio_bindings") == "mismatch":
-            add_finding(entry, "issue", "音频关联", "这节的 MP3 没有正确关联到图片页，请在 Studio 中核对音频。")
+            add_finding(entry, "issue", "音频绑定", "Gallery 的音频绑定数量不是恰好一条。")
+        if checks.get("audio_object_accessibility") == "mismatch":
+            add_finding(
+                entry,
+                "issue",
+                "音频对象可访问性",
+                "音频绑定存在，但对应的 OSS 对象缺失（404/NoSuchKey）。",
+            )
+        if checks.get("audio_object_accessibility") == "unverified":
+            add_finding(
+                entry,
+                "unverified",
+                "音频对象可访问性",
+                "音频绑定存在，但对象可访问性暂时无法确认。",
+            )
         if checks.get("gallery_owner") == "mismatch":
             add_finding(entry, "issue", "组件结构", "Gallery 没有唯一关联到目标小节，无法确认它属于哪节内容。")
         if validation.get("status") == "mismatch" and not image_mismatch and not any(
             checks.get(name) == "mismatch"
-            for name in ("play_config", "audio_bindings", "gallery_owner", "vertical_structure", "vertical_publication")
+            for name in (
+                "gallery_presence",
+                "play_config",
+                "audio_bindings",
+                "audio_object_accessibility",
+                "gallery_owner",
+                "vertical_structure",
+                "vertical_publication",
+            )
         ):
             add_finding(entry, "issue", "ImageGallery 内容", "Studio 中保存的 Gallery 内容与本地素材预期不一致。")
 
@@ -1228,9 +2148,17 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
             elif failed_step == "get_play_config":
                 add_finding(entry, "unverified", "字幕设置", "Studio 返回的字幕配置无法确认页数或字段完整性。")
             elif failed_step == "get_audios":
-                add_finding(entry, "unverified", "音频关联", "暂时无法读取 Gallery 的音频信息，因此无法确认 MP3 是否已正确关联。")
+                add_finding(entry, "unverified", "音频绑定", "暂时无法读取 Gallery 的音频绑定，因此无法确认绑定数量。")
             elif failed_step == "manifest":
-                add_finding(entry, "unverified", "本地素材", "本地素材清单暂时无法读取，因此无法核对图片和字幕页数。")
+                local_repair = entry.get("local_material_repair") if isinstance(entry.get("local_material_repair"), dict) else {}
+                message = (
+                    "本地素材恢复失败或仍有缺项，已停止 Studio 写入。"
+                    if local_repair.get("status") == "failed"
+                    else "本地 Gallery 素材不完整，暂时无法核对图片和字幕。"
+                )
+                add_finding(entry, "unverified", "本地素材", message)
+            elif failed_step == "target_mapping":
+                add_finding(entry, "unverified", "目标小节", "本地包目标无法唯一映射到 Studio 小节或 Gallery，已停止该目标写入。")
             elif failed_step == "operation_file":
                 add_finding(entry, "unverified", "目标小节", "目标地址或 Gallery 记录不完整，暂时无法确认这节的发布结果。")
             elif failed_step == "load_live_course_structure":
@@ -1239,7 +2167,8 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
                 gallery_checks = (
                     ("images", "暂时无法读取 Studio 中的图片信息，因此无法确认图片是否齐全。", "图片内容"),
                     ("play_config", "Studio 返回的字幕配置无法确认页数或字段完整性。", "字幕设置"),
-                    ("audio_bindings", "暂时无法读取 Gallery 的音频信息，因此无法确认 MP3 是否已正确关联。", "音频关联"),
+                    ("audio_bindings", "暂时无法读取 Gallery 的音频绑定，因此无法确认绑定数量。", "音频绑定"),
+                    ("audio_object_accessibility", "音频绑定存在，但对象可访问性暂时无法确认。", "音频对象可访问性"),
                 )
                 found_gallery_read = False
                 for check_name, message, category in gallery_checks:
@@ -1608,6 +2537,7 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
     operation_issue_count = 0
     for entry in entries:
         validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+        validation_checks = validation.get("checks") if isinstance(validation.get("checks"), dict) else {}
         vertical_locator = safe_locator(entry.get("vertical_locator"))
         vertical = vertical_results.get(vertical_locator, {})
         vertical_ok = (
@@ -1630,6 +2560,11 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
             and initial_vertical.get("status") == "completed"
             and not has_failed_publish_step
         )
+        no_initial_publish_attempt = (
+            bool(operation.get("targets_file"))
+            and original_publish.get("status") in {None, "", "not_started"}
+            and initial_vertical.get("status") in {None, "", "not_started", "pending"}
+        )
         repair_attempts = entry.get("repair_attempts", 0)
         gallery_ok = validation.get("status") == "verified" and vertical_ok
         repair_ok = True
@@ -1648,8 +2583,8 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
             gallery_issue_count += 1
         elif validation.get("status") != "verified":
             gallery_unverified_count += 1
-        operation_status = "completed" if operation_ok else "has_issues"
-        if operation_status != "completed":
+        operation_status = "not_applicable" if no_initial_publish_attempt else "completed" if operation_ok else "has_issues"
+        if operation_status == "has_issues":
             operation_issue_count += 1
         item = {
             "gallery_key": entry.get("gallery_key", ""),
@@ -1658,8 +2593,22 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
             "initial_vertical_publish_status": (entry.get("initial_vertical_publish") or {}).get("status", "missing") if isinstance(entry.get("initial_vertical_publish"), dict) else "missing",
             "expected": validation.get("expected", {}),
             "observed": validation.get("observed", {}),
+            "checks": copy.deepcopy(validation_checks),
             "repair_attempts": repair_attempts,
         }
+        if isinstance(entry.get("target_mapping_status"), str):
+            item["target_mapping_status"] = entry["target_mapping_status"]
+        if isinstance(entry.get("target_mapping_error"), str) and entry["target_mapping_error"]:
+            item["target_mapping_error"] = entry["target_mapping_error"]
+        if isinstance(entry.get("local_package_status"), str):
+            item["local_package_status"] = entry["local_package_status"]
+        local_repair = entry.get("local_material_repair")
+        if isinstance(local_repair, dict):
+            item["local_material_repair"] = {
+                key: local_repair[key]
+                for key in ("status", "return_code", "failed_step", "error_summary")
+                if key in local_repair
+            }
         publish_report = {key: publish[key] for key in ("status", "completed_stage", "active_step", "failed_step", "failure_http_status", "error_summary", "failed_page_image", "asset_ids", "images", "steps") if key in publish}
         if publish_report:
             item["publish"] = publish_report
@@ -1742,8 +2691,40 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
 
 
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
-    operation_path = Path(args.operation_file).expanduser().resolve()
-    operation = load_operation(operation_path)
+    parsed_studio_url = urlsplit(args.studio_url)
+    if parsed_studio_url.username or parsed_studio_url.password or parsed_studio_url.scheme not in {"http", "https"}:
+        raise BatchValidationError("studio_url", "--studio-url must be an HTTP(S) Studio URL without embedded credentials")
+    studio_base = f"{parsed_studio_url.scheme}://{parsed_studio_url.netloc}" if parsed_studio_url.netloc else ""
+    vertical_from_url = publisher.parse_vertical_block_id(args.studio_url)
+    course_key = publisher.course_key_from_vertical_block_id(vertical_from_url or "")
+    if not studio_base or not course_key or not vertical_from_url or "+type@vertical+" not in vertical_from_url:
+        raise BatchValidationError("studio_url", "--studio-url must contain a Studio vertical locator")
+    args.studio_url = publisher.build_container_block_url(studio_base, vertical_from_url)
+
+    package_path = Path(args.targets_file).expanduser().resolve() if args.targets_file else None
+    package: dict[str, Any] | None = None
+    package_targets: list[dict[str, Any]] = []
+    if package_path is not None:
+        package, package_targets = load_package_targets(package_path)
+        package_course = course_identity(package.get("course_id") or package.get("course_key"))
+        if package_course and package_course != course_key:
+            raise BatchValidationError("targets_file", "local package targets belong to a different Studio course")
+
+    operation_path = Path(args.operation_file).expanduser().resolve() if args.operation_file else None
+    if operation_path is None and package_path is not None:
+        operation_path = package_path.with_name(f"{package_path.stem}.batch-operation.json")
+    operation_exists = bool(operation_path and operation_path.is_file())
+    if operation_exists:
+        operation = load_operation(operation_path)
+        if not operation_course_matches(operation, course_key):
+            raise BatchValidationError("operation_file", "operation file does not match the requested Studio course")
+    elif package_path is not None:
+        operation = {"operation_id": uuid.uuid4().hex, "course_id": course_key, "galleries": []}
+    else:
+        raise BatchValidationError("operation_file", "provide an operation file or local package targets file")
+    args.operation_file = str(operation_path) if operation_path is not None else ""
+    operation["course_id"] = course_key
+
     resumable_attempts = []
     for entry in operation["galleries"]:
         attempt = resumable_repair_attempt(entry)
@@ -1788,22 +2769,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 entry["repair_attempts_in_request"] = 0
     report_mode = args.report_mode or "sections"
     operation["operator_report_mode"] = report_mode
-    store = lambda: publisher.atomic_write_json(operation_path, operation)
-    parsed_studio_url = urlsplit(args.studio_url)
-    if parsed_studio_url.username or parsed_studio_url.password or parsed_studio_url.scheme not in {"http", "https"}:
-        raise BatchValidationError("studio_url", "--studio-url must be an HTTP(S) Studio URL without embedded credentials")
-    studio_base = f"{parsed_studio_url.scheme}://{parsed_studio_url.netloc}" if parsed_studio_url.netloc else ""
-    vertical_from_url = publisher.parse_vertical_block_id(args.studio_url)
-    course_key = publisher.course_key_from_vertical_block_id(vertical_from_url or "")
-    if not studio_base or not course_key or not vertical_from_url or "+type@vertical+" not in vertical_from_url:
-        raise BatchValidationError("studio_url", "--studio-url must contain a Studio vertical locator")
-    args.studio_url = publisher.build_container_block_url(studio_base, vertical_from_url)
-    for entry in operation["galleries"]:
-        entry["gallery_locator"] = safe_locator(entry.get("gallery_locator"))
-        entry["vertical_locator"] = safe_locator(entry.get("vertical_locator"))
-        if not entry["gallery_locator"] or not entry["vertical_locator"]:
-            entry["validation"] = invalid_gallery_result(entry, None, step="operation_file", summary="Gallery or vertical locator is invalid")
-    store()
+    def store() -> None:
+        if operation_path is not None and operation.get("galleries"):
+            publisher.atomic_write_json(operation_path, operation)
+
     client = StudioClient(args, studio_base=studio_base, studio_url=args.studio_url, course_key=course_key)
     adapter = publisher.read_json(Path(args.adapter).expanduser().resolve())
     if not isinstance(adapter, dict) or not isinstance(adapter.get("publish_vertical"), dict):
@@ -1829,6 +2798,75 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         if not isinstance(structure.get("chapters"), list):
             return None, diagnostic, "Studio course structure has an invalid shape"
         return structure, diagnostic, ""
+
+    if package_path is not None and package is not None:
+        live_structure, _mapping_diagnostic, _mapping_error = read_live_structure()
+        mapped_entries = package_operation(
+            package_path,
+            package,
+            package_targets,
+            live_structure,
+            course_key=course_key,
+        )["galleries"]
+        if operation_exists:
+            previous_entries = [entry for entry in operation.get("galleries", []) if isinstance(entry, dict)]
+            package_entries = []
+            for mapped in mapped_entries:
+                candidates = [
+                    previous for previous in previous_entries
+                    if mapped.get("gallery_key") == previous.get("gallery_key")
+                    and mapped.get("gallery_key")
+                ]
+                if not candidates and mapped.get("vertical_locator"):
+                    candidates = [
+                        previous for previous in previous_entries
+                        if safe_locator(previous.get("vertical_locator")) == mapped.get("vertical_locator")
+                    ]
+                if not candidates and mapped.get("section_id"):
+                    candidates = [
+                        previous for previous in previous_entries
+                        if str(previous.get("section_id", "")).strip() == mapped.get("section_id")
+                    ]
+                if not candidates and mapped.get("section_title"):
+                    candidates = [
+                        previous for previous in previous_entries
+                        if str(previous.get("section_title", "")).strip() == mapped.get("section_title")
+                    ]
+                if len(candidates) == 1:
+                    previous = candidates[0]
+                    current_mapping = mapped
+                    mapped = dict(previous)
+                    for key in (
+                        "manifest", "section_id", "section_title", "package_target",
+                        "target_mapping_status", "target_mapping_error", "gallery_missing",
+                    ):
+                        mapped[key] = current_mapping.get(key)
+                    mapped["gallery_locator"] = current_mapping.get("gallery_locator", "")
+                    mapped["vertical_locator"] = current_mapping.get("vertical_locator", "")
+                    mapped["gallery_key"] = previous.get("gallery_key") or current_mapping["gallery_key"]
+                package_entries.append(mapped)
+            operation["galleries"] = package_entries
+        else:
+            operation["galleries"] = mapped_entries
+        operation["targets_file"] = str(package_path)
+        for entry in operation["galleries"]:
+            entry["gallery_locator"] = safe_locator(entry.get("gallery_locator"))
+            entry["vertical_locator"] = safe_locator(entry.get("vertical_locator"))
+            if entry.get("target_mapping_status") != "resolved" and entry.get("target_mapping_error"):
+                entry["validation"] = invalid_gallery_result(
+                    entry,
+                    None,
+                    step="target_mapping",
+                    summary=str(entry["target_mapping_error"]),
+                )
+        store()
+    else:
+        for entry in operation["galleries"]:
+            entry["gallery_locator"] = safe_locator(entry.get("gallery_locator"))
+            entry["vertical_locator"] = safe_locator(entry.get("vertical_locator"))
+            if not entry["gallery_locator"] or not entry["vertical_locator"]:
+                entry["validation"] = invalid_gallery_result(entry, None, step="operation_file", summary="Gallery or vertical locator is invalid")
+        store()
 
     def audit_batch_round(round_number: int) -> dict[str, list[str]]:
         structure, structure_diagnostic, structure_error = read_live_structure()
@@ -1862,21 +2900,81 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         for entry in operation["galleries"]:
             gallery_locator = safe_locator(entry.get("gallery_locator"))
             vertical_locator = safe_locator(entry.get("vertical_locator"))
-            if not gallery_locator or not vertical_locator:
-                validation = invalid_gallery_result(entry, None, step="operation_file", summary="Gallery or vertical locator is invalid")
-            else:
-                manifest_path = Path(str(entry.get("manifest", ""))).expanduser().resolve()
-                try:
-                    manifest = publisher.ensure_manifest(manifest_path)
-                    validation = validate_gallery(client, entry, manifest)
-                except Exception:
-                    validation = invalid_gallery_result(entry, None, step="manifest", summary="Local Gallery manifest or package could not be validated")
-
-            checks = validation.setdefault("checks", {})
             vertical_matches = [
                 item for item in vertical_records
                 if safe_locator(item.get("block_location")) == vertical_locator
             ]
+            owner_matches = owners.get(gallery_locator, [])
+            mapped_gallery_missing = (
+                entry.get("gallery_missing") is True
+                and entry.get("target_mapping_status") == "resolved"
+                and bool(vertical_locator)
+            )
+            safe_local_repair_target = len(vertical_matches) == 1 and (
+                mapped_gallery_missing
+                or (
+                    bool(gallery_locator)
+                    and len(owner_matches) == 1
+                    and owner_matches[0] == vertical_locator
+                )
+            )
+            manifest_path = Path(str(entry.get("manifest", ""))).expanduser().resolve()
+            manifest = None
+            if mapped_gallery_missing or gallery_locator and vertical_locator:
+                manifest = ensure_local_package(
+                    entry,
+                    manifest_path,
+                    args=args,
+                    targets_file=str(operation.get("targets_file") or ""),
+                    request_id=request_id,
+                    allow_local_repair=safe_local_repair_target,
+                    store=store,
+                )
+            local_package_complete = manifest is not None
+            if mapped_gallery_missing:
+                if local_package_complete:
+                    expected_count = manifest_image_count(manifest)
+                    validation = {
+                        "status": "mismatch",
+                        "expected": {"gallery_present": True, "image_count": expected_count},
+                        "observed": {"gallery_present": False},
+                        "checks": {"gallery_presence": "mismatch"},
+                        "failed_step": "gallery_presence",
+                        "error_summary": "No Studio Gallery exists in the uniquely matched section",
+                        "checked_at": utc_now(),
+                    }
+                else:
+                    validation = invalid_gallery_result(
+                        entry,
+                        None,
+                        step="manifest",
+                        summary="Local Gallery manifest or referenced assets could not be validated",
+                    )
+                    validation["expected"]["gallery_present"] = True
+                    validation["observed"]["gallery_present"] = False
+                    validation["checks"]["gallery_presence"] = "mismatch"
+                    validation["checks"]["local_package"] = "unverified"
+            elif not gallery_locator or not vertical_locator:
+                unresolved_mapping = entry.get("target_mapping_status") != "resolved"
+                validation = invalid_gallery_result(
+                    entry,
+                    None,
+                    step="target_mapping" if unresolved_mapping else "operation_file",
+                    summary=(
+                        str(entry.get("target_mapping_error") or "Package target could not be uniquely mapped to a Studio section")
+                        if unresolved_mapping
+                        else "Gallery or vertical locator is invalid"
+                    ),
+                )
+            else:
+                if local_package_complete:
+                    validation = validate_gallery(client, entry, manifest)
+                else:
+                    validation = invalid_gallery_result(entry, None, step="manifest", summary="Local Gallery manifest or package could not be validated")
+                    validation["checks"]["local_package"] = "unverified"
+
+            checks = validation.setdefault("checks", {})
+            target_snapshot = None
             if structure_error:
                 vertical_structure_status = "unverified"
                 owner_status = "unverified"
@@ -1899,8 +2997,11 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                     missing=missing_verticals,
                     ambiguous=ambiguous_verticals,
                 ) if len(vertical_matches) == 1 else "mismatch"
-                owner_matches = owners.get(gallery_locator, [])
-                owner_status = "pass" if len(owner_matches) == 1 and owner_matches[0] == vertical_locator else "mismatch"
+                owner_status = (
+                    "pass"
+                    if mapped_gallery_missing and len(vertical_matches) == 1
+                    else "pass" if len(owner_matches) == 1 and owner_matches[0] == vertical_locator else "mismatch"
+                )
                 publication = publication_states.get(vertical_locator, {
                     "status": "unverified",
                     "published": None,
@@ -1931,7 +3032,16 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             if publish.get("failed_step"):
                 validation["publish_failed_step"] = publish["failed_step"]
             states = list(checks.values())
-            if "unverified" in states:
+            safe_missing_gallery = (
+                mapped_gallery_missing
+                and local_package_complete
+                and not structure_error
+                and len(vertical_matches) == 1
+                and checks.get("gallery_presence") == "mismatch"
+            )
+            if safe_missing_gallery:
+                validation["status"] = "mismatch"
+            elif "unverified" in states:
                 validation["status"] = "unverified"
             elif "mismatch" in states:
                 validation["status"] = "mismatch"
@@ -1939,22 +3049,53 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 validation["status"] = "verified"
             content_mismatches = any(
                 checks.get(name) == "mismatch"
-                for name in ("images", "play_config", "audio_bindings")
+                for name in ("gallery_presence", "images", "play_config", "audio_bindings", "audio_object_accessibility")
             )
             publication_mismatch = checks.get("vertical_publication") == "mismatch"
             structure_mismatch = checks.get("vertical_structure") == "mismatch"
             play_config_untrusted = play_config_is_untrusted(validation)
-            has_repair_target = content_mismatches or play_config_untrusted or publication_mismatch or structure_mismatch
+            observed_config = validation.get("observed") if isinstance(validation.get("observed"), dict) else {}
+            unreadable_timeline = (
+                play_config_untrusted
+                and checks.get("play_config") == "unverified"
+                and "time_config_entries_valid" not in observed_config
+            )
+            timeline_only_repair = (
+                unreadable_timeline
+                and not content_mismatches
+                and not publication_mismatch
+                and not structure_mismatch
+            )
+            gallery_evidence_unverified = any(
+                checks.get(name) == "unverified"
+                for name in ("images", "audio_bindings", "audio_object_accessibility")
+            )
+            has_repair_target = safe_missing_gallery or content_mismatches or timeline_only_repair or publication_mismatch or structure_mismatch
             validation["repairable"] = bool(
-                has_repair_target
-                and checks.get("vertical_structure") in {"pass", "mismatch"}
-                and (not structure_mismatch or target_snapshot is not None)
-                and owner_status == "pass"
+                local_package_complete
+                and (safe_missing_gallery or not gallery_evidence_unverified)
+                and (
+                    safe_missing_gallery
+                    or (
+                        has_repair_target
+                        and checks.get("vertical_structure") in {"pass", "mismatch"}
+                        and (not structure_mismatch or target_snapshot is not None)
+                        and owner_status == "pass"
+                    )
+                )
             )
             if validation["repairable"]:
-                validation["repair_scope"] = "gallery" if content_mismatches or play_config_untrusted else "structure" if structure_mismatch else "publish_vertical"
+                validation["repair_scope"] = (
+                    "gallery" if safe_missing_gallery or content_mismatches or timeline_only_repair else
+                    "structure" if structure_mismatch else
+                    "publish_vertical"
+                )
             if has_repair_target and not validation["repairable"]:
-                validation["repair_skip_reason"] = "The current section structure or Gallery ownership is not safe to change automatically"
+                validation["repair_skip_reason"] = (
+                    "The local Gallery package is incomplete"
+                    if not local_package_complete
+                    else "The current section structure or Gallery ownership is not safe to change automatically"
+                )
             entry["validation"] = validation
             history = entry.get("repair_history") if isinstance(entry.get("repair_history"), list) else []
             latest_attempt = history[-1] if history and isinstance(history[-1], dict) else {}
@@ -1963,7 +3104,17 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 and "final_validation" not in latest_attempt
             ):
                 latest_attempt["final_validation"] = copy.deepcopy(validation)
-                if validation["status"] == "verified" and (latest_attempt.get("vertical_publish") or {}).get("status") == "completed":
+                publisher_result = latest_attempt.get("publisher_result") if isinstance(latest_attempt.get("publisher_result"), dict) else {}
+                vertical_publish = latest_attempt.get("vertical_publish") if isinstance(latest_attempt.get("vertical_publish"), dict) else {}
+                repair_failed = (
+                    latest_attempt.get("status") == "failed"
+                    or publisher_result.get("status") in {"failed", "partial"}
+                    or vertical_publish.get("status") == "failed"
+                )
+                if repair_failed:
+                    latest_attempt["status"] = "failed"
+                    validation["repair_status"] = "failed"
+                elif validation["status"] == "verified" and vertical_publish.get("status") == "completed":
                     latest_attempt["status"] = "completed"
                 elif validation["status"] == "unverified":
                     latest_attempt["status"] = "unverified"
@@ -1974,7 +3125,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         return owners
 
     owners = audit_batch_round(0)
-    for cycle in range(1, MAX_REPAIR_CYCLES + 1):
+    repair_cycles = range(1, MAX_REPAIR_CYCLES + 1) if args.execute else ()
+    for cycle in repair_cycles:
         repair_targets = []
         for entry in operation["galleries"]:
             validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
@@ -2050,20 +3202,16 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                     attempt["repair_round"] = cycle
                     attempt["request_id"] = request_id
                 else:
-                    attempt = repair_gallery(client, operation, entry, manifest, args, adapter, store, attempt=resume_attempt)
-                    attempt["repair_round"] = cycle
-                    attempt["request_id"] = request_id
-                    store()
-                    if validation.get("checks", {}).get("vertical_structure") == "mismatch":
-                        steps, expected = publisher.cleanup_and_publish_vertical(
-                            client.session, studio_base=studio_base, vertical_locator=entry["vertical_locator"],
-                            gallery_locator=entry["gallery_locator"], adapter=adapter, csrftoken=client.csrftoken, timeout=args.timeout,
-                        )
-                        attempt.setdefault("steps", []).extend(steps)
-                        attempt["vertical_publish"] = steps[-1]
-                        if expected is not None:
-                            entry.setdefault("vertical_integrity", {})["expected"] = expected
-                        store()
+                    attempt = replace_gallery_from_package(
+                        operation,
+                        entry,
+                        manifest,
+                        args,
+                        adapter,
+                        store,
+                        repair_round=cycle,
+                        attempt=resume_attempt,
+                    )
             except Exception as exc:
                 history = entry.setdefault("repair_history", [])
                 attempt = history[-1] if history and isinstance(history[-1], dict) else {"attempt": len(history) + 1, "steps": []}
@@ -2098,8 +3246,11 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate and safely repair a published Studio ImageGallery batch")
     parser.add_argument("--studio-url", help="Studio URL for a target vertical in this course")
-    parser.add_argument("--operation-file", required=True, help="shared batch-operation.json owned by the batch caller")
-    parser.add_argument("--execute", action="store_true", help="read Studio and perform up to two safe repair cycles for confirmed mismatches")
+    parser.add_argument("--operation-file", default="", help="batch-operation.json input/output; package mode defaults to a sibling report")
+    parser.add_argument("--targets-file", default="", help="local package targets file for operation-free legacy course mapping")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="read Studio and local package state without repairing")
+    mode.add_argument("--execute", action="store_true", help="repair confirmed mismatches and recheck Studio")
     parser.add_argument(
         "--report-mode",
         choices=sorted(OPERATOR_REPORT_MODES),
@@ -2116,13 +3267,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-retry-max-retries", type=int, default=publisher.DEFAULT_AUTH_RETRY_MAX_RETRIES)
     parser.add_argument("--auth-retry-delay-seconds", type=float, default=publisher.DEFAULT_AUTH_RETRY_DELAY_SECONDS)
     parser.add_argument("--skip-oss-multipart", action="store_true", help="debug only: skip the Gallery publisher's OSS audio upload")
+    parser.add_argument(
+        "--ppt-to-imagesgallery-root",
+        default=os.environ.get("PPT_TO_IMAGESGALLERY_ROOT", ""),
+        help="installed ppt-to-imagesgallery skill root for targeted local material recovery",
+    )
     args = parser.parse_args()
     args.cookie = args.cookie or os.environ.get("FIRA_SAAS_OP_COOKIE", "")
     args.csrf_token = args.csrf_token or os.environ.get("FIRA_SAAS_OP_CSRF_TOKEN", "")
     if not args.studio_url:
         parser.error("--studio-url is required")
-    if not args.execute:
-        parser.error("--execute is required because a confirmed mismatch can trigger repair")
+    if not args.operation_file and not args.targets_file:
+        parser.error("either --operation-file or --targets-file is required")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     return args
