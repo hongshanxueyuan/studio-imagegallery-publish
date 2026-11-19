@@ -373,16 +373,18 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 object_requests.append((url, kwargs))
                 return FakeRangeResponse()
 
-            code, stdout, stderr = self._run_cli(
-                operation_path,
-                studio,
-                execute=False,
-                object_get=get_object,
-            )
+            with patch.object(module, "local_audio_fingerprint", wraps=module.local_audio_fingerprint) as fingerprint:
+                code, stdout, stderr = self._run_cli(
+                    operation_path,
+                    studio,
+                    execute=False,
+                    object_get=get_object,
+                )
 
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             validation = state["galleries"][0]["validation"]
             self.assertEqual(0, code, stdout + stderr)
+            self.assertEqual(1, fingerprint.call_count)
             self.assertEqual("pass", validation["checks"]["audio_bindings"])
             self.assertEqual("pass", validation["checks"]["audio_object_accessibility"])
             self.assertEqual("accessible", validation["observed"]["audio_object_accessibility"])
@@ -407,12 +409,54 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual("cn-beijing", evidence["region"])
             self.assertEqual(2, evidence["multipart_part_count"])
             self.assertTrue(evidence["multipart_completed"])
+            self.assertNotIn("_verified_local_audio_fingerprint", json.dumps(state))
             self.assertNotIn("signed-secret", json.dumps(state))
             self.assertNotIn("upload-secret", json.dumps(state))
             self.assertNotIn("fragment-secret", json.dumps(state))
             self.assertNotIn("sts-secret", json.dumps(state))
             self.assertNotIn("signed-secret", stdout)
             self.assertNotIn("sts-secret", stdout)
+
+    def test_validate_gallery_computes_fingerprint_when_manifest_has_no_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._write_bundle(root)
+            manifest = publisher.ensure_manifest(manifest_path)
+            self.assertNotIn(module.LOCAL_AUDIO_FINGERPRINT_CACHE_KEY, manifest)
+            entry = self._operation(manifest_path)["galleries"][0]
+            client = SimpleNamespace(
+                studio_base="https://studio.example.com",
+                args=SimpleNamespace(timeout=5),
+            )
+
+            def studio_payload(_client, step, *_args, **_kwargs):
+                if step == "get_play_config":
+                    return {"play_config": {
+                        "time_config": valid_time_config(2),
+                        "show_subtitles": True,
+                    }}, None
+                if step == "get_audios":
+                    return {"audios": [{"document_id": "doc-1.mp3"}]}, None
+                raise AssertionError(f"Unexpected Studio request: {step}")
+
+            with patch.object(module, "get_files", return_value=([
+                {"id": "asset-a", "display_name": "page-001.png"},
+                {"id": "asset-b", "display_name": "page-002.png"},
+            ], 2, None)), patch.object(module, "read_json_call", side_effect=studio_payload), patch.object(
+                module,
+                "audio_download_url",
+                return_value=("https://objects.example.com/audio/doc-1.mp3?signature=signed-secret", None),
+            ), patch.object(module, "read_audio_range_byte", return_value=("accessible", 206, 999)), patch.object(
+                module,
+                "local_audio_fingerprint",
+                wraps=module.local_audio_fingerprint,
+            ) as fingerprint:
+                result = module.validate_gallery(client, entry, manifest)
+
+            self.assertEqual(1, fingerprint.call_count)
+            self.assertEqual("pass", result["checks"]["local_audio_fingerprint"])
+            self.assertEqual(10, entry["audio_evidence"]["local_size_bytes"])
+            self.assertEqual("72401f193251f177a310936253acb57e91e29d2aa582093974351e65e267bb32", entry["audio_evidence"]["local_sha256"])
 
     def test_cli_classifies_missing_and_unconfirmed_audio_objects(self):
         scenarios = (
@@ -3057,7 +3101,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertNotIn(str(media_path.resolve()), persisted)
                 self.assertNotIn("local-media-read-secret", persisted)
 
-    def test_final_local_audio_fingerprint_failure_keeps_audit_unverified_and_blocks_writes(self):
+    def test_initial_local_audio_fingerprint_failure_keeps_package_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = self._write_bundle(root, page_count=2)
@@ -3072,24 +3116,22 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 "audios": [{"document_id": "doc-1.mp3"}],
             }})
             audio_path = root / "full_speech.mp3"
-            audio_size = audio_path.stat().st_size
-            audio_digest = module.hashlib.sha256(audio_path.read_bytes()).hexdigest()
 
             with patch.object(
                 module,
                 "local_audio_fingerprint",
-                side_effect=[(audio_size, audio_digest), PermissionError("changed-audio-secret")],
+                side_effect=PermissionError("initial-audio-secret"),
             ) as fingerprint:
-                exit_code, stdout, stderr = self._run_cli(operation_path, studio, execute=True)
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio, execute=False)
 
             self.assertEqual(1, exit_code, stdout + stderr)
-            self.assertEqual(2, fingerprint.call_count)
+            self.assertEqual(1, fingerprint.call_count)
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             gallery = state["galleries"][0]
             validation = gallery["validation"]
             self.assertEqual("incomplete", gallery["local_package_status"])
             self.assertEqual(["音频文件 full_speech.mp3"], gallery["local_package_missing_items"])
-            self.assertEqual("unverified", validation["checks"]["local_audio_fingerprint"])
+            self.assertEqual("unverified", validation["checks"]["local_package"])
             self.assertEqual("unverified", validation["status"])
             self.assertFalse(validation["repairable"])
             self.assertFalse(state["batch_result"]["all_sections_verified"])
@@ -3107,7 +3149,64 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             ))
             persisted = stdout + stderr + json.dumps(state)
             self.assertNotIn(str(audio_path.resolve()), persisted)
-            self.assertNotIn("changed-audio-secret", persisted)
+            self.assertNotIn("initial-audio-secret", persisted)
+
+    def test_audio_fingerprint_failure_after_targeted_local_repair_blocks_studio_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            targets_path, _section_id, _section_title = self._write_repair_targets(root, manifest)
+            missing_image = root / "page-002.png"
+            missing_image.unlink()
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+            generator_root = root / "generator"
+            repair_script = generator_root / "scripts" / "repair_imagesgallery_materials.py"
+            repair_script.parent.mkdir(parents=True)
+            repair_script.write_text("", encoding="utf-8")
+
+            def repair_materials(_command, **_kwargs):
+                missing_image.write_bytes(b"restored image")
+                return SimpleNamespace(returncode=0, stdout="OK", stderr="")
+
+            with patch.object(module.subprocess, "run", side_effect=repair_materials) as repair:
+                with patch.object(
+                    module,
+                    "local_audio_fingerprint",
+                    side_effect=PermissionError("after-repair-audio-secret"),
+                ) as fingerprint:
+                    exit_code, stdout, stderr = self._run_package_cli(
+                        targets_path,
+                        studio,
+                        execute=True,
+                        extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
+                    )
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            self.assertTrue(missing_image.is_file())
+            repair.assert_called_once()
+            self.assertEqual(1, fingerprint.call_count)
+            self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+            state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            self.assertEqual("incomplete", gallery["local_package_status"])
+            self.assertEqual("failed", gallery["local_material_repair"]["status"])
+            self.assertEqual("local_audio_fingerprint", gallery["local_material_repair"]["failed_step"])
+            self.assertEqual(["音频文件 full_speech.mp3"], gallery["local_material_repair"]["missing_items"])
+            self.assertEqual(["音频文件 full_speech.mp3"], gallery["local_package_missing_items"])
+            self.assertFalse(gallery["validation"]["repairable"])
+            report = state["batch_result"]["operator_report"]["text"]
+            self.assertIn("本地素材恢复失败", report)
+            self.assertIn("音频文件 full_speech.mp3", report)
+            persisted = stdout + stderr + json.dumps(state)
+            self.assertNotIn(str(root / "full_speech.mp3"), persisted)
+            self.assertNotIn("after-repair-audio-secret", persisted)
 
     def test_execute_repairs_local_materials_before_auditing_and_resolves_relative_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3152,16 +3251,18 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 missing_image.write_bytes(b"restored image")
                 return SimpleNamespace(returncode=0, stdout="OK", stderr="")
 
-            with patch.object(module.subprocess, "run", side_effect=repair_materials):
-                exit_code, stdout, stderr = self._run_package_cli(
-                    targets_path,
-                    studio,
-                    execute=True,
-                    extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
-                )
+            with patch.object(module, "local_audio_fingerprint", wraps=module.local_audio_fingerprint) as fingerprint:
+                with patch.object(module.subprocess, "run", side_effect=repair_materials):
+                    exit_code, stdout, stderr = self._run_package_cli(
+                        targets_path,
+                        studio,
+                        execute=True,
+                        extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
+                    )
 
             self.assertEqual(0, exit_code, stdout + stderr)
             self.assertEqual(1, len(calls))
+            self.assertEqual(1, fingerprint.call_count)
             command = calls[0][0]
             self.assertIsInstance(command, list)
             self.assertEqual(str(repair_script.resolve()), command[1])
