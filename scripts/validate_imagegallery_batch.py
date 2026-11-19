@@ -66,17 +66,6 @@ def safe_summary_text(value: Any) -> str:
     return summary[:240]
 
 
-def safe_object_key_path(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    path = value.strip()
-    if "://" in path or path.startswith("//"):
-        path = urlsplit(path).path
-    else:
-        path = path.split("?", 1)[0].split("#", 1)[0]
-    return path[:500]
-
-
 def sanitize_operation_evidence(value: Any) -> Any:
     if isinstance(value, dict):
         forbidden = ("response", "request", "authorization", "cookie", "csrf", "password", "secret", "token", "credential")
@@ -85,7 +74,7 @@ def sanitize_operation_evidence(value: Any) -> Any:
             if any(word in str(key).lower() for word in forbidden):
                 continue
             if key in {"upload_key_path", "download_key_path"}:
-                safe[key] = safe_object_key_path(item)
+                safe[key] = publisher.safe_object_key_path(item)
             else:
                 safe[key] = sanitize_operation_evidence(item)
         return safe
@@ -138,6 +127,9 @@ def safe_publish_state(value: Any) -> dict[str, Any]:
     document_id = raw.get("audio_document_id")
     if isinstance(document_id, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", document_id):
         state["audio_document_id"] = document_id
+    audio_upload_evidence = safe_audio_evidence(raw.get("audio_upload_evidence"))
+    if audio_upload_evidence:
+        state["audio_upload_evidence"] = audio_upload_evidence
     return state
 
 
@@ -622,7 +614,7 @@ def safe_audio_evidence(value: Any) -> dict[str, Any]:
     for key in ("audio_id", "upload_key_path", "download_key_path", "bucket", "region", "object_accessibility"):
         item = value.get(key)
         if isinstance(item, str):
-            safe[key] = safe_object_key_path(item) if key in {"upload_key_path", "download_key_path"} else item[:500]
+            safe[key] = publisher.safe_object_key_path(item) if key in {"upload_key_path", "download_key_path"} else item[:500]
     for key in ("local_size_bytes", "multipart_part_count", "download_http_status", "object_length_bytes"):
         item = value.get(key)
         if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
@@ -654,6 +646,9 @@ def course_identity(value: Any) -> str:
     value = value.strip()
     if value.startswith("block-v1:"):
         return publisher.course_key_from_vertical_block_id(value)
+    vertical_locator = publisher.parse_vertical_block_id(value)
+    if vertical_locator:
+        return publisher.course_key_from_vertical_block_id(vertical_locator)
     return value if value.startswith("course-v1:") else ""
 
 
@@ -684,17 +679,29 @@ def section_id_matches(section: dict[str, Any], section_id: str) -> bool:
     return bool(prefix and prefix.group(1) == section_id)
 
 
-def target_course_matches(target: dict[str, Any], package: dict[str, Any], manifest: dict[str, Any], course_key: str) -> bool:
+def target_course_error(target: dict[str, Any], package: dict[str, Any], manifest: dict[str, Any], course_key: str) -> str:
+    identity_fields = (
+        "course_id",
+        "course_key",
+        "target_vertical_block_location",
+        "vertical_locator",
+        "source_vertical_block_location",
+        "gallery_locator",
+        "section_id",
+        "studio_vertical_url",
+        "studio_url",
+    )
     identities = [
-        course_identity(package.get("course_id")),
-        course_identity(package.get("course_key")),
-        course_identity(target.get("course_id")),
-        course_identity(target.get("course_key")),
-        course_identity(manifest.get("course_id")),
-        course_identity(target.get("target_vertical_block_location")),
+        identity
+        for record in (package, target, manifest)
+        for field in identity_fields
+        if (identity := course_identity(record.get(field)))
     ]
-    known = [identity for identity in identities if identity]
-    return all(identity == course_key for identity in known)
+    if not identities:
+        return "Package target has no verifiable course identity"
+    if any(identity != course_key for identity in identities):
+        return "Package target belongs to a different Studio course"
+    return ""
 
 
 def resolve_package_target(
@@ -703,11 +710,13 @@ def resolve_package_target(
     course_structure: dict[str, Any],
     *,
     course_key: str,
+    package: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     section_id = str(target.get("section_id") or manifest.get("section_id") or "").strip()
     section_title = str(target.get("section_title") or manifest.get("section_title") or target.get("name") or "").strip()
-    if not target_course_matches(target, {}, manifest, course_key):
-        return {"status": "unverified", "error": "Package target belongs to a different Studio course"}
+    identity_error = target_course_error(target, package or {}, manifest, course_key)
+    if identity_error:
+        return {"status": "unverified", "error": identity_error}
 
     records = publisher.iter_section_vertical_records(course_structure)
     sections = list(dict.fromkeys(id(record["section"]) for record in records))
@@ -814,14 +823,21 @@ def package_operation(
                 manifest_error = "Local Gallery manifest is not an object"
         except Exception:
             manifest_error = "Local Gallery manifest could not be read"
+        identity_error = target_course_error(target, package, manifest_data, course_key)
         if manifest_error:
             resolution = {"status": "unverified", "error": manifest_error}
-        elif not target_course_matches(target, package, manifest_data, course_key):
-            resolution = {"status": "unverified", "error": "Package target belongs to a different Studio course"}
+        elif identity_error:
+            resolution = {"status": "unverified", "error": identity_error}
         elif course_structure is None:
             resolution = {"status": "unverified", "error": "Studio course structure is unavailable"}
         else:
-            resolution = resolve_package_target(target, manifest_data, course_structure, course_key=course_key)
+            resolution = resolve_package_target(
+                target,
+                manifest_data,
+                course_structure,
+                course_key=course_key,
+                package=package,
+            )
         gallery_key = str(target.get("gallery_key") or "").strip()
         if not gallery_key:
             identity = str(target.get("section_id") or manifest_data.get("section_id") or target.get("section_title") or manifest_data.get("section_title") or target.get("name") or index)
@@ -906,6 +922,27 @@ def _section_title(record: dict[str, Any]) -> str:
     return ""
 
 
+def build_section_payload(
+    *,
+    section_id: str,
+    section_title: str,
+    resource_title: Any,
+    output_name: Any,
+    block_type: Any,
+    page_count: int,
+    page_content: list[Any],
+) -> dict[str, Any]:
+    return {
+        "section_id": section_id,
+        "section_title": section_title,
+        "resource_title": str(resource_title or "").strip(),
+        "output_name": str(output_name or "").strip(),
+        "block_type": str(block_type or "").strip(),
+        "page_count": page_count,
+        "page_content": page_content,
+    }
+
+
 def section_payload_from_list(
     entry: dict[str, Any],
     manifest: dict[str, Any],
@@ -938,15 +975,15 @@ def section_payload_from_list(
     resolved_title = _section_title(record)
     if not resolved_title and matched_by_id:
         resolved_title = section_title
-    return {
-        "section_id": resolved_id,
-        "section_title": resolved_title,
-        "resource_title": str(record.get("resource_title") or "").strip(),
-        "output_name": str(record.get("output_name") or "").strip(),
-        "block_type": str(record.get("block_type") or "").strip(),
-        "page_count": page_count,
-        "page_content": page_content,
-    }
+    return build_section_payload(
+        section_id=resolved_id,
+        section_title=resolved_title,
+        resource_title=record.get("resource_title"),
+        output_name=record.get("output_name"),
+        block_type=record.get("block_type"),
+        page_count=page_count,
+        page_content=page_content,
+    )
 
 
 def section_payload_from_manifest(entry: dict[str, Any], manifest_path: Path) -> dict[str, Any] | None:
@@ -960,15 +997,15 @@ def section_payload_from_manifest(entry: dict[str, Any], manifest_path: Path) ->
         return None
     if any(not isinstance(item, dict) or not isinstance(item.get("speech"), str) or not item["speech"].strip() for item in ordered_items):
         return None
-    return {
-        "section_id": str(entry.get("section_id") or manifest.get("section_id") or "").strip(),
-        "section_title": str(entry.get("section_title") or manifest.get("section_title") or "").strip(),
-        "resource_title": str(manifest.get("resource_title") or "").strip(),
-        "output_name": str(manifest.get("output_name") or "").strip(),
-        "block_type": str(manifest.get("block_type") or "").strip(),
-        "page_count": len(ordered_items),
-        "page_content": [item["speech"] for item in ordered_items],
-    }
+    return build_section_payload(
+        section_id=str(entry.get("section_id") or manifest.get("section_id") or "").strip(),
+        section_title=str(entry.get("section_title") or manifest.get("section_title") or "").strip(),
+        resource_title=manifest.get("resource_title"),
+        output_name=manifest.get("output_name"),
+        block_type=manifest.get("block_type"),
+        page_count=len(ordered_items),
+        page_content=[item["speech"] for item in ordered_items],
+    )
 
 
 def invoke_material_repair(
@@ -1031,6 +1068,35 @@ def invoke_material_repair(
         return int(result.returncode)
 
 
+def safe_local_asset_name(value: str) -> str:
+    filename = value.strip().replace("\\", "/").rsplit("/", 1)[-1]
+    filename = filename.split("?", 1)[0].split("#", 1)[0].strip()
+    return safe_summary_text(filename)[:120] or "未命名文件"
+
+
+def diagnose_local_material(manifest_path: Path) -> list[str]:
+    try:
+        publisher.ensure_manifest(manifest_path)
+    except FileNotFoundError as exc:
+        message = str(exc)
+        for prefix, label in (("图片不存在: ", "图片文件"), ("音频不存在: ", "音频文件")):
+            if message.startswith(prefix):
+                return [f"{label} {safe_local_asset_name(message[len(prefix):])}"]
+        return ["Gallery manifest 文件"]
+    except Exception as exc:
+        message = str(exc)
+        if "manifest.items must contain" in message:
+            return ["字幕时间配置（页码、时间边界或字幕文案无效）"]
+        if "manifest.audio" in message:
+            return ["音频素材配置"]
+        if "manifest.items[].image" in message:
+            return ["图片素材路径"]
+        if "manifest.items" in message:
+            return ["Gallery 图片和字幕清单"]
+        return ["Gallery manifest 内容或引用素材"]
+    return []
+
+
 def ensure_local_package(
     entry: dict[str, Any],
     manifest_path: Path,
@@ -1043,10 +1109,12 @@ def ensure_local_package(
 ) -> dict[str, Any] | None:
     try:
         manifest = publisher.ensure_manifest(manifest_path)
+        entry.pop("local_package_missing_items", None)
         entry["local_package_status"] = "complete"
         return manifest
     except Exception:
         entry["local_package_status"] = "incomplete"
+        entry["local_package_missing_items"] = diagnose_local_material(manifest_path)
 
     if not args.execute or not allow_local_repair:
         return None
@@ -1082,13 +1150,17 @@ def ensure_local_package(
         repair["status"] = "failed"
         repair["failed_step"] = publisher.safe_step_name(getattr(exc, "step", "local_material_repair"))
         repair["error_summary"] = safe_error(exc, repair["failed_step"])
+        repair["missing_items"] = diagnose_local_material(manifest_path)
         repair["finished_at"] = utc_now()
+        entry["local_package_missing_items"] = repair["missing_items"]
         entry["local_package_status"] = "incomplete"
         store()
         return None
 
     repair["status"] = "completed"
+    repair.pop("missing_items", None)
     repair["finished_at"] = utc_now()
+    entry.pop("local_package_missing_items", None)
     entry["local_package_status"] = "complete"
     store()
     return manifest
@@ -2156,9 +2228,20 @@ def _operator_report(operation: dict[str, Any], *, studio_base: str = "", report
                     if local_repair.get("status") == "failed"
                     else "本地 Gallery 素材不完整，暂时无法核对图片和字幕。"
                 )
+                missing_items = entry.get("local_package_missing_items")
+                if isinstance(missing_items, list):
+                    details = [item for item in missing_items if isinstance(item, str) and item]
+                    if details:
+                        message += f" 缺项：{'、'.join(details)}。"
                 add_finding(entry, "unverified", "本地素材", message)
             elif failed_step == "target_mapping":
-                add_finding(entry, "unverified", "目标小节", "本地包目标无法唯一映射到 Studio 小节或 Gallery，已停止该目标写入。")
+                mapping_error = entry.get("target_mapping_error")
+                message = (
+                    f"本地包目标无法唯一映射到 Studio 小节或 Gallery（{safe_summary_text(mapping_error)}），已停止该目标写入。"
+                    if isinstance(mapping_error, str) and mapping_error
+                    else "本地包目标无法唯一映射到 Studio 小节或 Gallery，已停止该目标写入。"
+                )
+                add_finding(entry, "unverified", "目标小节", message)
             elif failed_step == "operation_file":
                 add_finding(entry, "unverified", "目标小节", "目标地址或 Gallery 记录不完整，暂时无法确认这节的发布结果。")
             elif failed_step == "load_live_course_structure":
@@ -2602,6 +2685,11 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
             item["target_mapping_error"] = entry["target_mapping_error"]
         if isinstance(entry.get("local_package_status"), str):
             item["local_package_status"] = entry["local_package_status"]
+        local_missing_items = entry.get("local_package_missing_items")
+        if isinstance(local_missing_items, list) and local_missing_items:
+            item["local_package_missing_items"] = [
+                missing for missing in local_missing_items if isinstance(missing, str) and missing
+            ]
         local_repair = entry.get("local_material_repair")
         if isinstance(local_repair, dict):
             item["local_material_repair"] = {
@@ -2609,6 +2697,8 @@ def summarize_batch(operation: dict[str, Any], *, studio_base: str = "", report_
                 for key in ("status", "return_code", "failed_step", "error_summary")
                 if key in local_repair
             }
+            if isinstance(local_missing_items, list) and local_missing_items:
+                item["local_material_repair"]["missing_items"] = item["local_package_missing_items"]
         publish_report = {key: publish[key] for key in ("status", "completed_stage", "active_step", "failed_step", "failure_http_status", "error_summary", "failed_page_image", "asset_ids", "images", "steps") if key in publish}
         if publish_report:
             item["publish"] = publish_report
