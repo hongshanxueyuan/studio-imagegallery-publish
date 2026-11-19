@@ -117,7 +117,7 @@ class FakeStudio:
                 failed = self.publication_reads in self.fail_publication_reads
             if failed:
                 return FakeResponse({"detail": "structure unavailable"}, 503)
-            return FakeResponse(make_course_structure(self.galleries, self.vertical_overrides))
+            return FakeResponse(make_course_structure(self.galleries, self.vertical_overrides, concise=is_concise))
         if method == "GET" and path == f"/assets/{COURSE_KEY}/":
             page = int((kwargs.get("params") or {}).get("page", 0))
             return FakeResponse({"assets": self.assets if page == 0 else [], "totalCount": len(self.assets), "page": page, "pageSize": 50})
@@ -276,7 +276,7 @@ class FakeStudio:
         return self._response(method.upper(), path, kwargs)
 
 
-def make_course_structure(galleries, vertical_overrides=None):
+def make_course_structure(galleries, vertical_overrides=None, *, concise=False):
     vertical_overrides = vertical_overrides or {}
     override_gallery_locators = {
         block.get("id")
@@ -308,7 +308,7 @@ def make_course_structure(galleries, vertical_overrides=None):
             "display_name": "小节",
             "child_info": {"children": blocks},
         }
-        if not override.get("omit_published"):
+        if not override.get("omit_published") and not (concise and override.get("omit_published_concise")):
             node["published"] = override.get("published", True)
         if not override.get("omit_has_changes"):
             node["has_changes"] = override.get("has_changes", False)
@@ -2565,11 +2565,43 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertNotIn("visibility_state", subsection)
             self.assertFalse(any(call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
 
+    def test_cli_hydrates_published_state_from_full_read_when_concise_tree_omits_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{}],
+            }}, vertical_overrides={VERTICAL_1: {
+                "omit_published_concise": True,
+                "published": True,
+                "has_changes": False,
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(operation_path, studio)
+
+            self.assertEqual(0, exit_code, stdout + stderr)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            self.assertTrue(state["batch_result"]["all_sections_verified"])
+            self.assertEqual("pass", state["galleries"][0]["validation"]["checks"]["vertical_structure"])
+            subsection = state["course_structure_verification"]["subsections"][0]
+            self.assertTrue(subsection["published"])
+            self.assertFalse(subsection["has_changes"])
+            self.assertEqual("verified", subsection["status"])
+            self.assertEqual(0, state["galleries"][0]["repair_attempts"])
+
     def test_cli_does_not_write_when_saved_publication_evidence_is_missing_or_invalid(self):
         cases = (
             ({"omit_published": True, "has_changes": False}, "unverified"),
             ({"published": "true", "has_changes": False}, "unverified"),
             ({"omit_has_changes": True}, "unverified"),
+            ({"omit_published_concise": True, "omit_has_changes": True}, "unverified"),
             # A confirmed unpublished section remains an issue even when its
             # pending-change evidence is also missing.
             ({"published": False, "omit_has_changes": True}, "issue"),

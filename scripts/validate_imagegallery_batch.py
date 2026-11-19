@@ -3184,6 +3184,11 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                     expected_verticals[vertical_locator] = target_snapshot
                     missing_verticals.discard(vertical_locator)
                     entry.setdefault("vertical_integrity", {})["expected"] = target_snapshot
+                publication_state = publication_states.get(vertical_locator)
+                published_state = publication_state.get("published") if isinstance(publication_state, dict) else None
+                if len(vertical_matches) == 1 and isinstance(published_state, bool):
+                    # The concise tree omits this field; hydrate it from the separate live publication read.
+                    vertical_matches[0]["published"] = published_state
                 vertical_structure_status = live_vertical_structure_status(
                     structure,
                     vertical_locator,
