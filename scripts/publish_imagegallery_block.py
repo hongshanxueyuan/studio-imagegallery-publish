@@ -1213,6 +1213,19 @@ def valid_time_config_entries(value: Any) -> bool:
     return True
 
 
+def ensure_nonempty_readable_media(path: Path, label: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"{label}不存在: {path}")
+    try:
+        if not path.is_file():
+            raise OSError
+        with path.open("rb") as media:
+            if not media.read(1):
+                raise OSError
+    except OSError:
+        raise FileNotFoundError(f"{label}素材不可用: {path}") from None
+
+
 def ensure_manifest(manifest_path: Path) -> dict[str, Any]:
     data = read_json(manifest_path)
     if not isinstance(data.get("items"), list) or not data["items"]:
@@ -1232,15 +1245,13 @@ def ensure_manifest(manifest_path: Path) -> dict[str, Any]:
         img = Path(str(item["image"]))
         if not img.is_absolute():
             img = (root / img).resolve()
-        if not img.exists():
-            raise FileNotFoundError(f"图片不存在: {img}")
+        ensure_nonempty_readable_media(img, "图片")
         item["_image_abs"] = str(img)
 
     full_audio = Path(str(audio["full_audio"]))
     if not full_audio.is_absolute():
         full_audio = (root / full_audio).resolve()
-    if not full_audio.exists():
-        raise FileNotFoundError(f"音频不存在: {full_audio}")
+    ensure_nonempty_readable_media(full_audio, "音频")
     audio["_full_audio_abs"] = str(full_audio)
 
     data["items"] = sorted(data["items"], key=lambda x: int(x["page"]))

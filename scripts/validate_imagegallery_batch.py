@@ -585,6 +585,24 @@ def local_audio_fingerprint(manifest: dict[str, Any]) -> tuple[int | None, str]:
         return None, ""
 
 
+def local_audio_fingerprint_is_complete(size: Any, digest: Any) -> bool:
+    return (
+        isinstance(size, int)
+        and not isinstance(size, bool)
+        and size > 0
+        and isinstance(digest, str)
+        and re.fullmatch(r"[a-f0-9]{64}", digest) is not None
+    )
+
+
+def verified_local_audio_fingerprint(manifest: dict[str, Any]) -> tuple[int | None, str, bool]:
+    try:
+        size, digest = local_audio_fingerprint(manifest)
+    except Exception:
+        return None, "", False
+    return size, digest, local_audio_fingerprint_is_complete(size, digest)
+
+
 def audio_upload_evidence(entry: dict[str, Any]) -> dict[str, Any]:
     sources = [
         (entry.get(field) or {}).get("audio_upload_evidence")
@@ -1074,12 +1092,23 @@ def safe_local_asset_name(value: str) -> str:
     return safe_summary_text(filename)[:120] or "未命名文件"
 
 
+def local_audio_missing_item(manifest: dict[str, Any]) -> str:
+    audio = manifest.get("audio") if isinstance(manifest.get("audio"), dict) else {}
+    path = audio.get("_full_audio_abs") or audio.get("full_audio")
+    return f"音频文件 {safe_local_asset_name(str(path or ''))}"
+
+
 def diagnose_local_material(manifest_path: Path) -> list[str]:
     try:
         publisher.ensure_manifest(manifest_path)
     except FileNotFoundError as exc:
         message = str(exc)
-        for prefix, label in (("图片不存在: ", "图片文件"), ("音频不存在: ", "音频文件")):
+        for prefix, label in (
+            ("图片不存在: ", "图片文件"),
+            ("音频不存在: ", "音频文件"),
+            ("图片素材不可用: ", "图片文件"),
+            ("音频素材不可用: ", "音频文件"),
+        ):
             if message.startswith(prefix):
                 return [f"{label} {safe_local_asset_name(message[len(prefix):])}"]
         return ["Gallery manifest 文件"]
@@ -1107,14 +1136,20 @@ def ensure_local_package(
     allow_local_repair: bool,
     store: Callable[[], None],
 ) -> dict[str, Any] | None:
+    fingerprint_missing_items: list[str] = []
     try:
         manifest = publisher.ensure_manifest(manifest_path)
+        _size, _digest, fingerprint_complete = verified_local_audio_fingerprint(manifest)
+        if not fingerprint_complete:
+            fingerprint_missing_items = [local_audio_missing_item(manifest)]
+            raise BatchValidationError("local_audio_fingerprint", "Local audio size and SHA-256 could not be computed")
         entry.pop("local_package_missing_items", None)
         entry["local_package_status"] = "complete"
         return manifest
     except Exception:
         entry["local_package_status"] = "incomplete"
-        entry["local_package_missing_items"] = diagnose_local_material(manifest_path)
+        missing_items = diagnose_local_material(manifest_path)
+        entry["local_package_missing_items"] = list(dict.fromkeys([*missing_items, *fingerprint_missing_items]))
 
     if not args.execute or not allow_local_repair:
         return None
@@ -1146,11 +1181,17 @@ def ensure_local_package(
                 "local_material_repair",
                 "Local Gallery package remains incomplete after targeted repair",
             ) from None
+        _size, _digest, fingerprint_complete = verified_local_audio_fingerprint(manifest)
+        if not fingerprint_complete:
+            fingerprint_missing_items = [local_audio_missing_item(manifest)]
+            raise BatchValidationError("local_audio_fingerprint", "Local audio size and SHA-256 could not be computed")
+        fingerprint_missing_items = []
     except Exception as exc:
         repair["status"] = "failed"
         repair["failed_step"] = publisher.safe_step_name(getattr(exc, "step", "local_material_repair"))
         repair["error_summary"] = safe_error(exc, repair["failed_step"])
-        repair["missing_items"] = diagnose_local_material(manifest_path)
+        missing_items = diagnose_local_material(manifest_path)
+        repair["missing_items"] = list(dict.fromkeys([*missing_items, *fingerprint_missing_items]))
         repair["finished_at"] = utc_now()
         entry["local_package_missing_items"] = repair["missing_items"]
         entry["local_package_status"] = "incomplete"
@@ -1174,6 +1215,18 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
     observed: dict[str, Any] = {}
     checks: dict[str, str] = {}
     diagnostics: list[dict[str, Any]] = []
+    audio_size, audio_sha256, audio_fingerprint_complete = verified_local_audio_fingerprint(manifest)
+    if audio_fingerprint_complete:
+        checks["local_audio_fingerprint"] = "pass"
+    else:
+        checks["local_audio_fingerprint"] = "unverified"
+        entry["local_package_status"] = "incomplete"
+        entry["local_package_missing_items"] = [local_audio_missing_item(manifest)]
+        diagnostics.append({
+            "step": "manifest",
+            "status": "unverified",
+            "error_summary": "Local audio size and SHA-256 could not be verified",
+        })
 
     files, total_count, file_diagnostic = get_files(client, locator)
     if file_diagnostic:
@@ -1307,7 +1360,6 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
         checks["audio_bindings"] = "pass" if len(audios) == 1 else "mismatch"
 
     upload_evidence = audio_upload_evidence(entry)
-    audio_size, audio_sha256 = local_audio_fingerprint(manifest)
     audio_evidence = {
         **upload_evidence,
         "local_size_bytes": audio_size,
@@ -1419,6 +1471,10 @@ def invalid_gallery_result(entry: dict[str, Any], expected_count: int | None, *,
     return result
 
 
+def vertical_publish_started_record() -> dict[str, str]:
+    return {"step": "publish_vertical", "status": "started"}
+
+
 def replace_gallery_from_package(
     operation: dict[str, Any],
     entry: dict[str, Any],
@@ -1478,7 +1534,7 @@ def replace_gallery_from_package(
     if isinstance(request_id, str) and request_id:
         attempt["request_id"] = request_id
     entry["repair_attempts"] = max(int(entry.get("repair_attempts", 0)), int(attempt.get("attempt", 1)))
-    attempt["vertical_publish"] = {"step": "publish_vertical", "status": "started"}
+    attempt["vertical_publish"] = vertical_publish_started_record()
     store()
 
     vertical_locator = safe_locator(entry.get("vertical_locator"))
@@ -1968,7 +2024,7 @@ def republish_vertical_for_pending_changes(
 
     vertical_publish = attempt.get("vertical_publish")
     if not isinstance(vertical_publish, dict) or vertical_publish.get("status") != "completed":
-        vertical_publish = {"step": "publish_vertical", "status": "started"}
+        vertical_publish = vertical_publish_started_record()
         attempt["vertical_publish"] = vertical_publish
         store()
         try:
@@ -3082,6 +3138,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     validation = invalid_gallery_result(entry, None, step="manifest", summary="Local Gallery manifest or package could not be validated")
                     validation["checks"]["local_package"] = "unverified"
+            if entry.get("local_package_status") == "incomplete":
+                local_package_complete = False
 
             checks = validation.setdefault("checks", {})
             target_snapshot = None
@@ -3314,7 +3372,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                     if resume_attempt is None:
                         history.append(attempt)
                     entry["repair_attempts"] = max(entry.get("repair_attempts", 0), attempt["attempt"])
-                    attempt["vertical_publish"] = {"step": "publish_vertical", "status": "started"}
+                    attempt["vertical_publish"] = vertical_publish_started_record()
                     store()
                     steps, expected = publisher.cleanup_and_publish_vertical(
                         client.session, studio_base=studio_base, vertical_locator=entry["vertical_locator"],

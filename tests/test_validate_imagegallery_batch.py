@@ -3001,6 +3001,114 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertNotIn("local_material_repair", gallery)
             self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
 
+    def test_package_cli_rejects_unusable_local_media_and_reports_safe_names(self):
+        scenarios = (
+            ("image directory", "page-001.png", "directory", "图片文件 page-001.png"),
+            ("audio directory", "full_speech.mp3", "directory", "音频文件 full_speech.mp3"),
+            ("empty image", "page-001.png", "empty", "图片文件 page-001.png"),
+            ("empty audio", "full_speech.mp3", "empty", "音频文件 full_speech.mp3"),
+            ("unreadable image", "page-001.png", "unreadable", "图片文件 page-001.png"),
+            ("unreadable audio", "full_speech.mp3", "unreadable", "音频文件 full_speech.mp3"),
+        )
+        for label, filename, media_state, expected_missing_item in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                targets_path, _section_id, _section_title = self._write_repair_targets(root, manifest)
+                media_path = root / filename
+                if media_state == "directory":
+                    media_path.unlink()
+                    media_path.mkdir()
+                elif media_state == "empty":
+                    media_path.write_bytes(b"")
+
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [
+                        {"id": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{"document_id": "doc-1.mp3"}],
+                }})
+
+                if media_state == "unreadable":
+                    real_open = Path.open
+
+                    def open_unreadable_media(path, *args, **kwargs):
+                        if path.resolve() == media_path.resolve():
+                            raise PermissionError("local-media-read-secret")
+                        return real_open(path, *args, **kwargs)
+
+                    with patch.object(Path, "open", autospec=True, side_effect=open_unreadable_media):
+                        exit_code, stdout, stderr = self._run_package_cli(targets_path, studio, execute=False)
+                else:
+                    exit_code, stdout, stderr = self._run_package_cli(targets_path, studio, execute=False)
+
+                self.assertEqual(1, exit_code, stdout + stderr)
+                state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
+                gallery = state["galleries"][0]
+                self.assertEqual("incomplete", gallery["local_package_status"])
+                self.assertEqual([expected_missing_item], gallery["local_package_missing_items"])
+                self.assertEqual("unverified", gallery["validation"]["checks"]["local_package"])
+                self.assertFalse(state["batch_result"]["all_sections_verified"])
+                self.assertIn(expected_missing_item, state["batch_result"]["operator_report"]["text"])
+                self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
+                persisted = stdout + stderr + json.dumps(state)
+                self.assertNotIn(str(media_path.resolve()), persisted)
+                self.assertNotIn("local-media-read-secret", persisted)
+
+    def test_final_local_audio_fingerprint_failure_keeps_audit_unverified_and_blocks_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root, page_count=2)
+            operation_path = root / "batch-operation.json"
+            self._write_operation_file(operation_path, self._operation(manifest))
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "asset_key": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "asset_key": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{"document_id": "doc-1.mp3"}],
+            }})
+            audio_path = root / "full_speech.mp3"
+            audio_size = audio_path.stat().st_size
+            audio_digest = module.hashlib.sha256(audio_path.read_bytes()).hexdigest()
+
+            with patch.object(
+                module,
+                "local_audio_fingerprint",
+                side_effect=[(audio_size, audio_digest), PermissionError("changed-audio-secret")],
+            ) as fingerprint:
+                exit_code, stdout, stderr = self._run_cli(operation_path, studio, execute=True)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            self.assertEqual(2, fingerprint.call_count)
+            state = json.loads(operation_path.read_text(encoding="utf-8"))
+            gallery = state["galleries"][0]
+            validation = gallery["validation"]
+            self.assertEqual("incomplete", gallery["local_package_status"])
+            self.assertEqual(["音频文件 full_speech.mp3"], gallery["local_package_missing_items"])
+            self.assertEqual("unverified", validation["checks"]["local_audio_fingerprint"])
+            self.assertEqual("unverified", validation["status"])
+            self.assertFalse(validation["repairable"])
+            self.assertFalse(state["batch_result"]["all_sections_verified"])
+            self.assertIn("音频文件 full_speech.mp3", state["batch_result"]["operator_report"]["text"])
+            self.assertFalse(any(
+                call["method"] in {"POST", "PUT", "DELETE"}
+                and (call["path"].startswith("/xblock/") or call["path"].endswith((
+                    "/handler/file_upload",
+                    "/handler/remove_files",
+                    "/handler/change_files_order",
+                    "/handler/save_audio",
+                    "/handler/update_play_config",
+                )))
+                for call in studio.calls
+            ))
+            persisted = stdout + stderr + json.dumps(state)
+            self.assertNotIn(str(audio_path.resolve()), persisted)
+            self.assertNotIn("changed-audio-secret", persisted)
+
     def test_execute_repairs_local_materials_before_auditing_and_resolves_relative_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3077,16 +3185,25 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
 
     def test_failed_or_incomplete_local_repair_blocks_studio_writes(self):
         scenarios = (
-            ("nonzero exit with a missing image", 1, "image", "图片文件 page-002.png"),
-            ("incomplete after successful exit", 0, "audio", "音频文件 full_speech.mp3"),
+            ("nonzero exit with a missing image", 1, "image", "missing", "图片文件 page-002.png"),
+            ("incomplete after successful exit", 0, "audio", "missing", "音频文件 full_speech.mp3"),
+            ("nonzero exit with an image directory", 1, "image", "directory", "图片文件 page-002.png"),
+            ("nonzero exit with an empty audio file", 1, "audio", "empty", "音频文件 full_speech.mp3"),
+            ("nonzero exit with unreadable audio", 1, "audio", "unreadable", "音频文件 full_speech.mp3"),
         )
-        for label, return_code, missing_kind, expected_missing_item in scenarios:
+        for label, return_code, missing_kind, media_state, expected_missing_item in scenarios:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 manifest = self._write_bundle(root, page_count=2)
                 targets_path, _section_id, _section_title = self._write_repair_targets(root, manifest)
-                missing_path = root / ("page-002.png" if missing_kind == "image" else "full_speech.mp3")
-                missing_path.unlink()
+                media_path = root / ("page-002.png" if missing_kind == "image" else "full_speech.mp3")
+                if media_state == "missing":
+                    media_path.unlink()
+                elif media_state == "directory":
+                    media_path.unlink()
+                    media_path.mkdir()
+                elif media_state == "empty":
+                    media_path.write_bytes(b"")
                 studio = FakeStudio({GALLERY_1: {
                     "files": [
                         {"id": "asset-a", "display_name": "page-001.png"},
@@ -3100,20 +3217,41 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 repair_script.parent.mkdir(parents=True)
                 repair_script.write_text("", encoding="utf-8")
 
-                with patch.object(
-                    module.subprocess,
-                    "run",
-                    return_value=SimpleNamespace(returncode=return_code, stdout="token=output-secret", stderr="signature=signed-secret"),
-                ):
-                    exit_code, stdout, stderr = self._run_package_cli(
-                        targets_path,
-                        studio,
-                        execute=True,
-                        extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
-                    )
+                def run_with_failed_repair():
+                    with patch.object(
+                        module.subprocess,
+                        "run",
+                        return_value=SimpleNamespace(returncode=return_code, stdout="token=output-secret", stderr="signature=signed-secret"),
+                    ):
+                        return self._run_package_cli(
+                            targets_path,
+                            studio,
+                            execute=True,
+                            extra_args=("--ppt-to-imagesgallery-root", str(generator_root)),
+                        )
+
+                if media_state == "unreadable":
+                    real_open = Path.open
+
+                    def open_unreadable_media(path, *args, **kwargs):
+                        if path.resolve() == media_path.resolve():
+                            raise PermissionError("local-media-read-secret")
+                        return real_open(path, *args, **kwargs)
+
+                    with patch.object(Path, "open", autospec=True, side_effect=open_unreadable_media):
+                        exit_code, stdout, stderr = run_with_failed_repair()
+                else:
+                    exit_code, stdout, stderr = run_with_failed_repair()
 
                 self.assertEqual(1, exit_code, stdout + stderr)
-                self.assertFalse(missing_path.exists())
+                if media_state == "missing":
+                    self.assertFalse(media_path.exists())
+                elif media_state == "directory":
+                    self.assertTrue(media_path.is_dir())
+                elif media_state == "empty":
+                    self.assertEqual(b"", media_path.read_bytes())
+                else:
+                    self.assertTrue(media_path.is_file())
                 self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
                 state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
                 gallery = state["galleries"][0]
@@ -3127,7 +3265,8 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                 self.assertIn("本地素材恢复失败", report)
                 self.assertIn(expected_missing_item, report)
                 persisted = stdout + stderr + json.dumps(state)
-                self.assertNotIn(str(missing_path), persisted)
+                self.assertNotIn(str(media_path.resolve()), persisted)
+                self.assertNotIn("local-media-read-secret", persisted)
                 self.assertNotIn("output-secret", persisted)
                 self.assertNotIn("signed-secret", persisted)
 
