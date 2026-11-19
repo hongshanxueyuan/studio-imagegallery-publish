@@ -25,6 +25,9 @@ import publish_imagegallery_block as publisher
 DEFAULT_ADAPTER = Path(__file__).resolve().parents[1] / "references" / "adapter.template.json"
 DEFAULT_TIMEOUT = 30
 MAX_REPAIR_CYCLES = 2
+LOCAL_AUDIO_FINGERPRINT_CACHE_KEY = "_verified_local_audio_fingerprint"
+
+
 class BatchValidationError(RuntimeError):
     def __init__(self, step: str, summary: str, *, http_status: int | None = None):
         self.step = step
@@ -603,6 +606,30 @@ def verified_local_audio_fingerprint(manifest: dict[str, Any]) -> tuple[int | No
     return size, digest, local_audio_fingerprint_is_complete(size, digest)
 
 
+def local_audio_fingerprint_for_manifest(
+    manifest: dict[str, Any],
+    *,
+    refresh: bool = False,
+) -> tuple[int | None, str, bool]:
+    if refresh:
+        manifest.pop(LOCAL_AUDIO_FINGERPRINT_CACHE_KEY, None)
+
+    cached = manifest.get(LOCAL_AUDIO_FINGERPRINT_CACHE_KEY)
+    if isinstance(cached, dict):
+        size = cached.get("size_bytes")
+        digest = cached.get("sha256")
+        if local_audio_fingerprint_is_complete(size, digest):
+            return size, digest, True
+
+    size, digest, complete = verified_local_audio_fingerprint(manifest)
+    if complete:
+        manifest[LOCAL_AUDIO_FINGERPRINT_CACHE_KEY] = {
+            "size_bytes": size,
+            "sha256": digest,
+        }
+    return size, digest, complete
+
+
 def audio_upload_evidence(entry: dict[str, Any]) -> dict[str, Any]:
     sources = [
         (entry.get(field) or {}).get("audio_upload_evidence")
@@ -1139,7 +1166,7 @@ def ensure_local_package(
     fingerprint_missing_items: list[str] = []
     try:
         manifest = publisher.ensure_manifest(manifest_path)
-        _size, _digest, fingerprint_complete = verified_local_audio_fingerprint(manifest)
+        _size, _digest, fingerprint_complete = local_audio_fingerprint_for_manifest(manifest, refresh=True)
         if not fingerprint_complete:
             fingerprint_missing_items = [local_audio_missing_item(manifest)]
             raise BatchValidationError("local_audio_fingerprint", "Local audio size and SHA-256 could not be computed")
@@ -1181,7 +1208,7 @@ def ensure_local_package(
                 "local_material_repair",
                 "Local Gallery package remains incomplete after targeted repair",
             ) from None
-        _size, _digest, fingerprint_complete = verified_local_audio_fingerprint(manifest)
+        _size, _digest, fingerprint_complete = local_audio_fingerprint_for_manifest(manifest, refresh=True)
         if not fingerprint_complete:
             fingerprint_missing_items = [local_audio_missing_item(manifest)]
             raise BatchValidationError("local_audio_fingerprint", "Local audio size and SHA-256 could not be computed")
@@ -1215,7 +1242,7 @@ def validate_gallery(client: StudioClient, entry: dict[str, Any], manifest: dict
     observed: dict[str, Any] = {}
     checks: dict[str, str] = {}
     diagnostics: list[dict[str, Any]] = []
-    audio_size, audio_sha256, audio_fingerprint_complete = verified_local_audio_fingerprint(manifest)
+    audio_size, audio_sha256, audio_fingerprint_complete = local_audio_fingerprint_for_manifest(manifest)
     if audio_fingerprint_complete:
         checks["local_audio_fingerprint"] = "pass"
     else:
