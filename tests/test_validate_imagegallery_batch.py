@@ -738,6 +738,143 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertTrue(any(call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}" for call in studio.calls))
             self.assertEqual(operation["galleries"][0]["publish"], json.loads(path.read_text(encoding="utf-8"))["galleries"][0]["publish"])
 
+    def test_cli_publishes_ambiguous_vertical_once_without_changing_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            path = root / "operation.json"
+            self._write_operation_file(path, self._operation(manifest))
+            summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+            second_summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary-copy")
+            initial_blocks = [
+                {"id": GALLERY_1, "category": "imagesgallery"},
+                {"id": summary, "category": "html", "display_name": "本节要点"},
+                {"id": second_summary, "category": "html", "display_name": "本节要点"},
+            ]
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "asset-a", "display_name": "page-001.png"},
+                    {"id": "asset-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{}],
+            }}, vertical_overrides={VERTICAL_1: {
+                "blocks": copy.deepcopy(initial_blocks),
+                "published": False,
+                "has_changes": True,
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(path.read_text(encoding="utf-8"))
+            entry = state["galleries"][0]
+            self.assertEqual("mismatch", entry["validation"]["checks"]["vertical_structure"])
+            self.assertEqual("issue", state["course_structure_verification"]["subsections"][0]["status"])
+            self.assertEqual("issue", state["batch_result"]["operator_report"]["status"])
+            findings = state["batch_result"]["operator_report"]["groups"][0]["findings"]
+            self.assertIn("组件结构", [finding["category"] for finding in findings])
+            self.assertEqual(initial_blocks, studio.vertical_overrides[VERTICAL_1]["blocks"])
+            self.assertEqual(1, sum(
+                call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}"
+                for call in studio.calls
+            ))
+            self.assertFalse(any(
+                call["method"] == "DELETE" or call["method"] == "PUT" and call["path"] == f"/xblock/{VERTICAL_1}"
+                for call in studio.calls
+            ))
+            self.assertEqual(1, entry["repair_attempts"])
+            self.assertEqual(1, len(entry["repair_history"]))
+            self.assertEqual("completed", entry["repair_history"][0]["vertical_publish"]["status"])
+
+    def test_cli_does_not_publish_ambiguous_vertical_when_gallery_evidence_is_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self._write_bundle(root)
+            path = root / "operation.json"
+            self._write_operation_file(path, self._operation(manifest))
+            summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+            second_summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary-copy")
+            studio = FakeStudio({GALLERY_1: {
+                "files": [
+                    {"id": "wrong-a", "display_name": "page-001.png"},
+                    {"id": "wrong-b", "display_name": "page-002.png"},
+                ],
+                "time_config": valid_time_config(2),
+                "audios": [{}],
+            }}, payload_overrides={(GALLERY_1, "get_audios"): {"audios": "unreadable"}}, vertical_overrides={VERTICAL_1: {
+                "blocks": [
+                    {"id": GALLERY_1, "category": "imagesgallery"},
+                    {"id": summary, "category": "html", "display_name": "本节要点"},
+                    {"id": second_summary, "category": "html", "display_name": "本节要点"},
+                ],
+            }})
+
+            exit_code, stdout, stderr = self._run_cli(path, studio)
+
+            self.assertEqual(1, exit_code, stdout + stderr)
+            state = json.loads(path.read_text(encoding="utf-8"))
+            entry = state["galleries"][0]
+            self.assertEqual("unverified", entry["validation"]["checks"]["audio_bindings"])
+            self.assertEqual("mismatch", entry["validation"]["checks"]["vertical_structure"])
+            self.assertFalse(entry["validation"]["repairable"])
+            self.assertEqual(0, entry["repair_attempts"])
+            self.assertFalse(any(
+                call["path"] == f"/xblock/{VERTICAL_1}" and call["method"] == "POST"
+                for call in studio.calls
+            ))
+
+    def test_cli_publishes_ambiguous_vertical_without_a_saved_snapshot_once(self):
+        for integrity_shape in ("missing", "no_snapshot"):
+            with self.subTest(integrity_shape=integrity_shape), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root)
+                operation = self._operation(manifest)
+                if integrity_shape == "missing":
+                    operation["galleries"][0].pop("vertical_integrity")
+                else:
+                    operation["galleries"][0]["vertical_integrity"] = {"status": "unresolved"}
+                path = root / "operation.json"
+                self._write_operation_file(path, operation)
+                summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary")
+                second_summary = VERTICAL_1.replace("type@vertical", "type@html").replace("block@vertical", "block@summary-copy")
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [
+                        {"id": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{}],
+                }}, vertical_overrides={VERTICAL_1: {
+                    "blocks": [
+                        {"id": GALLERY_1, "category": "imagesgallery"},
+                        {"id": summary, "category": "html", "display_name": "本节要点"},
+                        {"id": second_summary, "category": "html", "display_name": "本节要点"},
+                    ],
+                }})
+
+                exit_code, stdout, stderr = self._run_cli(path, studio)
+
+                self.assertEqual(1, exit_code, stdout + stderr)
+                state = json.loads(path.read_text(encoding="utf-8"))
+                entry = state["galleries"][0]
+                self.assertEqual("unverified", entry["validation"]["checks"]["vertical_structure"])
+                self.assertEqual("unverified", state["course_structure_verification"]["subsections"][0]["structure_status"])
+                self.assertEqual("unverified", state["batch_result"]["operator_report"]["status"])
+                self.assertIn("发布记录不足以唯一确认目标组件", state["batch_result"]["operator_report"]["text"])
+                self.assertEqual(1, entry["repair_attempts"])
+                self.assertEqual("publish_vertical", entry["repair_history"][0]["repair_mode"])
+                self.assertEqual("publish_vertical", entry["repair_history"][0]["trigger_validation"]["repair_scope"])
+                self.assertEqual("completed", entry["repair_history"][0]["vertical_publish"]["status"])
+                self.assertEqual(1, sum(
+                    call["method"] == "POST" and call["path"] == f"/xblock/{VERTICAL_1}"
+                    for call in studio.calls
+                ))
+                self.assertFalse(any(
+                    call["method"] == "DELETE" or call["method"] == "PUT" and call["path"] == f"/xblock/{VERTICAL_1}"
+                    for call in studio.calls
+                ))
+
     def test_publisher_then_validator_cli_complete_first_pass_before_batch_audit(self):
         class SharedStudio(FakeStudio):
             def __init__(self):
