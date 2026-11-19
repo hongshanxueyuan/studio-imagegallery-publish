@@ -203,9 +203,16 @@ class FakeStudio:
                 return FakeResponse(override if override is not None else {"audios": audios})
             if method == "POST" and path == preview_prefix + "get_audio_download_url":
                 override = self.payload_overrides.get((gallery_locator, "get_audio_download_url"))
-                return FakeResponse(override if override is not None else {
-                    "download_url": "https://objects.example.com/audio/doc-1.mp3?signature=signed-secret&token=sts-secret",
-                })
+                if override is not None:
+                    return FakeResponse(override)
+                request_body = kwargs.get("json") or {}
+                document_id = request_body.get("document_id")
+                download_url = (
+                    f"https://objects.example.com/audio/{document_id}?signature=signed-secret&token=sts-secret"
+                    if isinstance(document_id, str) and document_id.strip()
+                    else ""
+                )
+                return FakeResponse({"url": download_url})
             if method == "POST" and path == author_prefix + "remove_files":
                 requested = set((kwargs.get("json") or {}).get("assets", []))
                 gallery["files"] = [
@@ -396,7 +403,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual("bytes=0-0", object_requests[0][1]["headers"]["Range"])
             self.assertTrue(object_requests[0][1]["stream"])
             download_call = next(call for call in studio.calls if call["path"].endswith("/get_audio_download_url"))
-            self.assertEqual({"audio_id": "doc-1.mp3"}, download_call["kwargs"]["json"])
+            self.assertEqual({"document_id": "doc-1.mp3"}, download_call["kwargs"]["json"])
             evidence = state["galleries"][0]["audio_evidence"]
             self.assertEqual(206, evidence["download_http_status"])
             self.assertEqual(999, evidence["object_length_bytes"])

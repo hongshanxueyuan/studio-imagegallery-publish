@@ -562,7 +562,7 @@ def audio_download_url(client: StudioClient, locator: str, audio_id: str, refere
         "get_audio_download_url",
         "POST",
         f"{client.studio_base}/preview/xblock/{locator}/handler/get_audio_download_url",
-        body={"audio_id": audio_id},
+        body={"document_id": audio_id},
         referer=referer,
     )
     if diagnostic and diagnostic.get("status") != "ok":
