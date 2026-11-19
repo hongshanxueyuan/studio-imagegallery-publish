@@ -143,7 +143,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 module,
                 "sts_multipart_upload_audio",
                 return_value={
-                    "object_key": "course/audio/object.mp3",
+                    "object_key": "//oss.example.com/course/audio/object.mp3?signature=upload-secret#fragment-secret",
                     "upload_id": "multipart-id-secret",
                     "parts": 3,
                     "size": 10,
@@ -161,7 +161,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
             state = json.loads(operation_path.read_text(encoding="utf-8"))
             evidence = state["galleries"][0]["publish"]["audio_upload_evidence"]
             self.assertEqual({
-                "upload_key_path": "course/audio/object.mp3",
+                "upload_key_path": "/course/audio/object.mp3",
                 "bucket": "course-audio",
                 "region": "cn-beijing",
                 "multipart_part_count": 3,
@@ -169,7 +169,7 @@ class PublishImageGalleryBlockTests(unittest.TestCase):
                 "local_size_bytes": 10,
             }, evidence)
             persisted = stdout + stderr + json.dumps(state)
-            for secret in ("secret-key-value", "sts-token-value", "multipart-id-secret"):
+            for secret in ("secret-key-value", "sts-token-value", "multipart-id-secret", "upload-secret", "fragment-secret", "oss.example.com"):
                 self.assertNotIn(secret, persisted)
 
     def _write_manifest_bundle(self, root: Path) -> Path:

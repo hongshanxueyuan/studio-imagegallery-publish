@@ -354,7 +354,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             operation_path = root / "operation.json"
             operation = self._operation(manifest)
             operation["galleries"][0]["publish"]["audio_upload_evidence"] = {
-                "upload_key_path": "audio/course.mp3?signature=upload-secret",
+                "upload_key_path": "//objects.example.com/audio/course.mp3?signature=upload-secret#fragment-secret",
                 "bucket": "course-audio",
                 "region": "cn-beijing",
                 "multipart_part_count": 2,
@@ -400,7 +400,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertEqual(999, evidence["object_length_bytes"])
             self.assertEqual(10, evidence["local_size_bytes"])
             self.assertEqual("72401f193251f177a310936253acb57e91e29d2aa582093974351e65e267bb32", evidence["local_sha256"])
-            self.assertEqual("audio/course.mp3", evidence["upload_key_path"])
+            self.assertEqual("/audio/course.mp3", evidence["upload_key_path"])
             self.assertEqual("/audio/doc-1.mp3", evidence["download_key_path"])
             self.assertFalse(evidence["key_paths_match"])
             self.assertEqual("course-audio", evidence["bucket"])
@@ -409,6 +409,7 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertTrue(evidence["multipart_completed"])
             self.assertNotIn("signed-secret", json.dumps(state))
             self.assertNotIn("upload-secret", json.dumps(state))
+            self.assertNotIn("fragment-secret", json.dumps(state))
             self.assertNotIn("sts-secret", json.dumps(state))
             self.assertNotIn("signed-secret", stdout)
             self.assertNotIn("sts-secret", stdout)
@@ -1213,6 +1214,16 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                         {"page": 1, "image": "page-001.png", "asset_id": "replacement-a"},
                         {"page": 2, "image": "page-002.png", "asset_id": "replacement-b"},
                     ],
+                    "audio_upload_evidence": {
+                        "upload_key_path": "audio/repaired.mp3?signature=repair-secret",
+                        "bucket": "course-audio",
+                        "region": "cn-beijing",
+                        "multipart_part_count": 3,
+                        "multipart_completed": True,
+                        "local_size_bytes": 1234,
+                        "local_sha256": "a" * 64,
+                        "Credentials": {"AccessKeySecret": "credential-secret"},
+                    },
                 }
                 entry["repair_gallery_locator"] = replacement_gallery
                 publisher.atomic_write_json(operation_path, persisted)
@@ -1272,6 +1283,17 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             gallery = state["galleries"][0]
             repair = gallery["repair_history"][0]
             self.assertEqual("gallery_replacement", repair["repair_mode"])
+            self.assertEqual({
+                "upload_key_path": "audio/repaired.mp3",
+                "bucket": "course-audio",
+                "region": "cn-beijing",
+                "multipart_part_count": 3,
+                "multipart_completed": True,
+                "local_size_bytes": 1234,
+                "local_sha256": "a" * 64,
+            }, repair["publish"]["audio_upload_evidence"])
+            self.assertNotIn("repair-secret", json.dumps(state))
+            self.assertNotIn("credential-secret", json.dumps(state))
             self.assertEqual("mismatch", repair["trigger_validation"]["checks"]["images"])
             self.assertEqual("mismatch", repair["trigger_validation"]["checks"]["play_config"])
             self.assertIn("images", repair["repair_components"])
@@ -2719,6 +2741,57 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertIn("more than one", state["batch_result"]["galleries"][0]["target_mapping_error"])
             self.assertIn("无法唯一映射", state["batch_result"]["operator_report"]["text"])
 
+    def test_package_cli_requires_a_matching_course_identity_for_each_target(self):
+        section_locator = "block-v1:ORG+COURSE+RUN+type@sequential+block@section"
+        scenarios = (
+            ("missing identity", None, None, "1.1", "unverified", "verifiable course identity", 1),
+            ("conflicting target identity", COURSE_KEY, "course-v1:OTHER+COURSE+RUN", section_locator, "unverified", "different Studio course", 1),
+            ("section locator identifies course", None, None, section_locator, "resolved", "", 0),
+        )
+        for label, package_course, target_course, section_id, expected_mapping, expected_error, expected_code in scenarios:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self._write_bundle(root, page_count=2)
+                manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+                manifest_data.update({"section_id": section_id, "section_title": "1.1 Local repair section"})
+                manifest.write_text(json.dumps(manifest_data, ensure_ascii=False), encoding="utf-8")
+                target = {
+                    "gallery_key": "legacy-gallery-1",
+                    "manifest": manifest.name,
+                    "section_id": section_id,
+                    "section_title": "1.1 Local repair section",
+                }
+                if target_course:
+                    target["course_id"] = target_course
+                targets = {"targets": [target]}
+                if package_course:
+                    targets["course_id"] = package_course
+                targets_path = root / "legacy-targets.json"
+                targets_path.write_text(json.dumps(targets, ensure_ascii=False), encoding="utf-8")
+                studio = FakeStudio({GALLERY_1: {
+                    "files": [
+                        {"id": "asset-a", "display_name": "page-001.png"},
+                        {"id": "asset-b", "display_name": "page-002.png"},
+                    ],
+                    "time_config": valid_time_config(2),
+                    "audios": [{"document_id": "doc-1.mp3"}],
+                }})
+
+                code, stdout, stderr = self._run_package_cli(targets_path, studio, execute=True)
+
+                self.assertEqual(expected_code, code, stdout + stderr)
+                state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
+                gallery = state["galleries"][0]
+                self.assertEqual(expected_mapping, gallery["target_mapping_status"])
+                if expected_error:
+                    self.assertIn(expected_error, gallery["target_mapping_error"])
+                    self.assertEqual("target_mapping", gallery["validation"]["failed_step"])
+                    self.assertIn(expected_error, state["batch_result"]["operator_report"]["text"])
+                self.assertFalse(any(
+                    call["method"] in {"POST", "PUT", "DELETE"} and call["path"].startswith("/xblock/")
+                    for call in studio.calls
+                ))
+
     def test_repair_publish_checkpoint_keeps_the_source_gallery_locator_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2786,6 +2859,8 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
             gallery = state["galleries"][0]
             self.assertEqual("incomplete", gallery["local_package_status"])
+            self.assertEqual(["图片文件 page-002.png"], gallery["local_package_missing_items"])
+            self.assertIn("图片文件 page-002.png", state["batch_result"]["operator_report"]["text"])
             self.assertNotIn("local_material_repair", gallery)
             self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
 
@@ -2864,13 +2939,17 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
             self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
 
     def test_failed_or_incomplete_local_repair_blocks_studio_writes(self):
-        scenarios = (("nonzero exit", 1), ("still incomplete", 0))
-        for label, return_code in scenarios:
+        scenarios = (
+            ("nonzero exit with a missing image", 1, "image", "图片文件 page-002.png"),
+            ("incomplete after successful exit", 0, "audio", "音频文件 full_speech.mp3"),
+        )
+        for label, return_code, missing_kind, expected_missing_item in scenarios:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 manifest = self._write_bundle(root, page_count=2)
                 targets_path, _section_id, _section_title = self._write_repair_targets(root, manifest)
-                (root / "page-002.png").unlink()
+                missing_path = root / ("page-002.png" if missing_kind == "image" else "full_speech.mp3")
+                missing_path.unlink()
                 studio = FakeStudio({GALLERY_1: {
                     "files": [
                         {"id": "asset-a", "display_name": "page-001.png"},
@@ -2897,16 +2976,21 @@ class ValidateImageGalleryBatchTests(unittest.TestCase):
                     )
 
                 self.assertEqual(1, exit_code, stdout + stderr)
-                self.assertFalse((root / "page-002.png").exists())
+                self.assertFalse(missing_path.exists())
                 self.assertFalse(any(call["path"].startswith("/xblock/") for call in studio.calls))
                 state = json.loads((root / "legacy-targets.batch-operation.json").read_text(encoding="utf-8"))
                 gallery = state["galleries"][0]
                 self.assertEqual("incomplete", gallery["local_package_status"])
                 self.assertEqual("failed", gallery["local_material_repair"]["status"])
                 self.assertEqual(return_code, gallery["local_material_repair"]["return_code"])
+                self.assertEqual([expected_missing_item], gallery["local_material_repair"]["missing_items"])
+                self.assertEqual([expected_missing_item], gallery["local_package_missing_items"])
                 self.assertFalse(gallery["validation"]["repairable"])
-                self.assertIn("本地素材恢复失败", state["batch_result"]["operator_report"]["text"])
+                report = state["batch_result"]["operator_report"]["text"]
+                self.assertIn("本地素材恢复失败", report)
+                self.assertIn(expected_missing_item, report)
                 persisted = stdout + stderr + json.dumps(state)
+                self.assertNotIn(str(missing_path), persisted)
                 self.assertNotIn("output-secret", persisted)
                 self.assertNotIn("signed-secret", persisted)
 
