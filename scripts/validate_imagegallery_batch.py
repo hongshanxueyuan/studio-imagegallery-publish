@@ -1478,6 +1478,7 @@ def replace_gallery_from_package(
     if isinstance(request_id, str) and request_id:
         attempt["request_id"] = request_id
     entry["repair_attempts"] = max(int(entry.get("repair_attempts", 0)), int(attempt.get("attempt", 1)))
+    attempt["vertical_publish"] = {"step": "publish_vertical", "status": "started"}
     store()
 
     vertical_locator = safe_locator(entry.get("vertical_locator"))
@@ -2058,6 +2059,25 @@ def expected_vertical_snapshots(operation: dict[str, Any]) -> tuple[dict[str, di
         else:
             expected[locator] = snapshot
     return expected, missing, ambiguous, unresolved
+
+
+def vertical_publish_attempted_in_request(entry: dict[str, Any], request_id: str) -> bool:
+    history = entry.get("repair_history")
+    if not isinstance(history, list):
+        return False
+    for attempt in history:
+        if not isinstance(attempt, dict) or attempt.get("request_id") != request_id:
+            continue
+        if attempt.get("repair_mode") == "structure" or isinstance(attempt.get("vertical_publish"), dict):
+            return True
+        publisher_result = attempt.get("publisher_result") if isinstance(attempt.get("publisher_result"), dict) else {}
+        steps = publisher_result.get("steps") if isinstance(publisher_result.get("steps"), list) else attempt.get("steps", [])
+        if isinstance(steps, list) and any(
+            isinstance(step, dict) and step.get("step") == "publish_vertical"
+            for step in steps
+        ):
+            return True
+    return False
 
 
 def final_vertical_snapshot_contract(snapshot: dict[str, Any], gallery_locator: str) -> bool:
@@ -3143,6 +3163,13 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             )
             publication_mismatch = checks.get("vertical_publication") == "mismatch"
             structure_mismatch = checks.get("vertical_structure") == "mismatch"
+            ambiguous_vertical_structure = (
+                not structure_error
+                and len(vertical_matches) == 1
+                and target_snapshot is None
+                and owner_status == "pass"
+                and vertical_structure_status in {"mismatch", "unverified"}
+            )
             play_config_untrusted = play_config_is_untrusted(validation)
             observed_config = validation.get("observed") if isinstance(validation.get("observed"), dict) else {}
             unreadable_timeline = (
@@ -3160,16 +3187,32 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 checks.get(name) == "unverified"
                 for name in ("images", "audio_bindings", "audio_object_accessibility")
             )
-            has_repair_target = safe_missing_gallery or content_mismatches or timeline_only_repair or publication_mismatch or structure_mismatch
+            has_repair_target = (
+                safe_missing_gallery
+                or content_mismatches
+                or timeline_only_repair
+                or publication_mismatch
+                or structure_mismatch
+                or ambiguous_vertical_structure
+            )
+            ambiguous_structure_publish_already_attempted = (
+                ambiguous_vertical_structure
+                and not (safe_missing_gallery or content_mismatches or timeline_only_repair)
+                and vertical_publish_attempted_in_request(entry, request_id)
+            )
             validation["repairable"] = bool(
                 local_package_complete
                 and (safe_missing_gallery or not gallery_evidence_unverified)
+                and not ambiguous_structure_publish_already_attempted
                 and (
                     safe_missing_gallery
                     or (
                         has_repair_target
-                        and checks.get("vertical_structure") in {"pass", "mismatch"}
-                        and (not structure_mismatch or target_snapshot is not None)
+                        and (
+                            checks.get("vertical_structure") in {"pass", "mismatch"}
+                            or ambiguous_vertical_structure
+                        )
+                        and (not structure_mismatch or target_snapshot is not None or ambiguous_vertical_structure)
                         and owner_status == "pass"
                     )
                 )
@@ -3184,6 +3227,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 validation["repair_skip_reason"] = (
                     "The local Gallery package is incomplete"
                     if not local_package_complete
+                    else "A publish attempt was already made for this unresolved structure in the current request"
+                    if ambiguous_structure_publish_already_attempted
                     else "The current section structure or Gallery ownership is not safe to change automatically"
                 )
             entry["validation"] = validation
@@ -3269,6 +3314,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                     if resume_attempt is None:
                         history.append(attempt)
                     entry["repair_attempts"] = max(entry.get("repair_attempts", 0), attempt["attempt"])
+                    attempt["vertical_publish"] = {"step": "publish_vertical", "status": "started"}
+                    store()
                     steps, expected = publisher.cleanup_and_publish_vertical(
                         client.session, studio_base=studio_base, vertical_locator=entry["vertical_locator"],
                         gallery_locator=entry["gallery_locator"], adapter=adapter, csrftoken=client.csrftoken, timeout=args.timeout,
