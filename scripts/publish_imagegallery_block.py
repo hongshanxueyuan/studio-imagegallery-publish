@@ -1797,6 +1797,17 @@ def safe_step_record(record: dict[str, Any], *, page_image: str = "") -> dict[st
     return safe
 
 
+def safe_object_key_path(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    path = value.strip()
+    if "://" in path or path.startswith("//"):
+        path = urlsplit(path).path
+    else:
+        path = path.split("?", 1)[0].split("#", 1)[0]
+    return path[:500]
+
+
 def safe_audio_upload_evidence(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -1804,11 +1815,7 @@ def safe_audio_upload_evidence(value: Any) -> dict[str, Any]:
     for key in ("upload_key_path", "bucket", "region"):
         item = value.get(key)
         if isinstance(item, str) and item.strip():
-            if key == "upload_key_path":
-                item = item.split("?", 1)[0].split("#", 1)[0]
-                if "://" in item:
-                    item = urlparse(item).path
-            safe[key] = item[:500]
+            safe[key] = safe_object_key_path(item) if key == "upload_key_path" else item[:500]
     for key in ("multipart_part_count", "local_size_bytes"):
         item = value.get(key)
         if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
